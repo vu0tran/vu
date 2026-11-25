@@ -324,3 +324,195 @@ vu_str vl_read_text(const vu_str *path, int64_t *ok, int64_t n) {
   if (!err && n > 0) ok[0] = 1;
   return s;
 }
+
+// ---- folders' listings, shared by the module graph's workers (vl_lkind, vl_llink)
+// A stat costs about as much as listing a small folder, and resolving a request looks at up to 17
+// paths of one folder, most of them not there. Each folder is listed once (opendir, d_type), into a
+// table of 64 parts by the folder's hash, each with its lock; the entries are found by their name
+// in ASCII lower case, so a name the file system could match under another case is seen.
+#include <dirent.h>
+#include <pthread.h>
+typedef struct { char *name; uint32_t len; uint64_t lh; uint8_t dt; int8_t kind; } vl_dent;
+typedef struct vl_dir {
+  char *path; size_t plen; uint64_t h; int ok; int wide;
+  uint32_t n; vl_dent *e; uint32_t mask; int32_t *slot;
+  struct vl_dir *next;
+} vl_dir;
+#define VL_PARTS 64
+#define VL_BUCKETS 1024
+static pthread_mutex_t vl_dmu[VL_PARTS] = { [0 ... VL_PARTS - 1] = PTHREAD_MUTEX_INITIALIZER };
+static vl_dir *vl_dtab[VL_PARTS][VL_BUCKETS];
+
+static uint64_t vl_fnv(const char *s, size_t n, int fold) {
+  uint64_t h = 1469598103934665603ULL;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (fold && c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+    h = (h ^ c) * 1099511628211ULL;
+  }
+  return h;
+}
+
+static int vl_ieq(const char *a, const char *b, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    unsigned char x = (unsigned char)a[i], y = (unsigned char)b[i];
+    if (x >= 'A' && x <= 'Z') x = (unsigned char)(x + 32);
+    if (y >= 'A' && y <= 'Z') y = (unsigned char)(y + 32);
+    if (x != y) return 0;
+  }
+  return 1;
+}
+
+static vl_dir *vl_list(const char *path, size_t plen, uint64_t h) {
+  vl_dir *d = calloc(1, sizeof *d);
+  d->path = malloc(plen + 1); memcpy(d->path, path, plen); d->path[plen] = 0;
+  d->plen = plen; d->h = h;
+  DIR *dd = opendir(d->path);
+  if (!dd) return d;
+  d->ok = 1;
+  uint32_t cap = 16;
+  d->e = malloc(cap * sizeof(vl_dent));
+  struct dirent *x;
+  while ((x = readdir(dd)) != NULL) {
+    const char *nm = x->d_name;
+    if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
+    size_t nl = strlen(nm);
+    if (d->n == cap) { cap *= 2; d->e = realloc(d->e, cap * sizeof(vl_dent)); }
+    vl_dent *e = &d->e[d->n++];
+    e->name = malloc(nl + 1); memcpy(e->name, nm, nl + 1); e->len = (uint32_t)nl;
+    e->lh = vl_fnv(nm, nl, 1);
+    e->dt = x->d_type;
+    e->kind = -1;
+    if (x->d_type == DT_DIR) e->kind = 2;
+    else if (x->d_type != DT_LNK && x->d_type != DT_UNKNOWN) e->kind = 1;
+    for (size_t i = 0; i < nl; i++) if ((unsigned char)nm[i] >= 128) d->wide = 1;
+  }
+  closedir(dd);
+  uint32_t sz = 16;
+  while (sz < 2 * d->n + 2) sz *= 2;
+  d->mask = sz - 1;
+  d->slot = malloc(sz * sizeof(int32_t));
+  for (uint32_t i = 0; i < sz; i++) d->slot[i] = -1;
+  for (uint32_t k = 0; k < d->n; k++) {
+    uint32_t s = (uint32_t)d->e[k].lh & d->mask;
+    while (d->slot[s] >= 0) s = (s + 1) & d->mask;
+    d->slot[s] = (int32_t)k;
+  }
+  return d;
+}
+
+static void vl_free_dir(vl_dir *d) {
+  for (uint32_t k = 0; k < d->n; k++) free(d->e[k].name);
+  free(d->e); free(d->slot); free(d->path); free(d);
+}
+
+// the listing of path's folder (path[0..plen]), listed now if no worker has
+static vl_dir *vl_dir_of(const char *path, size_t plen) {
+  uint64_t h = vl_fnv(path, plen, 0);
+  int part = (int)(h % VL_PARTS);
+  size_t b = (size_t)((h >> 6) % VL_BUCKETS);
+  pthread_mutex_lock(&vl_dmu[part]);
+  for (vl_dir *d = vl_dtab[part][b]; d; d = d->next)
+    if (d->h == h && d->plen == plen && memcmp(d->path, path, plen) == 0) { pthread_mutex_unlock(&vl_dmu[part]); return d; }
+  pthread_mutex_unlock(&vl_dmu[part]);
+  vl_dir *nd = vl_list(path, plen, h);
+  pthread_mutex_lock(&vl_dmu[part]);
+  for (vl_dir *d = vl_dtab[part][b]; d; d = d->next)
+    if (d->h == h && d->plen == plen && memcmp(d->path, path, plen) == 0) { pthread_mutex_unlock(&vl_dmu[part]); vl_free_dir(nd); return d; }
+  nd->next = vl_dtab[part][b];
+  vl_dtab[part][b] = nd;
+  pthread_mutex_unlock(&vl_dmu[part]);
+  return nd;
+}
+
+// (folders of links, where a listing says little: node_modules and its @scope folders)
+static int vl_listable(const char *p, size_t plen) {
+  size_t i = plen;
+  while (i > 0 && p[i - 1] != '/') i--;
+  const char *b = p + i; size_t bl = plen - i;
+  if (bl == 0) return 0;
+  if (bl == 12 && memcmp(b, "node_modules", 12) == 0) return 0;
+  if (b[0] == '@' && i >= 14 && memcmp(p + i - 14, "/node_modules/", 14) == 0) return 0;
+  return 1;
+}
+
+// the entry named exactly base in d: index, -1 none (and *ci set when one matches under case
+// folding), -2 the name could match one the folding of the file system can't be told here
+static int64_t vl_find(vl_dir *d, const char *base, size_t bl, int *ci) {
+  *ci = 0;
+  for (size_t i = 0; i < bl; i++) if ((unsigned char)base[i] >= 128) return -2;
+  if (d->wide) return -2;
+  uint64_t lh = vl_fnv(base, bl, 1);
+  uint32_t s = (uint32_t)lh & d->mask;
+  int64_t found = -1;
+  while (d->slot[s] >= 0) {
+    vl_dent *e = &d->e[d->slot[s]];
+    if (e->lh == lh && e->len == bl && vl_ieq(e->name, base, bl)) {
+      if (memcmp(e->name, base, bl) == 0) found = d->slot[s];
+      else *ci = 1;
+    }
+    s = (s + 1) & d->mask;
+  }
+  return found;
+}
+
+static int vl_split(const vu_str *path, size_t *dl) {
+  const char *p = (const char *)path->data;
+  size_t n = (size_t)path->len;
+  if (n == 0 || p[0] != '/' || memchr(p, 0, n)) return 0;
+  size_t i = n;
+  while (i > 0 && p[i - 1] != '/') i--;
+  if (i == n) return 0;
+  const char *b = p + i; size_t bl = n - i;
+  if ((bl == 1 && b[0] == '.') || (bl == 2 && b[0] == '.' && b[1] == '.')) return 0;
+  *dl = i > 1 ? i - 1 : 1;   // the folder: "/" for "/x"
+  return 1;
+}
+
+// What stat says path is (0 nothing, 1 not a folder, 2 a folder, links followed), from its
+// folder's listing: -1 when the listing can't say (a folder of links, a name it could match
+// under case folding), -2 when the folder couldn't be listed.
+int64_t vl_lkind(const vu_str *path) {
+  size_t dl;
+  if (!vl_split(path, &dl)) return -1;
+  const char *p = (const char *)path->data;
+  size_t n = (size_t)path->len;
+  if (!vl_listable(p, dl)) return -1;
+  vl_dir *d = vl_dir_of(p, dl);
+  if (!d->ok) return -2;
+  size_t bs = dl == 1 ? 1 : dl + 1;
+  int ci;
+  int64_t k = vl_find(d, p + bs, n - bs, &ci);
+  if (k == -2) return -1;
+  if (k < 0) return ci ? -1 : 0;
+  vl_dent *e = &d->e[k];
+  int8_t kd = __atomic_load_n(&e->kind, __ATOMIC_RELAXED);
+  if (kd >= 0) return kd;
+  char *full = vu_cstr(path);
+  if (!full) return -1;
+  struct stat st;
+  int r = stat(full, &st);
+  free(full);
+  kd = r != 0 ? 0 : (S_ISDIR(st.st_mode) ? 2 : 1);
+  __atomic_store_n(&e->kind, kd, __ATOMIC_RELAXED);
+  return kd;
+}
+
+// Whether path is a symbolic link, from its folder's listing: 1 yes, 0 no, -1 it can't say.
+int64_t vl_llink(const vu_str *path) {
+  size_t dl;
+  if (!vl_split(path, &dl)) return -1;
+  const char *p = (const char *)path->data;
+  size_t n = (size_t)path->len;
+  if (!vl_listable(p, dl)) return -1;
+  vl_dir *d = vl_dir_of(p, dl);
+  if (!d->ok) return -1;
+  size_t bs = dl == 1 ? 1 : dl + 1;
+  int ci;
+  int64_t k = vl_find(d, p + bs, n - bs, &ci);
+  if (k < 0) return -1;
+  uint8_t t = d->e[k].dt;
+  if (t == DT_LNK) return 1;
+  if (t == DT_UNKNOWN) return -1;
+  return 0;
+}

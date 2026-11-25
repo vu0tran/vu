@@ -57,6 +57,8 @@ type Rec:
   le_s: [Int]
   le_e: [Int]
   ind_t: [Bool]       # each indirect export entry: type-only
+  part: Bool = false  # a dependency's record whose requests other than re-exports aren't resolved
+                      # yet (rq_path ""): place loads only its re-exports, unless it's followed whole
 
 fn new_rec(path: Str) -> Rec:
   return Rec(path, false, false, [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], false, [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [])
@@ -101,13 +103,14 @@ fn nb_seeds(r: Rec) -> [Bool]:
 
 # record x and all it reaches followed whole (no-barrel-file counts them): a dependency placed
 # before gets the requests it didn't follow then
-fn mark_full(var g: Graph, x: Int, var todo: [Job]):
+fn mark_full(fs: Fs, ffi: Ffi, var mrs: Rs, var g: Graph, x: Int, var todo: [Job]):
   var st: [Int] = [x]
   while st.len > 0:
     let y = st.pop()
     if g.fullv[y]: continue
     g.fullv[y] = true
     if not g.placed[y]: continue
+    if g.recs[y].part: resolve_rest(fs, ffi, &mrs, &g.recs[y])
     for j in 0..g.recs[y].rq.len:
       let target = g.recs[y].rq_path[j] + ""
       if target == "" or not valid_ext(target): continue
@@ -554,8 +557,36 @@ fn new_rs() -> Rs:
   return Rs(lresolve.new_rv(), {}, {})
 
 fn resolve_all(fs: Fs, ffi: Ffi, var rs: Rs, var r: Rec, p: Str):
+  # (a dependency in node_modules: its re-exports only, what place loads of it; the rest when
+  # it's followed whole, resolve_rest)
+  var only: [Bool] = []
+  if p.find("/node_modules/") >= 0:
+    only = [false] * r.rq.len
+    for q in r.star_rq: only[q] = true
+    for q in r.ind_rq: only[q] = true
+    for q in only:
+      if not q: r.part = true
   for j in 0..r.rq.len:
+    if only.len > 0 and not only[j]: continue
     var target = lresolve.resolve(&rs.rv, fs, p, r.rq[j])
+    if target != "":
+      if not (target in rs.real):
+        var rp = lcache.realpath_memo_l(ffi, &rs.rdirs, target, rs.rv.lk.len > 0)
+        if rp == "": rp = target + ""
+        rs.real[target] = rp
+      target = rs.real[target] + ""
+    r.rq_path[j] = target
+
+# the requests resolve_all left of a dependency's record
+fn resolve_rest(fs: Fs, ffi: Ffi, var rs: Rs, var r: Rec):
+  if not r.part: return
+  r.part = false
+  var only = [false] * r.rq.len
+  for q in r.star_rq: only[q] = true
+  for q in r.ind_rq: only[q] = true
+  for j in 0..r.rq.len:
+    if only[j]: continue
+    var target = lresolve.resolve(&rs.rv, fs, r.path, r.rq[j])
     if target != "":
       if not (target in rs.real):
         var rp = lcache.realpath_memo(ffi, &rs.rdirs, target)
@@ -575,12 +606,12 @@ type Job:
   bidx: [Int] = []      # (idx -1) a batch of linted files from one folder, for one worker: its
   bpath: [Str] = []     # resolver's caches answer their requests, much the same
 
-fn gworker(fs: Fs, ffi: Ffi, own jobs: Chan[Job], own res: Chan[GRes], own kms: [Memo[Str, Int]], own dls: [Memo[Str, lresolve.Dl]], own cdir: Str, own pcm: Memo[Str, PkgC]):
+fn gworker(fs: Fs, ffi: Ffi, own jobs: Chan[Job], own res: Chan[GRes], own kms: [Memo[Str, Int]], own cdir: Str, own pcm: Memo[Str, PkgC]):
   var kw = scan.keywords()
   var t = new_tree()
   var rs = new_rs()
   swap(&rs.rv.km, &kms)
-  swap(&rs.rv.dl, &dls)
+  rs.rv.lk.push(own fn(p: Str) -> Int => lcache.listed_kind(ffi, p))
   while true:
     let j = jobs.recv() else return
     if j.idx < 0:
@@ -613,7 +644,7 @@ fn new_tree() -> ast.Ast:
 
 # A parsed record into the graph at its slot (a partial file's earlier sections get slots of their
 # own): its requests' targets get records, new ones queued in `todo`
-fn place(var g: Graph, var gr: GRes, pshown: {Str: Str}, var todo: [Job]):
+fn place(fs: Fs, ffi: Ffi, var mrs: Rs, var g: Graph, var gr: GRes, pshown: {Str: Str}, var todo: [Job]):
   let p = g.recs[gr.idx].path + ""
   var slots: [Int] = []
   for mi in 0..gr.more.len:
@@ -641,6 +672,7 @@ fn place(var g: Graph, var gr: GRes, pshown: {Str: Str}, var todo: [Job]):
       follow = [false] * r.rq.len
       for q in r.star_rq: follow[q] = true
       for q in r.ind_rq: follow[q] = true
+    elif r.part: resolve_rest(fs, ffi, &mrs, &r)
     var seeds: [Bool] = []
     if g.full and g.root[x]: seeds = nb_seeds(r)
     let whole = g.full and g.fullv[x]
@@ -656,7 +688,7 @@ fn place(var g: Graph, var gr: GRes, pshown: {Str: Str}, var todo: [Job]):
         if whole or (seeds.len > 0 and seeds[j]): marks.push(r.rq_res[j])
     swap(&g.recs[x], &r)
     g.placed[x] = true
-  for y in marks: mark_full(&g, y, &todo)
+  for y in marks: mark_full(fs, ffi, &mrs, &g, y, &todo)
 
 # (texts: each linted file's text as read for its record, has: whether it was; the linter reads
 # those from here instead of opening the file again)
@@ -696,7 +728,7 @@ fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool,
       if gr.croot != "": note_fresh(&fresh, gr)
       take_text(&gr, fi_of, &texts, &has)
       resolve_res(fs, ffi, &rs, &gr, jp)
-      place(&g, &gr, pshown, &todo)
+      place(fs, ffi, &rs, &g, &gr, pshown, &todo)
     save_cache(fs, ffi, cdir, pcm, fresh)
     return g
   # workers that stay for the whole graph (their resolvers' caches with them); a record's new
@@ -710,19 +742,14 @@ fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool,
   for _i in 0..16:
     let km: Memo[Str, Int] = memo()
     kms.push(km)
-  # (and folders' listings, kind_of's answers for the folders that aren't links' folders)
-  var dls: [Memo[Str, lresolve.Dl]] = []
-  for _i in 0..16:
-    let dm: Memo[Str, lresolve.Dl] = memo()
-    dls.push(dm)
   for w in 0..threads:
     var mine: [Memo[Str, Int]] = []
     for m in kms: mine.push(m.share())
-    var mdl: [Memo[Str, lresolve.Dl]] = []
-    for m in dls: mdl.push(m.share())
-    spawn gworker(fs, ffi, jc, rc, mine, mdl, cdir + "", pcm.share())
+    spawn gworker(fs, ffi, jc, rc, mine, cdir + "", pcm.share())
   var pending = 0
   var sent = 0
+  # (the main task's resolver: a dependency's other requests when it turns out to be followed whole)
+  var mrs = new_rs()
   # (the linted files in batches of up to 32 from one folder)
   while sent < todo.len and todo[sent].keep:
     var bi: [Int] = []
@@ -743,7 +770,7 @@ fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool,
     pending -= 1
     if gr.croot != "": note_fresh(&fresh, gr)
     take_text(&gr, fi_of, &texts, &has)
-    place(&g, &gr, pshown, &todo)
+    place(fs, ffi, &mrs, &g, &gr, pshown, &todo)
     while sent < todo.len:
       jc.send(Job(todo[sent].idx, todo[sent].path + "", todo[sent].keep))
       sent += 1
