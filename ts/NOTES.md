@@ -318,6 +318,23 @@ A shared type table (the redesign this would take), as scoped on 2026-11-24, not
   type-aware check, that is perhaps 10-15 s of the job's 71-75 s: about the 20% asked for at best,
   for a rewrite of most of vtsc's checker.
 
+The single-thread check, profiled (VLINT_PHASE=0 VLINT_VTSC_SERIAL=1 VTSC_JOBS=1, `vu build
+--profile`, instructions from `/usr/bin/time -l`) on a 79-, a 221- and a 1,127-file program
+(18.5, 16.8 and 55.1 G instructions): the self time is flat. The largest items are the push of a
+new object type (types.new_obj, 5-9%), interning a mapper (types.new_mapper, 5-8%), reading files
+(read_fsrc, 5-19%, the read-ahead tasks), the parser's node push (3-8%), bind.get_prop (4-5%),
+rel.assignable (2-4%); nothing else reaches 3%. The work is tsc's own: per 221-file program
+554,000 instantiations against tsgo's 791,000 (tsgo 7.0.2 on one thread checks it in 1.22 s, vtsc
+in 1.29). Tried, not kept:
+- one C file instead of the split build (VU_SPLIT=off; `--emit-c`): instructions within 0.5%
+- profile-guided optimization (clang -fprofile-instr-generate on 12 of the job's invocations, then
+  -fprofile-instr-use, through a CC wrapper): instructions -5 to -6%, cpu about -5%. Not in the
+  release build: that is built per platform in CI (packaging/tools/build.sh), with a profile to
+  train on each.
+
+Scheduling and output: the six largest invocations, each run 10 times cold with the default
+(dynamic) sharding, gave one output each.
+
 With the caches kept between runs (`$XDG_CACHE_HOME/vlint`: the vtsc file cache, the tsconfig
 cache, the module records; 261 MB for the job), the CI job's pattern takes 33.9 s and 214 cpu-s
 against oxlint's 74-76 s, outputs identical; the run that fills them 81.6 s.
