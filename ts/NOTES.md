@@ -578,6 +578,14 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   panics if the names table grew while checking. Probes 133/133, vtests' 3 failures byte for byte
   (both with VTSC_SO_CHECK=1), the CI job's 88 outputs byte-identical with VTSC_SO_CHECK=1; 18.43 /
   16.49 / 54.35 G instructions (-0.3, -1.7, -1.5% on the pre-M3 base).
+- Step 4.2's open case closed (landed 2026-11-24): the late root wasn't an import's target but
+  `bind.ns_import_file`, which for a name found in no scope (a global) looks for the file's own
+  import of it at the file's root, and named the root to do so: in @types/node's test.d.ts, a script,
+  `import TestFn = test.TestFn` inside its `declare module "node:test"`. A file that isn't a module
+  has no imports at its root (any import makes it a module), so it now looks only in a module's
+  root. With that, VTSC_SO_CHECK=1 panics on any scope named after checking starts, scripts' roots
+  included. Probes 133/133, vtests' 3 failures byte for byte, the CI job's 88 outputs
+  byte-identical, all with VTSC_SO_CHECK=1 and no panic; 18.60 / 16.55 / 54.45 G instructions.
 - Next (step 4.3's rest, in order): the other interning maps as `ik_*` keys (`strlits`,
   `numlits`/`nums`/`numtext`, `biglits`, `unions` (Str keys), `tmpls`/`tmpl_ids`,
   `mappers`/`mapper_ids` (and `c.mappers` itself: a list column of from and to), `inst_cache`,
