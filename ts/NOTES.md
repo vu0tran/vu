@@ -390,11 +390,25 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   1,009 of vlint's functions that call C): 79 files 18.62 G instructions, 221 files 16.90, 1,127 files
   55.19 (+0.8, +0.8, 0.0% on the pre-M3 base; 18.85, 17.24, 56.40 at step 1). Probes 133/133, vtest
   the same 3 failures byte for byte, the CI job's 88 outputs byte-identical.
-- Next (M3 step 2b): Obj as columns. Its Int and Bool fields (`kind sym node sidx nidx target mapper
-  display sname nname mcons`, `resolved fresh ro`) as ctab columns, its lists (`calls ctors tparams
-  args eflags`) as list columns (`sconv.py . objs ho_ SCALARS LISTS BOOLS`, which writes a Bool as
-  `b2i`, reads it as `!= 0`); `props` (a map, iterated in insertion order in bind.vu 5722/5736) and
-  `order` can stay in a smaller Vu `Obj` for that step. Then the compute-once slots and step 3.
+- M3 step 2b, object types as columns (landed 2026-11-24): `Obj`'s Int and Bool fields (`kind sym
+  node sidx nidx target mapper display sname nname mcons`, `resolved fresh ro`: a Bool is 0/1,
+  written through `types.b2i`, read as `!= 0`) are ctab columns `c.ho_*`, its lists (`calls ctors
+  tparams args eflags`) list columns; `c.objs` keeps only `props` (a map, iterated in insertion order
+  in bind.vu's class/function merging) and `order` (`sconv.py . objs ho_ SCALARS LISTS BOOLS`, then
+  `hoist2.py`, 52 sites). A side effect of the scripts: code quoted inside a few `rfail` trace
+  messages (rel.vu, shown only with relation tracing) was rewritten with the code. 79 files 18.61 G
+  instructions, 221 files 16.85, 1,127 files 55.11 (+0.7, +0.5, -0.2% on the pre-M3 base). Probes
+  133/133, vtest the same 3 failures byte for byte, the CI job's 88 outputs byte-identical.
+- Next (M3 step 2c): `props`/`order` in C (a list column of names and one of symbols in the same
+  order, plus a lookup by (object, name): an open-addressed table in C, append-only, keyed by both),
+  keeping iteration in insertion order. Then the compute-once slots: today a column entry is written
+  in place (`ct_set`, `cl_set`/`cl_add` on a row); once rows are shared, a row is filled by one
+  thread before its index is published (a new object or signature), and the lazily filled fields
+  (`resolved` with `calls ctors sidx nidx sname nname`, `args`/`eflags` of a deferred tuple or
+  reference, `sigs.ret`, `tparams`) need a set-once protocol (a state word per row: empty, being
+  filled by worker N, filled; a second filler waits or computes the same value). Step 3: the lazy
+  `stype`/`nsym`/`ntype` writes as set-once slots with a debug-build check that a second write gives
+  the same value.
 
 With the caches kept between runs (`$XDG_CACHE_HOME/vlint`: the vtsc file cache, the tsconfig
 cache, the module records; 261 MB for the job), the CI job's pattern takes 33.9 s and 214 cpu-s
