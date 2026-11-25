@@ -1312,13 +1312,41 @@ fn fn_sig(var c: C, d: Int) -> Int:
   if d in c.fsig:
     if d in c.cyc_fset: c.cyc_hits += 1
     return c.fsig[d]
+  let pub = c.fsig_pub.get(d, types.SM_NONE)
+  if pub != types.SM_NONE: return pub
   # (made while an alias it reads is being made: made again after it, bind.declared_type)
   if c.alias_busy.len > 0:
     let fh0 = c.cyc_hits
     let r = fn_sig1(&c, d)
     if c.cyc_hits > fh0: c.cyc_fset[d] = true
     return r
-  return fn_sig1(&c, d)
+  let r = fn_sig1(&c, d)
+  # (a declaration's signature, final once made, published for every worker: one made meanwhile
+  # by another worker that published first is taken in its place; this worker's is unused from
+  # now on. A function expression's or an object literal method's is made again in context, so
+  # it stays the worker's own, as one made with nothing reported (c.spec) does)
+  if c.spec == 0 and fsig_final(c, d):
+    let w = c.fsig_pub.add(d, r)
+    if w != r: c.fsig[d] = w
+    return w
+  return r
+
+# Whether a function-like node's signature is made once: a declared function's, a class's or an
+# interface's method or accessor's (not a function expression's or an object literal's, made in
+# context, nor a constructor's).
+fn fsig_final(c: C, d: Int) -> Bool:
+  let k = c.t.nd[d].k
+  if k == ast.N_FUNC: return true
+  # (not a constructor's: chk.class_static sets its return and type parameters after)
+  if k != ast.N_METHOD and k != ast.N_GET and k != ast.N_SET: return false
+  var p = c.parent[d]
+  if p >= 0 and c.t.nd[p].k == ast.N_LIST: p = c.parent[p]
+  return p >= 0 and (c.t.nd[p].k == ast.N_CLASS or c.t.nd[p].k == ast.N_INTERFACE)
+
+# A function-like node's signature made by this worker or published (-1 none yet).
+fn fsig_of(c: C, d: Int) -> Int:
+  if d in c.fsig: return c.fsig[d]
+  return c.fsig_pub.get(d, -1)
 
 fn fn_sig1(var c: C, d: Int) -> Int:
   let sg = types.new_sig(&c, d)
@@ -16186,10 +16214,10 @@ fn redo_nested(var c: C, d: Int):
   for x in todo:
     if not (x in c.redo_fns): continue
     c.redo_fns.remove(x)
-    if x in c.checked_fns or not (x in c.fsig): continue
+    if x in c.checked_fns or fsig_of(c, x) < 0: continue
     let xk = c.t.nd[x].k
     if (xk == ast.N_ARROW or xk == ast.N_FUNCEXPR) and c.fn_ctxt.get(x, -2) == -1 and not is_iife(c, x): check_expr(&c, x, -1)
-    else: check_function_body(&c, x, c.fsig[x])
+    else: check_function_body(&c, x, fsig_of(c, x))
 
 fn check_function_body(var c: C, d: Int, sg: Int):
   if d in c.checked_fns: return
@@ -17850,7 +17878,7 @@ fn this_type_from(var c: C, n: Int, x0: Int) -> Int:
 # assignments' types where one isn't null or undefined, else all of them; with undefined when only
 # methods assign it; widened ([] is any[], only null or undefined is any).
 fn js_this_type(var c: C, s: Int) -> Int:
-  let xs = types.ints(c.js_this[s])
+  let xs = types.ckl_ints(c.ffi, c.hy_jsthis, s)
   var ctor_ts: [Int] = []
   var all_ts: [Int] = []
   var in_ctor = false
@@ -17902,9 +17930,9 @@ fn js_this_type(var c: C, s: Int) -> Int:
     let mk = types.ct_at(c.ffi, c.htk, types.mem(c, u, mi_))
     if mk != TK_NULL and mk != TK_UNDEF: all_null = false
   if all_null: u = c.any_t
-  elif not in_ctor and not (s in c.js_expando): u = types.union_of(&c, [u, c.undef_t])
-  if s in c.js_this_base:
-    let bsym = c.js_this_base[s]
+  elif not in_ctor and not types.cx_has(c.ffi, c.hy_jsexp, s): u = types.union_of(&c, [u, c.undef_t])
+  if types.cx_has(c.ffi, c.hy_jsbase, s):
+    let bsym = types.cx_at(c.ffi, c.hy_jsbase, s)
     let bt = bind.type_of_sym(&c, bsym)
     if in_ctor and ctor_top and last_ctor >= 0:
       var ln = false
@@ -17972,8 +18000,8 @@ fn js_expando_props(var c: C, n: Int, t: Int):
       j -= 1
     let ps = types.new_sym(&c, S_PROP, pn, c.t.nd[xs[0]].a)
     types.ct_set(c.ffi, c.hsflags, ps, 0)
-    c.js_this[ps] = xs
-    c.js_expando[ps] = true
+    types.ckl_set(c.ffi, c.hy_jsthis, ps, xs)
+    types.cx_put(c.ffi, c.hy_jsexp, ps, 1)
     types.add_prop(&c, t, pn, ps)
 
 # Whether an assignment is a statement of a constructor's body itself (not in a branch, loop or
@@ -18317,14 +18345,15 @@ fn class_sym_of_base(var c: C, d: Int) -> Int:
 
 # The class's constructor type: construct signatures (its constructor's, else its base's, else
 # none-argument ones) returning the instance type, and the static members.
-fn class_static(var c: C, s: Int) -> Int:
+fn class_static(var c: C, s: Int, publish: Bool) -> Int:
   let d = types.ct_at(c.ffi, c.hsdecl, s)
   let inst = bind.self_type(&c, s)
   let dt = bind.declared_type(&c, s)
   let ctps = types.cl_ints(c.ffi, c.ho_tparams, types.ct_at(c.ffi, c.hta, dt))
   let t = types.anon_obj(&c, s, d)
   types.cx_put(c.ffi, c.ht_static, t, s)
-  types.sty_put(&c, s, t)
+  # (this worker's while its members are added: published once made, below)
+  types.sty_tmp(&c, s, t)
   let o = types.ct_at(c.ffi, c.hta, t)
   bind.add_members(&c, t, c.t.nd[d].d, s, true)
   # (prototype: the instance type, any for the class's type parameters, before
@@ -18429,7 +18458,10 @@ fn class_static(var c: C, s: Int) -> Int:
       types.cl_set(c.ffi, c.hs_tparams, ns, types.ints(ctps))
       types.cl_add(c.ffi, c.ho_ctors, o, ns)
   types.ct_set(c.ffi, c.ho_resolved, o, 1)
-  return t
+  # (a class merged with a namespace: published by the caller, once the namespace's values are
+  # added, bind.type_of_sym)
+  if not publish: return t
+  return types.sty_put(&c, s, t)
 
 # The base class's constructor type as the derived class sees it: its construct signatures with
 # the base's type parameters set to the arguments of extends Base<X>.
@@ -21518,16 +21550,16 @@ fn cjs_value(var c: C, n: Int, spec: Int) -> Int:
 # (getTypeOfSymbol of the module's export=); else not modeled.
 fn cjs_exports(var c: C, n: Int, g: Int) -> Int:
   if c.roots[g] in c.cjs_exp:
-    if g in c.cjs_exp_t:
-      if c.cjs_exp_t[g] == -2: return unsup(&c, n, "a require of a CommonJS module while its value is typed")
-      return c.cjs_exp_t[g]
-    c.cjs_exp_t[g] = -2
+    let had = c.cjs_exp_t.get(g, types.SM_NONE)
+    if had != types.SM_NONE: return had
+    if g in c.cjs_busy: return unsup(&c, n, "a require of a CommonJS module while its value is typed")
+    c.cjs_busy[g] = true
     let ex = c.cjs_exp[c.roots[g]]
     let et = check_expr(&c, ex, -1)
     let wt0 = widen(&c, et)
     let wt = regular_obj(&c, wt0)
-    c.cjs_exp_t[g] = wt
-    return wt
+    c.cjs_busy.remove(g)
+    return c.cjs_exp_t.add(g, wt)
   return unsup(&c, n, "a require of a CommonJS module")
 
 # module in a CommonJS JavaScript file that declares no module of its own: the file's module, a
@@ -21543,7 +21575,8 @@ fn cjs_module_ident(var c: C, n: Int, s: Int) -> Int:
   # (exports.x = ... beside it, and the like: as before, the global module or none; module as a
   # value isn't let through there, js_unsupported)
   if not (c.roots[f] in c.cjs_exp): return -2
-  if f in c.cjs_mod_t: return c.cjs_mod_t[f]
+  let had = c.cjs_mod_t.get(f, types.SM_NONE)
+  if had != types.SM_NONE: return had
   let et = cjs_exports(&c, n, f)
   if et < 0 or types.ct_at(c.ffi, c.htk, et) == TK_UNSUP: return et
   let t = types.anon_obj(&c, -1, -1)
@@ -21552,8 +21585,7 @@ fn cjs_module_ident(var c: C, n: Int, s: Int) -> Int:
   types.sty_init(&c, ps, et)
   types.add_prop(&c, t, ex_id, ps)
   types.ct_set(c.ffi, c.ho_resolved, types.ct_at(c.ffi, c.hta, t), 1)
-  c.cjs_mod_t[f] = t
-  return t
+  return c.cjs_mod_t.add(f, t)
 
 # exports in a CommonJS JavaScript file that declares no exports of its own, with top-level
 # exports.x = v and exports used only as a property access's object: the file's exports, the binder's ModuleExports symbol, typeof
@@ -21565,9 +21597,9 @@ fn cjs_exports_ident(var c: C, n: Int, s: Int) -> Int:
   if s >= 0:
     let d = types.ct_at(c.ffi, c.hsdecl, s)
     if d < 0 or c.t.nd[d].file == f: return -2
-  if f in c.cjs_xs_t:
-    if c.cjs_xs_t[f] == -3: return -2
-    return c.cjs_xs_t[f]
+  let had = c.cjs_xs_t.get(f, types.SM_NONE)
+  if had != types.SM_NONE: return had
+  if f in c.cjs_xs_busy: return -2
   let root = c.roots[f]
   if root in c.cjs_exp: return -2
   var lhs_ids: {Int: Bool} = {}
@@ -21598,13 +21630,13 @@ fn cjs_exports_ident(var c: C, n: Int, s: Int) -> Int:
   while i >= 0 and c.t.nd[i].file == f:
     if c.t.nd[i].k == ast.N_ID and c.t.nd[i].s == ex_id and not (i in lhs_ids) and not (i in objs): return -2
     i -= 1
-  c.cjs_xs_t[f] = -3
+  c.cjs_xs_busy[f] = true
   var pts: [Int] = []
   for v in vals:
     let et = check_expr(&c, v, -1)
     if et < 0 or types.ct_at(c.ffi, c.htk, et) == TK_UNSUP:
-      c.cjs_xs_t[f] = et
-      return et
+      c.cjs_xs_busy.remove(f)
+      return c.cjs_xs_t.add(f, et)
     # (getWidenedType: object literals widened, a literal kept, exports.k = 2 is 2)
     let wo = widen_objs(&c, et)
     pts.push(types.regular(c, wo))
@@ -21614,8 +21646,8 @@ fn cjs_exports_ident(var c: C, n: Int, s: Int) -> Int:
     types.sty_init(&c, ps, pts[j])
     types.add_prop(&c, t, names[j], ps)
   types.ct_set(c.ffi, c.ho_resolved, types.ct_at(c.ffi, c.hta, t), 1)
-  c.cjs_xs_t[f] = t
-  return t
+  c.cjs_xs_busy.remove(f)
+  return c.cjs_xs_t.add(f, t)
 
 fn tsprog_require_spec(c: C, n: Int) -> Int:
   if c.t.nd[n].k != ast.N_CALL or c.t.nd[n].b >= 0: return -1

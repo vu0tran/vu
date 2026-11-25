@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sched.h>
 #define CT_MAX ((int64_t)1 << 28)  // entries a column can hold (2 GB of address space, reserved only)
 
 // The tables a checker uses are made through one store (types.Store, the owner: the task that made
@@ -277,6 +278,19 @@ static inline void cx_put(void *h, int64_t k, int64_t v) {
   __atomic_store_n(&p[k], v + CX_OFF, __ATOMIC_RELEASE);
   ct_cover(p, k + 1);
 }
+// k's value set once: from none to v with a compare-and-swap; the value k has after (v when this
+// call set it, else the one another task set first)
+static inline int64_t cx_publish(void *h, int64_t k, int64_t v) {
+  int64_t *p = h;
+  if ((uint64_t)k >= (uint64_t)CT_MAX) vu_panic(0, "cx_publish: index out of range", 30);
+  int64_t old = 0;
+  if (__atomic_compare_exchange_n(&p[k], &old, v + CX_OFF, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+    ct_cover(p, k + 1);
+    return v;
+  }
+  ct_cover(p, k + 1);
+  return old - CX_OFF;
+}
 static inline void cx_del(void *h, int64_t k) {
   int64_t *p = h;
   if ((uint64_t)k < (uint64_t)ct_len0(p)) __atomic_store_n(&p[k], 0, __ATOMIC_RELEASE);
@@ -290,7 +304,8 @@ static inline void *ckl_new(void *st) {
 static inline const int64_t *ckl_rp(const cl_t *h, int64_t k) {
   if ((uint64_t)k >= (uint64_t)(ct_len0(h->row) >> 1)) return NULL;
   const int64_t *rp = &h->row[2 * k];
-  if (__atomic_load_n(&rp[0], __ATOMIC_ACQUIRE) == 0) return NULL;
+  // (0: no list; -1: claimed by a ckl_publish, its list not written yet)
+  if (__atomic_load_n(&rp[0], __ATOMIC_ACQUIRE) <= 0) return NULL;
   return rp;
 }
 static inline bool ckl_has(void *p, int64_t k) { return ckl_rp(p, k) != NULL; }
@@ -348,6 +363,27 @@ static inline void ckl_add(void *p, int64_t k, int64_t v) {
   int64_t *w = &h->row[2 * k];
   __atomic_store_n(&w[1], n + 1, __ATOMIC_RELAXED);
   __atomic_store_n(&w[0], at, __ATOMIC_RELEASE);
+}
+// row k's list set to xs unless it has one: true when this call set it, false when another task's
+// list is there (read it with ckl_*). The row is claimed first (its offset from 0 to -1 by a
+// compare-and-swap), then its list written and published; a second publisher waits for the
+// claimer's few stores (no fill: the claimer waits on nothing), so it returns only once that list
+// can be read.
+static inline bool ckl_publish(void *p, int64_t k, const int64_t *xs, int64_t n) {
+  cl_t *h = p;
+  if ((uint64_t)k >= (uint64_t)(CT_MAX / 2)) vu_panic(0, "ckl_publish: row out of range", 29);
+  int64_t *rp = &h->row[2 * k];
+  int64_t old = 0;
+  if (!__atomic_compare_exchange_n(&rp[0], &old, -1, false, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
+    while (__atomic_load_n(&rp[0], __ATOMIC_ACQUIRE) < 0) sched_yield();
+    return false;
+  }
+  int64_t at = cl_res(h, n);
+  for (int64_t i = 0; i < n; i++) h->pool[at + i] = xs[i];
+  __atomic_store_n(&rp[1], n, __ATOMIC_RELAXED);
+  ct_cover(h->row, 2 * k + 2);
+  __atomic_store_n(&rp[0], at, __ATOMIC_RELEASE);
+  return true;
 }
 static inline void ckl_del(void *p, int64_t k) {
   cl_t *h = p;
