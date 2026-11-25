@@ -326,6 +326,7 @@ What's left, by size (job-wide, vlint's own about 85 cpu-s, node about 96):
   (infer_mutation_aliasing_effects about 37% of it: apply_effect, compute_signature, clone_state;
   enter_ssa 9%; lowering 9%; rc_shapes.base, the registry built again for every file, 7%: one built
   once and shared read-only, with each file's additions in an overlay, is the next small step).
+  Done since: see "vlint's own process on the largest plain invocation" below.
 - the module graph: 1.2-2.7 s of read, parse and resolve per large package even with the record
   cache; dependencies' re-exports are what import/named and friends need.
 
@@ -388,6 +389,57 @@ What's left in node: start-up (about 0.1 cpu-s a process, 0.05 of it node's own;
 snapshot of the host could save part of the rest, but the plugins are ESM loaded with import());
 oxlint's walker (9.7 s sampled); the ajv meta schema at start (13 ms a process: uri-js's IPv6
 regex on hosts without a colon, a guard would skip it); setParents (a fifth of the remaining build).
+
+## vlint's own process on the largest plain invocation (measured 2026-11-25)
+
+How it was measured (the machine had a load average of 10-30 and every wall and cpu time was off):
+instructions retired of vlint's process alone. `/usr/bin/time -l`'s count is the process's own, not
+its children's (`sh -c 'python3 -c ...; true'` reports 24 M against the child's 7.0 G), so the node
+processes don't count, and one.py execs vlint in its place. To isolate the React Compiler, the same
+invocation (the largest package, 12,400 files) with a config that turns on only its rules: 139.8 G,
+of which read, parse and scopes 9.7 G (VLINT_PHASE=2), so the compiler was about 130 G. The plain
+invocation itself was 192.3 G: VLINT_PHASE 0 / 1 / 2 / 9 = 6.4 / 28.3 / 29.1 / 149.4 G after the
+changes below (phases 0-2 don't change with them). The run-to-run noise is about 0.3 G.
+
+Profiles: `vu --profile` puts 21-25% of the samples on lint_one's `fs.read` line and 20% on
+ljs.call; both are threads blocked (VLINT_PHASE=0, which reads every file, is 4.8 G). macOS's
+`/usr/bin/sample PID 2 -file OUT` on the running process shows the C level the Vu profile hides:
+of the busy samples in the compiler, malloc, free and realloc about 25%, memmove/memset 8-12%,
+hash-map operations 12-14% (`vu_mget_M3_IntS_rc_hir__BasicBlock` alone 4%: every pass looks up
+`f.body.blocks[bid]` in a map). Scripts in the session's scratch `m8/` (samp.py: a sample's
+allocation samples charged to the Vu function that called; incl.py: inclusive samples).
+
+What landed (the compiler-only invocation, G instructions, cumulative; every output identical):
+| change | G |
+|---|---|
+| before | 139.8 |
+| rc_shapes: the built-in shapes and globals built once per process (`shared_base`, a Shared `Base` in `rules.Cx.rcb`); a file's Registry holds only the module types it adds, looked up first | 137.0 |
+| rc_imae: an identifier's one value read without making a list (kind_sp, merge_vars, define, assign, freeze); the never-read `initialized` set no longer written; rc_ssa: definitions in one map keyed `block << 32 \| id`, the predecessors not copied on every lookup | 100.3 |
+| rc_imae: the state indexed by `local_order` (the identifiers the function names first, a gap for the ones the pass makes, the rest after) instead of by identifier: an inner function's state was as long as the file's identifiers (one package: 27,620 calls, 179,000 clones copying 570 M ints); rmore10's rule list built once per setup | 94.5 |
+| rc_build.is_always_reserved: a length and first-letter test before the 36 comparisons; rc_imae: phis and freezes of one value without lists, local_order's list made by repetition | 92.4 |
+| rc_imar: the nodes in a list with an identifier -> index map (mutate looked a node up a dozen times a visit); rc_lower: a nested function's builder is lent the parent's bindings and names instead of copying them in and back | 89.6 |
+| rc_vref: the checks and lookup read the environment in place instead of through a copied one-element list; shapes compared without copying | 87.1 |
+| rmore10: comments, module kind and the source copy only for files with a function to compile | 86.7 |
+
+The plain invocations, vlint's own process, before -> after (G; the build before rmore10's
+change): the largest package 192.3 -> 142.9; the next three by the job's time 31.8 -> 27.2, 20.6 -> 20.2 and 29.0 -> 28.1 (outputs
+identical to the old build's).
+
+Reverted (within the noise): eliminate_redundant_phi skipping rewrites while nothing is mapped
+(0.16 G), imae's signature cache as a list plus `reserve` on its output (0.15 G).
+
+What's left, by size:
+- allocation: lists grow with malloc/realloc and every `[x]` or `[]`-returned option, every
+  `value_operands` list and every copied AliasingEffect (224 bytes, pushed again each time a block
+  is re-applied) is a malloc. Short strings already have per-thread free lists in the runtime; the
+  same for small list buffers would be a runtime change for the whole language (every free of a
+  list's data goes through generated drops), not tried here.
+- the HIR's blocks are a map `{Int: BasicBlock}`; block ids are the file's (shared by nested
+  functions), so a list by id would be sparse; a per-function index would touch every pass.
+- the module graph: 18,377 records on the largest package (12,428 of them the linted files, parsed
+  again for their records; 4,023 in node_modules), about 18 G of the 28 G of phase 1, mostly
+  open/read/stat (`sample` shows the graph workers in `__open_nocancel`, `read` and `stat`).
+- the React Compiler is still about 77 G of the largest package's 143 G.
 
 ## Checking one program on several workers (design notes, measured 2026-11-24)
 
