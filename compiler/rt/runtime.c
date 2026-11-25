@@ -513,6 +513,8 @@ static void *vu_bump(size_t n) {
 #endif
 /* another handle to a Shared value (its count is atomic: handles live on any thread) */
 #define VU_SHUP(p) ({ __typeof__(p) vu_shq_ = (p); __atomic_add_fetch(&vu_shq_->refs, 1, __ATOMIC_RELAXED); vu_shq_; })
+/* a Shared value's value, writable: only while this is its only handle (no other task can see it) */
+#define VU_SHUNIQ(p, line) ({ __typeof__(p) vu_shu_ = (p); if (__atomic_load_n(&vu_shu_->refs, __ATOMIC_ACQUIRE) != 1) vu_panic(line, "a Shared value's .unique used while it has other handles", sizeof "a Shared value's .unique used while it has other handles" - 1); vu_shu_; })
 /* move: copy the value out and zero the source so its later drop is a no-op */
 #define VU_MV(x) ({ __typeof__(x) vu_mv_ = (x); memset(&(x), 0, sizeof(x)); vu_mv_; })
 

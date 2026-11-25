@@ -775,6 +775,10 @@ let h = share(own fn(req: Request) => answer(req, base))   # closures too: h.val
   bindings and moves out of it are compile errors), so readers never see it change and need no
   locks. It's freed when its last handle goes. A channel inside is still a channel: tasks send and
   receive through it (a pool of connections in a `Chan[pg.Db]` inside a `Shared` value works).
+- `s.unique` is the value too, but writable (`s.unique.nodes.push(n)`, `grow(&s.unique)`), for
+  building a value in place before tasks see it: using it while another handle exists (another
+  `s.share()`, a task's) stops the program. A value read by tasks and filled by one owner first
+  can then be one `Shared` field from the start.
 - Passing a `Shared` value to an `own` parameter (or `spawn`) gives the callee another handle, as
   for channels; `s.share()` makes one to store. `let t = s` moves the handle.
 - A `Shared` value can't hold a connection, a listener or a C handle (using one from several tasks

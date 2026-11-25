@@ -3335,3 +3335,18 @@ a wrong value, `get` without a default) found nothing but two mistakes in the te
 under TSan (`CC=clang vu build --tsan`, three runs of each spawn test) no reports, and a planted bug
 (a slot's hash word published before its key, or read relaxed) is reported (1 of 3 and 3 of 3
 runs). The par test runs under ASan only here: Archer isn't installed on this Mac.
+
+**A Shared value built in place: `.unique` (2026-11-25).** A value tasks read at once had to be
+complete before `share()`, so a program that fills a large structure through one field and then
+hands it to worker tasks (a type checker's syntax tree, read by every checking thread, but added to
+while binding) needed two fields and two ways to read it. `s.unique` is the value of `s`, writable
+(`s.unique.nd.push(n)`, `grow(&s.unique)`), checked where it's used: while `s` has another handle
+(`s.share()`, a task's), the program stops ("a Shared value's .unique used while it has other
+handles"). The count is read with acquire ordering, so a task's last reads happen before the writes
+that follow its handle's drop. `.value` stays read-only. Attack round 1 (targeted 801-806: building
+through a field, an index, push and a `var` argument, then 4 tasks reading; a handle kept in a
+struct; every task's handle dropped first; a parameter that isn't `var`; a view of `.value` held
+across a write; a write reached through an outer `.value`) found only mistakes in the tests (a wrong
+expected sum, and a test that raced its own tasks' drops); round 2 (807: a list swapped out of
+`.unique`, Shared values in a list written through `.unique`, a map entry replaced; ASan, UBSan and
+the C audit clean) found nothing.
