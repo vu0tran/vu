@@ -327,14 +327,18 @@ vu_str vl_read_text(const vu_str *path, int64_t *ok, int64_t n) {
 
 // ---- folders' listings, shared by the module graph's workers (vl_lkind, vl_llink)
 // A stat costs about as much as listing a small folder, and resolving a request looks at up to 17
-// paths of one folder, most of them not there. Each folder is listed once (opendir, d_type), into a
-// table of 64 parts by the folder's hash, each with its lock; the entries are found by their name
-// in ASCII lower case, so a name the file system could match under another case is seen.
+// paths of one folder, most of them not there. A folder asked about VL_LIST_AFTER times is listed,
+// once (opendir, d_type; the others are answered by stat): a table of 64 parts by the folder's hash,
+// each with its lock, held while a folder is listed. The entries are found by their name in ASCII
+// lower case, so a name the file system could match under another case is seen. (Listing every
+// folder asked about once listed home folders and a 43,000-file package four times, once for each
+// worker, and made a small package's graph a third slower.)
 #include <dirent.h>
 #include <pthread.h>
 typedef struct { char *name; uint32_t len; uint64_t lh; uint8_t dt; int8_t kind; } vl_dent;
+#define VL_LIST_AFTER 4
 typedef struct vl_dir {
-  char *path; size_t plen; uint64_t h; int ok; int wide;
+  char *path; size_t plen; uint64_t h; int ok; int wide; int listed; int asked;
   uint32_t n; vl_dent *e; uint32_t mask; int32_t *slot;
   struct vl_dir *next;
 } vl_dir;
@@ -363,12 +367,10 @@ static int vl_ieq(const char *a, const char *b, size_t n) {
   return 1;
 }
 
-static vl_dir *vl_list(const char *path, size_t plen, uint64_t h) {
-  vl_dir *d = calloc(1, sizeof *d);
-  d->path = malloc(plen + 1); memcpy(d->path, path, plen); d->path[plen] = 0;
-  d->plen = plen; d->h = h;
+static void vl_list(vl_dir *d) {
+  d->listed = 1;
   DIR *dd = opendir(d->path);
-  if (!dd) return d;
+  if (!dd) return;
   d->ok = 1;
   uint32_t cap = 16;
   d->e = malloc(cap * sizeof(vl_dent));
@@ -398,31 +400,28 @@ static vl_dir *vl_list(const char *path, size_t plen, uint64_t h) {
     while (d->slot[s] >= 0) s = (s + 1) & d->mask;
     d->slot[s] = (int32_t)k;
   }
-  return d;
 }
 
-static void vl_free_dir(vl_dir *d) {
-  for (uint32_t k = 0; k < d->n; k++) free(d->e[k].name);
-  free(d->e); free(d->slot); free(d->path); free(d);
-}
-
-// the listing of path's folder (path[0..plen]), listed now if no worker has
+// the listing of path's folder (path[0..plen]), listed now if it's been asked about often
+// enough; NULL while it hasn't
 static vl_dir *vl_dir_of(const char *path, size_t plen) {
   uint64_t h = vl_fnv(path, plen, 0);
   int part = (int)(h % VL_PARTS);
   size_t b = (size_t)((h >> 6) % VL_BUCKETS);
   pthread_mutex_lock(&vl_dmu[part]);
-  for (vl_dir *d = vl_dtab[part][b]; d; d = d->next)
-    if (d->h == h && d->plen == plen && memcmp(d->path, path, plen) == 0) { pthread_mutex_unlock(&vl_dmu[part]); return d; }
+  vl_dir *d = vl_dtab[part][b];
+  while (d && !(d->h == h && d->plen == plen && memcmp(d->path, path, plen) == 0)) d = d->next;
+  if (!d) {
+    d = calloc(1, sizeof *d);
+    d->path = malloc(plen + 1); memcpy(d->path, path, plen); d->path[plen] = 0;
+    d->plen = plen; d->h = h;
+    d->next = vl_dtab[part][b];
+    vl_dtab[part][b] = d;
+  }
+  if (!d->listed && ++d->asked >= VL_LIST_AFTER) vl_list(d);
+  vl_dir *out = d->listed ? d : NULL;
   pthread_mutex_unlock(&vl_dmu[part]);
-  vl_dir *nd = vl_list(path, plen, h);
-  pthread_mutex_lock(&vl_dmu[part]);
-  for (vl_dir *d = vl_dtab[part][b]; d; d = d->next)
-    if (d->h == h && d->plen == plen && memcmp(d->path, path, plen) == 0) { pthread_mutex_unlock(&vl_dmu[part]); vl_free_dir(nd); return d; }
-  nd->next = vl_dtab[part][b];
-  vl_dtab[part][b] = nd;
-  pthread_mutex_unlock(&vl_dmu[part]);
-  return nd;
+  return out;
 }
 
 // (folders of links, where a listing says little: node_modules and its @scope folders)
@@ -479,6 +478,7 @@ int64_t vl_lkind(const vu_str *path) {
   size_t n = (size_t)path->len;
   if (!vl_listable(p, dl)) return -1;
   vl_dir *d = vl_dir_of(p, dl);
+  if (!d) return -1;
   if (!d->ok) return -2;
   size_t bs = dl == 1 ? 1 : dl + 1;
   int ci;
@@ -506,7 +506,7 @@ int64_t vl_llink(const vu_str *path) {
   size_t n = (size_t)path->len;
   if (!vl_listable(p, dl)) return -1;
   vl_dir *d = vl_dir_of(p, dl);
-  if (!d->ok) return -1;
+  if (!d || !d->ok) return -1;
   size_t bs = dl == 1 ? 1 : dl + 1;
   int ci;
   int64_t k = vl_find(d, p + bs, n - bs, &ci);
