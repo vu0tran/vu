@@ -300,22 +300,25 @@ printed nothing on these invocations (exit 0), so its per-rule costs weren't mea
 
 What landed:
 - node processes as the work needs them (ljs_glue.c: vl_node_expect, vl_pick): told how many lint
-  requests the run sends, calls go to the least loaded of the processes in use, and another is added
-  only when the requests left, at the time the answers so far took, are more than 0.5 s for each
-  process in use. Small packages keep one process; the largest still get four within the first few
-  hundred files. 341 -> 170 processes, node 130 -> 102 cpu-s.
+  requests the run sends, calls go to the least loaded of the processes in use, and once 16 answers
+  have come another is added only when the requests left, at the time the answers so far took, are
+  more than 1.0 s for each process in use. Small packages keep one process; the largest still get
+  four within the first few hundred files. 341 -> 134 processes, node 130 -> 96 cpu-s. (With 0.5 s
+  and 4 answers: 170 processes, the plain job 190 cpu-s.)
 - no-barrel-file's module graph scoped to what it counts (lmod: fullv, nb_seeds, mark_full): a
   dependency is followed whole only when it is reachable from what a linted file re-exports whole
   (`export * from`, `export * as ns from`, an exported namespace import); every other dependency
   only through its re-exports, as with the rule off (no-cycle doesn't go through node_modules). The
   counts are the same; most packages have no such file (the job reports two barrel files).
-Together: the plain-only job 190.4 and 189.9 cpu-s, 35.5 and 35.5 s (from 240.3 and 241.1, 41.0
-and 40.0; oxlint 146.8 and 148.0 cpu-s); the full cold job 76.6 and 74.7 s, 459 and 461 cpu-s
-(before 78.4 and 79.1 s, 501 and 497; oxlint 73.7 and 74.7 s, 470 and 472), every output identical.
+Together: the plain-only job 180.9 and 181.7 cpu-s, 33.2 and 34.1 s (from 240.3 and 241.1, 41.0
+and 40.0; oxlint 146.4 and 148.7 cpu-s); the full cold job 74.8 and 74.8 s, 451.5 and 449.0 cpu-s
+(before 78.4 and 79.1 s, 501 and 497; oxlint, alternated, 74.6 and 73.9 s, 473 and 468), every
+output identical. So the plain lint is down a quarter, not the half aimed at; the job's wall is
+the type-aware part's.
 The plain numbers include the node wrapper (a python process per node process).
 
-What's left, by size (job-wide, vlint's own about 88 cpu-s, node about 102):
-- node: about 34 cpu-s of the 102 is still process starts (170); the rest is per-file work, on light
+What's left, by size (job-wide, vlint's own about 85 cpu-s, node about 96):
+- node: about 27 cpu-s of the 96 is still process starts (134; 88 is the floor with one each); the rest is per-file work, on light
   plugins mostly the transfer (JSON.parse, buildEstree, setParents). A binary transfer read lazily,
   as oxlint's raw transfer, would cut most of it. A plugin that runs React's compiler itself is
   heavy in both linters; four processes warm its JIT four times.

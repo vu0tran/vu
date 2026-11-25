@@ -3269,11 +3269,12 @@ the CI job's pattern without type-aware rules, vlint's plain lint cost 240 cpu-s
 147: 341 node processes for JS plugins (one per two cores in every invocation, about 0.2 cpu-s each
 to start, most for packages of a few dozen files) and a module graph that followed every import of
 every dependency for no-barrel-file. Now a process is added only when the requests left are more
-than 0.5 s of work for each process in use (at the time the answers so far took), and a dependency
-is followed whole only when it is reachable from what a linted file re-exports whole. Measured
-alternated with oxlint 1.79: the plain-only job 190.4 and 189.9 cpu-s (35.5 s twice; node 130 -> 102
-cpu-s, 341 -> 170 processes), the full cold job 76.6 and 74.7 s, 459 and 461 cpu-s (from 78.4 and
-79.1 s, 501 and 497; oxlint 73.7 and 74.7 s, 470 and 472). All 88 outputs identical, the 133 probes
+than 1.0 s of work for each process in use (at the time the first 16 answers and those after took),
+and a dependency is followed whole only when it is reachable from what a linted file re-exports
+whole. Measured alternated with oxlint 1.79: the plain-only job 180.9 and 181.7 cpu-s, 33.2 and
+34.1 s (from 240.3 and 241.1, 41.0 and 40.0; node 130 -> 96 cpu-s, 341 -> 134 processes; oxlint
+146-149), the full cold job 74.8 s twice, 451.5 and 449.0 cpu-s (from 78.4 and 79.1 s, 501 and 497;
+oxlint 74.6 and 73.9 s, 473 and 468). All 88 outputs identical, the 133 probes
 the same, vtest's 3 failures unchanged. Tried and not kept: kind_of answered from folder listings
 (in Vu maps: more instructions; in C, shared by the process: 34,000 of 34,400 answers without a
 stat, cpu unchanged) and integer keys for the React Compiler's value cache (-0.4% instructions).

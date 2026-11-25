@@ -74,7 +74,7 @@ static int vl_slots = 1, vl_next_slot = 0, vl_inited = 0;
 static long vl_expect = -1, vl_nsent = 0;
 static int vl_inuse = 1;
 static double vl_spawned_at = 0;
-#define VL_SPAWN_SECS 0.5
+#define VL_SPAWN_SECS 1.0
 static char vl_pool[32] = "";     /* --v8-pool-size=N for the processes, or "" */
 static __thread int vl_slot = -1;
 
@@ -514,7 +514,7 @@ static int vl_pick(void) {
         pthread_mutex_unlock(&w->rmu);
         if (bestq < 0 || q < bestq) { bestq = q; best = i; }
     }
-    if (vl_inuse < vl_slots && served >= 4 && bestq > 0) {
+    if (vl_inuse < vl_slots && served >= 16 && bestq > 0) {
         double now = vl_now();
         double left = (double)(vl_expect - vl_nsent) * busy / (double)served;
         if (now - vl_spawned_at > 0.05 && left / vl_inuse > VL_SPAWN_SECS) {
