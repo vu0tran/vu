@@ -462,7 +462,13 @@ static bool vl_send(vl_worker *w, const vu_str *req, long *t, int *g) {
         vl_req_path(req, path, sizeof path);
         VL_DBG("process %d: sending request of %lld bytes on its fd 3 (vlint's fd %d), ticket %ld%s%s", (int)w->pid, (long long)req->len, w->in, w->tickets, path[0] ? ": " : "", path);
     }
-    bool ok = vl_write_req(w, req->data, (size_t)req->len) && vl_write(w, w->in, "\n", 1);
+    /* (a frame, ljs.lint_frame: its JSON line, then its bytes as they are; any other request: one
+       line) */
+    static const char frame[] = "{\"op\":\"lintb\"";
+    const char *rd = (const char *)req->data, *nl = NULL;
+    if ((size_t)req->len > sizeof frame - 1 && memcmp(rd, frame, sizeof frame - 1) == 0) nl = memchr(rd, '\n', (size_t)req->len);
+    bool ok = nl ? vl_write_req(w, rd, (size_t)(nl + 1 - rd)) && vl_write(w, w->in, nl + 1, (size_t)(rd + req->len - (nl + 1)))
+                 : vl_write_req(w, rd, (size_t)req->len) && vl_write(w, w->in, "\n", 1);
     pthread_mutex_lock(&w->rmu);
     VL_DBG("process %d: request of %lld bytes sent (%s), ticket %ld", (int)w->pid, (long long)req->len, ok ? "ok" : "failed", w->tickets);
     if (ok && !w->broken) {

@@ -329,6 +329,66 @@ What's left, by size (job-wide, vlint's own about 85 cpu-s, node about 96):
 - the module graph: 1.2-2.7 s of read, parse and resolve per large package even with the record
   cache; dependencies' re-exports are what import/named and friends need.
 
+## The node processes on the CI job's pattern (measured 2026-11-25)
+
+Which JS plugins run: every invocation has the monorepo's own local plugin (a `.mts` of about 30
+rules on CallExpression, MemberExpression, JSX and import nodes; company-specific, so it can't be
+ported into this repo), four packages add eslint-plugin-react-hooks' compiler rules, two add
+eslint-plugin-n and eslint-plugin-jsx-a11y. Node cpu by invocation (a `node` wrapper logging each
+process's cpu and the invocation): the react-hooks packages are about half (the largest 32 cpu-s in
+4 processes, three more 3-8 each), the other 83 invocations the rest at 0.1-8 each.
+
+Where it goes (`node --cpu-prof` on every process of the plain job, main threads only, 71 s
+sampled of 98 by rusage; the rest is V8's GC and compiler threads): process start-up to the first
+lint request about 110 ms a process (node's own internal modules compiled, 33 ms; the host module;
+ajv's meta schema, 13 ms, mostly uri-js's IPv6 regex), 14.6 s over 133 processes; building the
+ESTree 13.0 s; the plugin's work (React's compiler and Babel, 17.7 s; the local plugin 3 s);
+oxlint's walker and context 9.7 s; JSON.parse of the requests 3.2 s; GC 4.7 s.
+
+Not portable to Vu with identical output: eslint-plugin-react-hooks 7.1.1's compiler rules. vlint's
+native React Compiler (rc_*.vu) is oxc's port of a later compiler, and they disagree on this very
+monorepo: the native react(purity) reports `new Date()` in render at six places in one package
+where react-hooks-js/purity (on as an error) reports nothing. The JS rules also print Babel code
+frames with absolute paths. Its cost is the plugin's own: one package's 1,430 files take 21.1
+cpu-s in one process and 29.0 in four (the JIT warmed four times), against 6.8 s of wall instead of
+about 25. No V8 flag tried changed that by more than 4% (semi-space 32/64 MB, single-threaded GC,
+pool size 0/1; the pool is already 1 on the job). The plugin skips files with no top-level
+component or hook itself (`mayContainReactCode`), so skipping node for them saves nothing while the
+local plugin needs every file.
+
+What landed:
+- estree.js's node literals made with constructors (gen_host.py `with_ctors`, at host generation):
+  V8 builds `{ __proto__: NodeProto, ... }` about 8.5 times slower than `new Nd(...)` with the same
+  prototype and keys in the same order (100,000 Identifiers: 1,170 ms against 137), and reads
+  them about 1.8 times slower. buildEstree on 13,863 captured requests 2,353 -> 882 ms; the trees
+  dumped (keys in order, values, prototypes, property attributes, parent links) identical. oxlint's
+  own deserializer makes its nodes the same slow way.
+- lint requests as frames (ljs.lint_frame, ljs_glue.c vl_send, main.js): the JSON line without the
+  text and the node and list arrays, then those as bytes (int32 arrays read in place by estree.js;
+  the text's bytes given as they are when they're valid UTF-8). No readline: fd 3 is split by hand,
+  a frame's bytes copied into a fresh aligned buffer. vlint no longer formats 64 million numbers
+  per 14,000 files, node no longer parses them. A number that doesn't fit an int32 falls back to the
+  JSON request. Checked: the trees from typed arrays dump identical on 8,220 requests; a scratch
+  plugin reporting every Identifier's span, parent and loc, every Literal and the token and comment
+  counts gives the same 80,090 lines with the old and new build on a BOM file, a .vue section,
+  invalid UTF-8, U+2028, an emoji, an empty file and a 20,000-line file.
+- `gen_host.py --from-lhost` regenerates the host from the current lhost.vu (oxlint 1.90's dist
+  isn't needed to change jsplug/).
+
+Measured: with the constructors alone, one plain-only job on a quiet machine: node 97.8 -> 91.8
+cpu-s, the job 183.4 -> 177.5 cpu-s (one run each, outputs identical); the profiled ESTree share
+13.0 -> 7.6 s. With frames too, the job wasn't measured: the machine then had a load average of
+15-27 from other work and a 99%-full disk, every job's cpu was about doubled (oxlint's plain job
+971 cpu-s, its usual 476) and invocations of the old build, the new one and oxlint alike stalled
+for 4-50 minutes with their processes idle (not reproduced alone in 30 runs of one invocation). So
+the frames' saving is measured only offline: JSON.parse was 0.8 of the 3.2 s (JSON.parse + build)
+on 13,863 requests, and 3.2 s of the 71 sampled job-wide. Measure it again on a quiet machine.
+
+What's left in node: start-up (about 0.1 cpu-s a process, 0.05 of it node's own; a user-land V8
+snapshot of the host could save part of the rest, but the plugins are ESM loaded with import());
+oxlint's walker (9.7 s sampled); the ajv meta schema at start (13 ms a process: uri-js's IPv6
+regex on hosts without a colon, a guard would skip it); setParents (a fifth of the remaining build).
+
 ## Checking one program on several workers (design notes, measured 2026-11-24)
 
 tsgolint checks a program on several checkers over one parsed and bound program, the files split

@@ -5,7 +5,7 @@
 //    "settings", "globals"}                      -> null, or lintFile's answer (JSON text)
 import { writeSync as __vlWriteSync } from "node:fs";
 import { Socket as __vlSocket } from "node:net";
-import { createInterface as __vlCreateInterface } from "node:readline";
+import { isUtf8 as __vlIsUtf8 } from "node:buffer";
 
 // (standard output and error are vlint's: Node makes pipes non-blocking, which would make vlint's
 // own writes fail half-way; back to blocking, as oxlint's cli.js does)
@@ -42,7 +42,8 @@ function __vlHandleOnce(line, done) {
 function __vlHandle(line, __vlAnswer) {
   if (line === "") return;
   let req;
-  try {
+  if (typeof line !== "string") req = line;
+  else try {
     req = JSON.parse(line);
   } catch (err) {
     __vlAnswer({ Failure: "vlint: bad request" });
@@ -50,7 +51,7 @@ function __vlHandle(line, __vlAnswer) {
   }
   if (req.op === "load") return loadPluginWrapper(req.url, req.name, req.alias).then((res) => __vlAnswer(__vlCut(res, "loadPluginWrapper")));
   if (req.op === "setup") return __vlAnswer(__vlCut(setupRuleConfigsWrapper(req.json), "setupRuleConfigsWrapper"));
-  if (req.op === "lint") return __vlAnswer(__vlCut(lintFileWrapper(req), "lintFileWrapper"));
+  if (req.op === "lint" || req.op === "lintb") return __vlAnswer(__vlCut(lintFileWrapper(req), "lintFileWrapper"));
   __vlAnswer(null);
 }
 let __vlChain = Promise.resolve();
@@ -67,7 +68,58 @@ __vlIn.on("error", (err) => {
   }
   process.exit(1);
 });
-__vlCreateInterface({ input: __vlIn, crlfDelay: Infinity }).on("line", (line) => {
+// A lint frame (ljs.lint_frame): its JSON, then the text, zeros to a multiple of 4, the nodes and
+// the lists as int32 arrays, read in place. Its text is given as its bytes too when they are valid
+// UTF-8 (the bytes the tree's positions count; estree.js reads them as they are).
+function __vlFrame(head, buf) {
+  const [sl, nl, ll] = head.bin;
+  const sb = Buffer.from(buf.buffer, buf.byteOffset, sl);
+  head.src = sb.toString("utf8");
+  if (__vlIsUtf8(sb)) head.srcBuf = sb;
+  const at = buf.byteOffset + sl + ((4 - sl % 4) % 4);
+  head.tree.nd = new Int32Array(buf.buffer, at, nl);
+  head.tree.L = new Int32Array(buf.buffer, at + 4 * nl, ll);
+  return head;
+}
+// fd 3's bytes split into requests: lines, a frame's bytes after its line
+let __vlPend = null, __vlBody = null, __vlFill = 0, __vlHead = null;
+__vlIn.on("data", (chunk) => {
+  let c = chunk;
+  for (;;) {
+    if (__vlBody !== null) {
+      const n = Math.min(c.length, __vlBody.length - __vlFill);
+      __vlBody.set(n === c.length ? c : c.subarray(0, n), __vlFill);
+      __vlFill += n;
+      c = c.subarray(n);
+      if (__vlFill < __vlBody.length) return;
+      const req = __vlFrame(__vlHead, __vlBody);
+      __vlBody = __vlHead = null;
+      __vlRequest(req);
+      continue;
+    }
+    if (c.length === 0) return;
+    const nl = c.indexOf(10);
+    if (nl < 0) { __vlPend = __vlPend === null ? Buffer.from(c) : Buffer.concat([__vlPend, c]); return; }
+    let lb = c.subarray(0, nl);
+    if (__vlPend !== null) { lb = Buffer.concat([__vlPend, lb]); __vlPend = null; }
+    c = c.subarray(nl + 1);
+    const line = lb.toString("utf8");
+    if (line.startsWith('{"op":"lintb"')) {
+      let head = null;
+      try { head = JSON.parse(line); } catch {}
+      if (head !== null && Array.isArray(head.bin)) {
+        const [sl, nl2, ll] = head.bin;
+        __vlHead = head;
+        // (a fresh buffer: the int32 arrays need it aligned)
+        __vlBody = new Uint8Array(sl + ((4 - sl % 4) % 4) + 4 * (nl2 + ll));
+        __vlFill = 0;
+        continue;
+      }
+    }
+    __vlRequest(line);
+  }
+});
+function __vlRequest(line) {
   // (every request is answered exactly once: if handling it throws, the error is the answer, and
   // the chain goes on to the next request rather than stopping for good; issue #7)
   __vlChain = __vlChain.then(() => {
@@ -86,4 +138,4 @@ __vlCreateInterface({ input: __vlIn, crlfDelay: Infinity }).on("line", (line) =>
     }
     if (r && typeof r.then === "function") return r.then(undefined, fail);
   });
-});
+}
