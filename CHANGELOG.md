@@ -3278,3 +3278,40 @@ oxlint 74.6 and 73.9 s, 473 and 468). All 88 outputs identical, the 133 probes
 the same, vtest's 3 failures unchanged. Tried and not kept: kind_of answered from folder listings
 (in Vu maps: more instructions; in C, shared by the process: 34,000 of 34,400 answers without a
 stat, cpu unchanged) and integer keys for the React Compiler's value cache (-0.4% instructions).
+
+**Lists' and maps' buffers from per-thread free lists (2026-11-25).** On macOS, malloc, free and
+realloc were about a quarter of vlint's busy samples in its React Compiler: every list grew from
+malloc and was freed to it, and so was every map's entry array and index. Now a buffer of up to
+1,024 bytes whose size is a multiple of 8 goes back, when it's freed, on a free list of its thread
+for exactly that size (`vu_lalloc`, `vu_lfree` and `vu_lgrow` in rt/runtime.c; list.c and the
+map templates, and the lists' drop functions in c5_build.vu, use them). A buffer is freed knowing
+only its capacity, which never says more than the buffer holds, so a buffer made anywhere by malloc
+can go on the list its capacity names, and one taken from a list can still be freed by free(): the
+lists need no header and no agreement with code that still calls malloc and free (the deferred
+drops past the drop depth, buffers handed to Str, the runtime's C). A list's first buffer is now at
+least 16 bytes (16 Bytes or Bools, not 4). Each list keeps at most 1 MB (256 KB in programs with
+tasks or par loops, where a buffer freed on another thread stays on that thread's lists); past that
+malloc and free as before. --san and --malloc builds call malloc and free for every buffer;
+--san-pool and TSan builds use the lists, with freed buffers poisoned under ASan as the string pool's
+are. Measured (instructions retired, macOS arm64, a loaded machine): vlint's plain invocations on the
+CI job's pattern 133.6 -> 111.8 G, 20.8 -> 17.7 and 26.3 -> 25.6 G; a serial type-aware invocation
+55.0 -> 46.2 G; the compiler checking its own source 2.58 -> 2.22 G (the build's wall is the C
+compiler's and didn't change); examples/json.vu on a 30 MB document 3.17 -> 3.09 G (summary) and
+7.87 -> 7.78 G (printing it back); binarytrees unchanged (its nodes were already pooled);
+tests/memory/list_par.vu 21.4 -> 9.0 G, its peak resident memory 20 -> 29 MB (28 MB after 20 of
+its 200 rounds: bounded). Tried and not kept: 2,048-byte buffers (-0.5%), 4 MB or 256 KB a list
+(within 0.6%). Attack rounds: the first (a single-thread program with lists of 1-, 8-, 24- and
+48-byte elements grown, truncated, popped, reserved, sliced, repeated and nested, maps grown past
+their index, `take_str`; bags of lists and maps made by tasks and freed by others on other threads
+through two channels; par loops freeing the main thread's lists and the main thread the workers')
+found nothing, under ASan with and without the pool and under TSan. The second (a 200,000-deep chain
+through lists and maps, whose drop is deferred and frees with free() between pooled buffers;
+[Byte] lists of every length to 1,100 through bytes(), push, reserve, take_str and str()) found
+nothing; reading the code for it found that a zero-size element type would have divided by zero in
+the first buffer's size (guarded; Vu has no such type today). New tests: targeted 782-786 and
+tests/memory/list_par.vu (resident memory is read from /proc: on macOS it checks nothing). The full gate
+on this Mac (arm64, loaded) printed GATE FAILED, as it does for the build before (run alongside in a
+second worktree): the same suites fail the same way in both (networking, JSON, modules, FFI and
+others that need Linux; the selfhost chain test's hash), run_targeted.sh 781 of 781 (776 of 776
+before), run_memory 4 of 4, run_split 17 of 17, run_differential one more "different" (the new par
+test, which Apple's clang can't build with OpenMP, as for every par program there); not run on Linux.

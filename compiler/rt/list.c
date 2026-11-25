@@ -25,7 +25,7 @@ static @@L@@ vu_sub_@@M@@(const @@L@@ *l, int64_t a, int64_t b, int line) {
         vu_fail(line, "slice %lld..%lld out of bounds for a list of length %lld", (long long)a, (long long)b, (long long)l->len);
     @@L@@ r = {0};
     if (b > a) {
-        r.data = (@@E@@ *)vu_malloc((size_t)(b - a) * sizeof(@@E@@));
+        r.data = (@@E@@ *)vu_lalloc((size_t)(b - a) * sizeof(@@E@@));
         memcpy(r.data, l->data + a, (size_t)(b - a) * sizeof(@@E@@));
         r.len = r.cap = b - a;
     }
@@ -33,9 +33,9 @@ static @@L@@ vu_sub_@@M@@(const @@L@@ *l, int64_t a, int64_t b, int line) {
 }
 static void vu_grow_@@M@@(@@L@@ *l) {
     if (l->cap > (int64_t)(PTRDIFF_MAX / sizeof(@@E@@) / 2)) vu_oom();
-    int64_t c = l->cap ? l->cap * 2 : 4;
-    @@E@@ *d = (@@E@@ *)realloc(l->data, (size_t)c * sizeof(@@E@@));
-    if (!d) vu_oom();
+    /* (4 elements first, at least 16 bytes: a size the free lists keep) */
+    int64_t c = l->cap ? l->cap * 2 : sizeof(@@E@@) >= 4 ? 4 : (int64_t)(16 / (sizeof(@@E@@) ? sizeof(@@E@@) : 1));
+    @@E@@ *d = (@@E@@ *)vu_lgrow(l->data, (size_t)l->cap * sizeof(@@E@@), (size_t)c * sizeof(@@E@@), (size_t)l->len * sizeof(@@E@@));
     l->data = d;
     l->cap = c;
 }
@@ -44,8 +44,7 @@ static void vu_reserve_@@M@@(@@L@@ *l, int64_t n, int line) {
     if (n <= l->cap - l->len) return;
     if (n > (int64_t)(PTRDIFF_MAX / sizeof(@@E@@)) - l->len) vu_oom();
     int64_t c = l->len + n;
-    @@E@@ *d = (@@E@@ *)realloc(l->data, (size_t)c * sizeof(@@E@@));
-    if (!d) vu_oom();
+    @@E@@ *d = (@@E@@ *)vu_lgrow(l->data, (size_t)l->cap * sizeof(@@E@@), (size_t)c * sizeof(@@E@@), (size_t)l->len * sizeof(@@E@@));
     l->data = d;
     l->cap = c;
 }
@@ -63,11 +62,11 @@ static @@L@@ vu_rep_@@M@@(@@L@@ src, int64_t n, int line) {
         if (n > INT64_MAX / src.len || src.len * n > (int64_t)(PTRDIFF_MAX / sizeof(@@E@@)))
             vu_fail(line, "list of %lld x %lld elements is too large", (long long)src.len, (long long)n);
         int64_t total = src.len * n;
-        r.data = (@@E@@ *)vu_malloc((size_t)total * sizeof(@@E@@));
+        r.data = (@@E@@ *)vu_lalloc((size_t)total * sizeof(@@E@@));
         r.len = r.cap = total;
         if (src.len == 1) { @@E@@ v = src.data[0]; for (int64_t k = 0; k < total; k++) r.data[k] = v; }
         else for (int64_t k = 0; k < n; k++) memcpy(r.data + k * src.len, src.data, (size_t)src.len * sizeof(@@E@@));
     }
-    free(src.data);
+    vu_lfree(src.data, (size_t)src.cap * sizeof(@@E@@));
     return r;
 }

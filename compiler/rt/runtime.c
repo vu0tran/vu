@@ -573,6 +573,79 @@ __attribute__((noinline)) static void vu_sfree_(uint8_t *p, int64_t cap) {
     free(p);
 }
 static inline void drop_Str(vu_str *s) { if (s->cap > 0) vu_sfree_(s->data, s->cap); }
+/* Lists' and maps' buffers up to VU_LMAX bytes are kept on per-thread free lists by their exact size
+   (a multiple of 8) and reused for a buffer of the same size. A buffer is freed knowing only its
+   capacity, which never says more than it holds, so any malloc'd buffer can go on the list for the
+   size its capacity says, whoever made it, and one from a list can be freed with free() (they are
+   all malloc's). Each list keeps at most VU_LKEEP bytes (less with several threads, where buffers
+   made on one thread and freed on another stay on the freeing thread's lists); past that, and for
+   other sizes, malloc and free. (Sanitizer and --malloc builds call malloc and free for every
+   buffer.) */
+#ifndef VU_LMAX
+#define VU_LMAX 1024
+#endif
+#ifndef VU_LKEEP
+#if defined(_OPENMP) || defined(VU_MT)
+#define VU_LKEEP ((size_t)1 << 18)
+#else
+#define VU_LKEEP ((size_t)1 << 20)
+#endif
+#endif
+typedef struct { void *free[VU_LMAX / 8 + 1]; uint32_t num[VU_LMAX / 8 + 1]; } vu_lpool;
+VU_G __thread vu_lpool vu_lp;
+/* (b - 8 < VU_LMAX: 8 <= b <= VU_LMAX, as unsigned) */
+#define VU_LSIZE(b) ((((b) & 7) == 0) & ((size_t)(b) - 8 < (size_t)VU_LMAX))
+__attribute__((noinline)) static void *vu_lalloc(size_t b) {
+#ifndef VU_MALLOC
+    if (VU_LSIZE(b)) {
+        vu_lpool *lp = &vu_lp;
+        size_t k = b >> 3;
+        void *p = lp->free[k];
+        if (p) {
+            VU_UNPOISON(p, b);
+            memcpy(&lp->free[k], p, sizeof(void *));
+            lp->num[k]--;
+            return p;
+        }
+    }
+#endif
+    void *p = malloc(b ? b : 1);
+    if (!p) vu_oom();
+    return p;
+}
+/* Frees a buffer that holds at least b bytes (NULL: nothing). */
+__attribute__((noinline)) static void vu_lfree(void *p, size_t b) {
+#ifndef VU_MALLOC
+    if (VU_LSIZE(b)) {
+        vu_lpool *lp = &vu_lp;
+        size_t k = b >> 3;
+        if ((size_t)lp->num[k] * b < VU_LKEEP && p) {
+            memcpy(p, &lp->free[k], sizeof(void *));
+            lp->free[k] = p;
+            lp->num[k]++;
+            VU_POISON(p, b);   /* any later access to this freed buffer is reported */
+            return;
+        }
+    }
+#endif
+    free(p);
+}
+/* A buffer of nb bytes in place of p (ob bytes, used of them in use, kept): realloc when neither is
+   a size the free lists keep. */
+static void *vu_lgrow(void *p, size_t ob, size_t nb, size_t used) {
+#ifndef VU_MALLOC
+    if (VU_LSIZE(nb) || (p && VU_LSIZE(ob))) {
+        void *d = vu_lalloc(nb);
+        if (used) memcpy(d, p, used);
+        vu_lfree(p, ob);
+        return d;
+    }
+#endif
+    (void)ob; (void)used;
+    void *d = realloc(p, nb);
+    if (!d) vu_oom();
+    return d;
+}
 static vu_str vu_str_lit(const char *p, int64_t n) { vu_str s = { (uint8_t *)p, n, 0 }; return s; }
 static void vu_str_reserve(vu_str *s, int64_t extra) {
     if (extra < 0 || s->len > INT64_MAX / 2 - extra) vu_oom();
@@ -688,12 +761,12 @@ static vu_str vu_take_str(uint8_t **data, int64_t *len, int64_t *cap) {
         }
     } else if (*len == 0) {
         s = vu_str_lit("", 0);
-        free(*data);
+        vu_lfree(*data, (size_t)*cap);
     } else {
         int64_t c = *len;
         s.data = vu_salloc(&c); s.len = *len; s.cap = c;
         memcpy(s.data, *data, (size_t)*len);
-        free(*data);
+        vu_lfree(*data, (size_t)*cap);
     }
     *data = NULL; *len = 0; *cap = 0;
     return s;

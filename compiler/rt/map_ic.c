@@ -24,9 +24,9 @@ static void vu_mindex_@@M@@(@@M@@ *m, int64_t want) {
     m->nents = j;
     int64_t n = 8;
     while (n < want) { if (n > INT64_MAX / 4) vu_oom(); n *= 2; }
-    free(m->idx);
-    m->idx = (int64_t *)calloc((size_t)n, sizeof(int64_t));
-    if (!m->idx) vu_oom();
+    vu_lfree(m->idx, (size_t)m->nidx * sizeof(int64_t));
+    m->idx = (int64_t *)vu_lalloc((size_t)n * sizeof(int64_t));
+    memset(m->idx, 0, (size_t)n * sizeof(int64_t));
     m->nidx = n;
     for (int64_t i = 0; i < m->nents; i++) {
         uint64_t s = m->ents[i].hash & ((uint64_t)n - 1);
@@ -54,8 +54,7 @@ static void vu_mput_@@M@@(@@M@@ *m, @@KC@@ *k, @@VC@@ v, bool take) {
         if (m->cap > (int64_t)(PTRDIFF_MAX / sizeof(ME_@@M@@) / 2)) vu_oom();
         /* 4 entries first (most objects are small), then 12, so a typical record grows once; then 1.5x. */
         int64_t c = m->cap == 0 ? 4 : m->cap == 4 ? 12 : m->cap + m->cap / 2;
-        ME_@@M@@ *d = (ME_@@M@@ *)realloc(m->ents, (size_t)c * sizeof(ME_@@M@@));
-        if (!d) vu_oom();
+        ME_@@M@@ *d = (ME_@@M@@ *)vu_lgrow(m->ents, (size_t)m->cap * sizeof(ME_@@M@@), (size_t)c * sizeof(ME_@@M@@), (size_t)m->nents * sizeof(ME_@@M@@));
         m->ents = d;
         m->cap = c;
     }
@@ -91,14 +90,13 @@ static @@VC@@ vu_mgetor_@@M@@(const @@M@@ *m, const @@KC@@ *k, @@VC@@ d) {
     int64_t e = vu_mfind_@@M@@(m, k);
     return e < 0 ? d : m->ents[e].val;
 }
-static void vu_freeents_@@M@@(void *v, int64_t n) {
-    ME_@@M@@ *ents = (ME_@@M@@ *)v;
+static void vu_dropents_@@M@@(ME_@@M@@ *ents, int64_t n) {
     for (int64_t i = 0; i < n; i++) { ME_@@M@@ *en = &ents[i]; if (!en->live) continue;   }
-    free(ents);
 }
+static void vu_freeents_@@M@@(void *v, int64_t n) { vu_dropents_@@M@@((ME_@@M@@ *)v, n); free(v); }
 static void drop_@@M@@(@@M@@ *p) {
-    free(p->idx);
+    vu_lfree(p->idx, (size_t)p->nidx * sizeof(int64_t));
     if (!p->ents) return;
-    if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) { vu_drop_depth++; vu_freeents_@@M@@(p->ents, p->nents); vu_drop_depth--; }
+    if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) { vu_drop_depth++; vu_dropents_@@M@@(p->ents, p->nents); vu_lfree(p->ents, (size_t)p->cap * sizeof(ME_@@M@@)); vu_drop_depth--; }
     else vu_defer(vu_freeents_@@M@@, p->ents, p->nents);
 }

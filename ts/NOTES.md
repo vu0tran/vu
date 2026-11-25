@@ -952,3 +952,14 @@ The run that fills an empty cache: 78.8-81.6 s.
 - A struct with many fields: give the fields defaults (`ts: Bool = false`) and construct with
   named arguments (`Scopes(ts: true)`), so adding a field doesn't mean editing every call.
 - `let x = s.field` of a list or struct freezes `s`: copy what you need first.
+
+## Lists' buffers from free lists (measured 2026-11-25)
+
+The Vu runtime now keeps list and map buffers up to 1,024 bytes on per-thread free lists by exact
+size (CHANGELOG, 2026-11-25). Instructions retired of vlint's process, the same outputs: plain idx
+59 / 31 / 52 133.6 / 20.8 / 26.3 -> 111.8 / 17.7 / 25.6 G; serial type-aware idx 76 55.0 -> 46.2 G.
+In a macOS sample of idx 59, malloc, free and realloc went from about 1,500 of 5,900 busy samples to
+about 230; what's left of the allocator's cost is mostly _tlv_get_addr (each free list is a
+thread-local, about 270 samples) and memmove/memset (about 490: vu_str_concat, rc_imae.clone_state,
+maps' entries). The cold job 77.2 -> 69.9 s wall, 407 -> 384 cpu-s, one run each on a loaded machine.
+
