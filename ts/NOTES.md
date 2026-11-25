@@ -335,6 +335,31 @@ in 1.29). Tried, not kept:
 Scheduling and output: the six largest invocations, each run 10 times cold with the default
 (dynamic) sharding, gave one output each.
 
+The shared-type-table rewrite, milestones (started 2026-11-24; the old path stays the default):
+- M1, bind first (measured; `VTSC_EAGER_BIND=1`, off by default): naming every file's scopes
+  before checking (each module root, block and namespace body: bind.scope_names) takes 18-29 ms a
+  program and makes 51,000-93,000 symbols where lazy naming had made 5,700-8,900 by then; outputs
+  identical, check time within noise. But a program ends with 390,000-1,016,000 symbols: nearly
+  all are made while checking, by type operations (instantiated and mapped properties, spreads,
+  widening, object literals: get_prop, mapped_over1, spread_into, widen_*, about 40 call sites),
+  not by binding. Those belong with the types, in the shared tables, not in a frozen bound part.
+- M2, order independence (`VTSC_SHUFFLE=SEED`: the files visited, so checked, in a seeded random
+  order that still has each file's imports first): the probes under seeds 1-5 and all 88 of the CI
+  job's invocations under seeds 1-20 give output identical to the unshuffled run. Union members are
+  ordered by TypeScript 7's compareTypes, and nothing printed turned out to depend on which file
+  made a type first.
+- M3, shared tables, measured so far: an append-only Int table in C, one reserved region (mmap,
+  never moved, the length published with a release store), read from Vu through an extern
+  function: 548-672 ms for 60 million dependent random reads against 598-681 ms for a Vu list
+  (chunked, with an extra indirection: 693-720 ms). So the struct-of-arrays tables (`tk`, `tf`,
+  `ta`, `tb`, `tl`, the symbols' `sk`, `sname`, `sdecl`, `stype`, `sdtype`, `sflags`) can move to
+  C at no read cost. What can't as they are: `objs` and `sigs` are lists of structs with maps and
+  lists inside, filled in place after they're made (about 250 sites: `objs[o].args`/`.eflags` 40
+  each, `.sidx`/`.nidx`/`.resolved` 20 each, `sigs[s].tparams` 23, `.ret` 17 ...), and `stype` (61
+  writes), `nsym` (32), `ntype` (22) are written lazily from everywhere. Each such fill would have to
+  become compute-once (as a Memo is) and every checker function take a shared and a per-worker
+  state instead of `var c: C` (1,222 functions). That is the rest of M3.
+
 With the caches kept between runs (`$XDG_CACHE_HOME/vlint`: the vtsc file cache, the tsconfig
 cache, the module records; 261 MB for the job), the CI job's pattern takes 33.9 s and 214 cpu-s
 against oxlint's 74-76 s, outputs identical; the run that fills them 81.6 s.
