@@ -4,6 +4,7 @@
 // (ts/NOTES.md, "Checking one program on several workers").
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/mman.h>
 #define CT_MAX ((int64_t)1 << 28)  // entries a column can hold (2 GB of address space, reserved only)
 
@@ -371,6 +372,89 @@ static inline int64_t ik_put(void *ph, int64_t tag, int64_t pre, const int64_t *
 static inline int64_t ik_addr(void *h) { return ct_addr(h); }
 static inline void *ik_view(int64_t a) { return ct_view(a); }
 
+// Names made while checking: text -> an id (0, 1, 2 ... in the order added; the checker adds its
+// frozen names table's length), found or added by several tasks at once without a lock, as ik_*: a
+// chain per bucket of entries in an append-only pool (next, hash, length, the bytes in words), the
+// ids an append-only column of entry offsets (ids taken by fetch-add: a task that loses the race
+// for a name leaves its id unused).
+typedef struct { int64_t *head; int64_t *pool; int64_t *ids; } ns_t;
+static inline void *ns_new(void *st) {
+  ns_t *h = malloc(sizeof *h);
+  if (!h) vu_panic(0, "ns_new: out of memory", 21);
+  h->head = calloc((size_t)IK_BUCKETS, 8);
+  if (!h->head) vu_panic(0, "ns_new: out of memory", 21);
+  h->pool = ct_mk();
+  h->pool[-1] = 1;
+  h->ids = ct_mk();
+  cs_add(st, h, 5);
+  return h;
+}
+static inline void ns_free(void *p) {
+  ns_t *h = p;
+  free(h->head);
+  ct_free(h->pool);
+  ct_free(h->ids);
+  free(h);
+}
+static inline void ns_keep(void *h) { (void)h; }
+static inline uint64_t ns_hash(const uint8_t *d, int64_t n) {
+  uint64_t x = 0xCBF29CE484222325ull ^ (uint64_t)n;
+  for (int64_t i = 0; i < n; i++) x = (x ^ d[i]) * 0x100000001B3ull;
+  return x ^ (x >> 29);
+}
+// the id of a matching entry from e to stop, -1 none (an entry: next, hash, length, id, bytes)
+static inline int64_t ns_walk(const ns_t *h, int64_t e, int64_t stop, uint64_t hs, const uint8_t *d, int64_t n) {
+  const int64_t *p = h->pool;
+  for (; e != stop; e = p[e]) {
+    if ((uint64_t)p[e + 1] != hs || p[e + 2] != n) continue;
+    if (n == 0 || memcmp(&p[e + 4], d, (size_t)n) == 0) return p[e + 3];
+  }
+  return -1;
+}
+static inline int64_t ns_find(void *ph, const vu_str *s) {
+  const ns_t *h = ph;
+  uint64_t hs = ns_hash(s->data, s->len);
+  int64_t e = __atomic_load_n(&h->head[hs & (IK_BUCKETS - 1)], __ATOMIC_ACQUIRE);
+  return ns_walk(h, e, 0, hs, s->data, s->len);
+}
+static inline int64_t ns_put(void *ph, const vu_str *s) {
+  ns_t *h = ph;
+  const uint8_t *d = s->data;
+  int64_t n = s->len;
+  uint64_t hs = ns_hash(d, n);
+  int64_t *hd = &h->head[hs & (IK_BUCKETS - 1)];
+  int64_t e0 = __atomic_load_n(hd, __ATOMIC_ACQUIRE);
+  int64_t w = ns_walk(h, e0, 0, hs, d, n);
+  if (w >= 0) return w;
+  int64_t *p = h->pool;
+  int64_t words = (n + 7) / 8;
+  int64_t ne = __atomic_fetch_add(&p[-1], words + 4, __ATOMIC_RELAXED);
+  if (ne + words + 4 > CT_MAX) vu_panic(0, "ns_put: the names are full", 26);
+  int64_t id = __atomic_fetch_add(&h->ids[-1], 1, __ATOMIC_RELAXED);
+  if (id >= CT_MAX) vu_panic(0, "ns_put: the names are full", 26);
+  p[ne + 1] = (int64_t)hs;
+  p[ne + 2] = n;
+  p[ne + 3] = id;
+  if (n > 0) memcpy(&p[ne + 4], d, (size_t)n);
+  h->ids[id] = ne;
+  ct_cover(h->ids, id + 1);
+  for (;;) {
+    p[ne] = e0;
+    int64_t seen = e0;
+    if (__atomic_compare_exchange_n(hd, &seen, ne, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) return id;
+    w = ns_walk(h, seen, e0, hs, d, n);
+    if (w >= 0) return w;
+    e0 = seen;
+  }
+}
+static inline vu_str ns_str(void *ph, int64_t id) {
+  const ns_t *h = ph;
+  int64_t e = ct_at(h->ids, id);
+  return vu_str_from(&h->pool[e + 4], h->pool[e + 2]);
+}
+static inline int64_t ns_addr(void *h) { return ct_addr(h); }
+static inline void *ns_view(int64_t a) { return ct_view(a); }
+
 // every table the store made freed
 static inline void cs_free(void *p) {
   cs_t *s = p;
@@ -380,6 +464,7 @@ static inline void cs_free(void *p) {
       case 1: cl_free(s->p[i]); break;
       case 2: ph_free(s->p[i]); break;
       case 4: ik_free(s->p[i]); break;
+      case 5: ns_free(s->p[i]); break;
       default: free(s->p[i]);
     }
   }

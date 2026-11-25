@@ -564,6 +564,30 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   4, trules 3+3) become `nm(c, x)`. Then a list column's pool reservation (`cl_add`/`cl_set`),
   `ph_put` without moving slots, and the `ct_len` watermarks (chk.vu `cur_id`/`nsg`, tyops'
   `tk0`).
+- Step 4.3, names made while checking in C (landed 2026-11-24): `types.freeze_names` (when checking
+  starts) fixes `c.names0`, the names table's length; from then on `types.name_id` finds a name in
+  the frozen table read-only (`ast.find_name`) or finds or adds it in ctab.h's `ns_*` table (a
+  lock-free chained table as `ik_*`, the ids an append-only column, taken by fetch-add), its id
+  `names0 + k`, so single-threaded ids are the ones `ast.intern` gave before. A name's text is
+  `types.name_text(c, id)` (or bind/chk's `nm`): the checker's files read a type's or symbol's name
+  through it (130 sites); a node's own name (`c.t.names[c.t.nd[x].s]`, 31 sites) stays a direct
+  read, since nodes are frozen with their names. First measured +4.4 / +5.4 / +1.7% instructions:
+  `name_text` returns a copy where the list read had been a view, and cmp_types compares literal and
+  alias names on every union sort; `types.name_cmp` / `name_js_cmp` compare two ids' texts without
+  copying when both are frozen, and the `+ ""` after each call (a second copy) went. VTSC_SO_CHECK=1
+  panics if the names table grew while checking. Probes 133/133, vtests' 3 failures byte for byte
+  (both with VTSC_SO_CHECK=1), the CI job's 88 outputs byte-identical with VTSC_SO_CHECK=1; 18.43 /
+  16.49 / 54.35 G instructions (-0.3, -1.7, -1.5% on the pre-M3 base).
+- Next (step 4.3's rest, in order): the other interning maps as `ik_*` keys (`strlits`,
+  `numlits`/`nums`/`numtext`, `biglits`, `unions` (Str keys), `tmpls`/`tmpl_ids`,
+  `mappers`/`mapper_ids` (and `c.mappers` itself: a list column of from and to), `inst_cache`,
+  `ref_cache`, `t_alias`/`t_alias_args`, `t_origin`, `t_ctv`, `t_iorigin`, `tl_cache`, `alias_inst`,
+  `inst_icache`/`inst_acache`, `enum_type`/`enum_union`, `tuple_labels`, `unres_names`): a Str key
+  becomes its Ints, a type's side attributes C columns written before `ik_put` publishes it. Then
+  a list column's pool reservation (`cl_add`/`cl_set` append without one), `ph_put` without moving
+  slots (one region sized from the program, or a new table published by pointer), and the `ct_len`
+  watermarks (chk.vu's `cur_id`/`nsg` over `hs_node`, tyops' `tk0` over `htk`), which another
+  worker's rows would break. Then step 4's split of `C` and M4.
 - Then step 4: `var c: C` split into the shared tables and a per-worker state, and M4: N checker
   threads over the shared tables behind a switch, off by default. M4's gates: 1, 2, 4 and 8 threads,
   20 runs each, byte-identical on the 88 invocations and the probes; TSan with CC=clang and Archer as
