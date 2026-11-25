@@ -145,3 +145,74 @@ static inline bool cl_has(void *p, int64_t r, int64_t v) {
     if (xs[i] == v) return true;
   return false;
 }
+
+// Object types' properties by (object, name): an open-addressed table of (key, symbol), the key
+// object << 32 | name (both under 2^31), linear probing, doubled at half full. The names in insertion
+// order are a list column beside it (types.add_prop).
+typedef struct { int64_t *slot; int64_t cap; int64_t n; } ph_t;
+static inline void *ph_new(void) {
+  ph_t *h = malloc(sizeof *h);
+  if (!h) vu_panic(0, "ph_new: out of memory", 21);
+  h->cap = 1 << 16;
+  h->n = 0;
+  h->slot = malloc((size_t)h->cap * 16);
+  if (!h->slot) vu_panic(0, "ph_new: out of memory", 21);
+  for (int64_t i = 0; i < h->cap; i++) h->slot[2 * i] = -1;
+  return h;
+}
+static inline void ph_free(void *p) {
+  ph_t *h = p;
+  free(h->slot);
+  free(h);
+}
+static inline uint64_t ph_hash(int64_t k) {
+  uint64_t x = (uint64_t)k * 0x9E3779B97F4A7C15ull;
+  return x ^ (x >> 31);
+}
+// the symbol of o's property name, -1 none
+static inline int64_t ph_get(void *p, int64_t o, int64_t name) {
+  const ph_t *h = p;
+  int64_t k = o << 32 | name, m = h->cap - 1;
+  for (int64_t i = (int64_t)(ph_hash(k) & (uint64_t)m);; i = (i + 1) & m) {
+    int64_t s = h->slot[2 * i];
+    if (s == k) return h->slot[2 * i + 1];
+    if (s == -1) return -1;
+  }
+}
+static inline void ph_grow(ph_t *h) {
+  int64_t oc = h->cap, *os = h->slot;
+  h->cap = oc * 2;
+  h->slot = malloc((size_t)h->cap * 16);
+  if (!h->slot) vu_panic(0, "ph_grow: out of memory", 22);
+  for (int64_t i = 0; i < h->cap; i++) h->slot[2 * i] = -1;
+  int64_t m = h->cap - 1;
+  for (int64_t j = 0; j < oc; j++) {
+    int64_t k = os[2 * j];
+    if (k == -1) continue;
+    int64_t i = (int64_t)(ph_hash(k) & (uint64_t)m);
+    while (h->slot[2 * i] != -1) i = (i + 1) & m;
+    h->slot[2 * i] = k;
+    h->slot[2 * i + 1] = os[2 * j + 1];
+  }
+  free(os);
+}
+// o's property name set to sym: true when it is a new property
+static inline bool ph_put(void *p, int64_t o, int64_t name, int64_t sym) {
+  ph_t *h = p;
+  if ((uint64_t)o >= ((uint64_t)1 << 31) || (uint64_t)name >= ((uint64_t)1 << 32) || sym < 0) vu_panic(0, "ph_put: out of range", 20);
+  if (2 * (h->n + 1) > h->cap) ph_grow(h);
+  int64_t k = o << 32 | name, m = h->cap - 1;
+  for (int64_t i = (int64_t)(ph_hash(k) & (uint64_t)m);; i = (i + 1) & m) {
+    int64_t s = h->slot[2 * i];
+    if (s == k) {
+      h->slot[2 * i + 1] = sym;
+      return false;
+    }
+    if (s == -1) {
+      h->slot[2 * i + 1] = sym;
+      h->slot[2 * i] = k;
+      h->n += 1;
+      return true;
+    }
+  }
+}

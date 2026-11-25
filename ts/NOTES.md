@@ -464,6 +464,19 @@ The shared-type-table rewrite, milestones (started 2026-11-24; the old path stay
   after that, with the check on: vtests the same 3 failures byte for byte, probes 133/133, the CI
   job's 88 outputs byte-identical with no panic (and again with the check off). 18.59 / 16.90 /
   55.73 G instructions (+0.6, +0.8, +1.0% on the pre-M3 base): the markers are map entries now.
+- Step 3.4, properties in C (landed 2026-11-24): `types.Obj` and `c.objs` are gone. An object's
+  property names in insertion order are a list column (`c.ho_order`, one row per object: `new_obj`
+  takes its index from `cl_row`), and each property's symbol is found by (object, name) in one
+  open-addressed table for all objects (`c.hph`, ctab.h `ph_get`/`ph_put`: key object << 32 | name,
+  linear probing, doubled at half full). `add_prop` appends the name only when `ph_put` says it's
+  new, so the order is the old map's insertion order exactly; `sort_props` writes the row again; the
+  merges that iterated the map (bind.vu's function and class merged with a namespace) read the row,
+  then sort as before. Rewritten by the session's scratch `m4/pconv.py`. Probes 133/133, vtests the
+  same 3 failures byte for byte, the CI job's 88 outputs byte-identical; 18.51 / 16.50 / 54.73 G
+  instructions (+0.2, -1.6, -0.9% on the pre-M3 base: no map and list allocated per object). Not
+  yet safe for threads: `ph_grow` moves the slots, so M4 needs a resize readers can't see torn (a
+  new table published by pointer, the old one kept until no reader can hold it) or one reserved
+  region sized from the program; and a row's `cl_add` must happen before the object is published.
 - Then step 4: `var c: C` split into the shared tables and a per-worker state, and M4: N checker
   threads over the shared tables behind a switch, off by default. M4's gates: 1, 2, 4 and 8 threads,
   20 runs each, byte-identical on the 88 invocations and the probes; TSan with CC=clang and Archer as
