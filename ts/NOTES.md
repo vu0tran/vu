@@ -944,11 +944,14 @@ What it takes, decided:
      tag 7 in place of `mapper_ids`: `types.mp_*`). `unions`, `ref_cache` and `inst_cache` were
      unused (removed). `enum_type`/`enum_union` belong with step 3 (a fill that makes symbols).
      The four invocations 184.5 / 101.8 / 63.0 / 53.9 G (-0.6, -0.3, +0.4, +0.1%).
-  2. Types' and symbols' attributes now in Vu maps keyed by a shared id, written once when the row
-     is made: `t_alias`, `t_iorigin`, `t_ctv` (Int) as columns of the type group; `t_alias_args`,
-     `t_origin`, `tuple_labels` as list columns; the symbols' `smore`, `lazy_icomb`, `lazy_inst`,
-     `wk_symbols`, `lazy_meth` likewise. A map written again later (`t_alias_args.remove`, the
-     resets) needs the publish-once rule first, as `stype` got (step 3.3).
+  2. (Done, 2026-11-25, for 37 maps: the table below.) Types' and symbols' attributes now in Vu
+     maps keyed by a shared id: columns kept by the row's index (ctab.h `cx_*` one Int, `ckl_*` a
+     list), not of the group (a column of the group would need every row written). A map written
+     again later (`t_alias_args` removed, `tp_con`'s placeholder, the lazy members' removal) needs
+     the publish-once rule first, as `stype` got (step 3.3): the sites are in the table. The four
+     invocations: 11 maps 183.8 / 100.1 / 62.9 / 53.4 G; all 37 and the identity caches 180.1 /
+     98.2 / 62.4 / 52.8 G (-3.0, -3.8, -0.6, -1.9% against e34cb684: a column read is cheaper than a
+     Vu map's).
   3. The lazy fills of shared rows (an object's members, `resolved` with `calls ctors sidx nidx`, a
      deferred tuple's `args`/`eflags`, a signature's `ret`): a worker can't wait on another's fill
      (A fills X and needs Y while B fills Y and needs X), so a fill is computed privately and
@@ -963,6 +966,81 @@ What it takes, decided:
   half the state (types made by one worker, their attributes in another's maps) and print wrong
   types: a crash or a wrong answer, not a measurement. Steps 2 and 3 are the large ones (about 250
   fill sites, step 3's table above, and some 40 attribute maps).
+
+### The checker's state, shared or per worker: what's converted and what's left (2026-11-25)
+
+An audit of every field of `types.C` (about 510; the session's scratch
+`m12/audit.py` counts each field's write sites). The first two groups are done; the rest is a first
+classification from each field's comment and write sites, not checked site by site.
+
+Shared, done (one checker still; every conversion kept the probes, vtests' 3 failures and the job's
+176 outputs identical):
+- SharedMaps (first add wins; a site returns what `add` returns): `tl_cache`, `strlits`, `biglits`,
+  `unres_names`, `inst_icache`, `inst_acache`, `alias_inst` (commit e34cb684); `numlits`, `tmpl_ids`;
+  `inst_gcache`, `cond_cache`, `fresh_sig` and `erased_sig` (the made signature's own entry added
+  first), `base_sigs`, `mapped_fresh_p`, `alias_clones`, `compose_cache`, `mtmpl`.
+- Side tables as C columns: numeric literals (`hnx` texts, `hnv` values), template literal types
+  (`htm_h`, `htm_t`, `htm_m`, texts in the Ns `hsx`), mappers (`hmp`, interned in `hik` tag 7).
+- Attributes kept by row (`cx_*`/`ckl_*`, `types.vu`'s `ht_*` types', `hy_*` symbols', `ho_*`
+  objects', `hs_*` signatures'): `t_alias`, `t_alias_args`, `t_origin`, `t_iorigin`, `t_ctv`,
+  `tuple_labels`, `smore`, `lazy_inst`, `lazy_icomb`, `lazy_meth`, `wk_symbols`, `enum_union`,
+  `enum_base`, `enum_members`, `spread_orig`, `order_decl`, `tidx`, `yidx`, `sig_outer`, `bare_opt`,
+  `noshow_t`, `tp_con`, `this_of`, `assert_pred`, `this_pred`, `tquery_node`, `static_side`,
+  `funions`, `freg`, `unfresh_of`, `mapped_m`, `tlen_sym`, `this_tp`, `noinfer_of_t`, `merged_ns`,
+  `spread_syms`, `unsup_msg` (an id in `hsx`: `types.umsg_*`). Also order-independent: the probes
+  under VTSC_SHUFFLE 1-3 and idx 31, 52, 86 under seed 1 give the unshuffled output.
+  `ctab_stress.vu` covers `cx_*`, `ckl_*` and `cl_row` (8 tasks, TSan clean).
+- Removed, unused: `unions`, `inst_cache`, `ref_cache`, `tvar_cache` still there (unused too).
+
+Written again after the row is made (a reader in another worker may see either value: each needs
+the publish-once rule or a private copy until published, step 3): `t_alias`/`t_alias_args` put on
+an existing type by bind.alias_tag's callers (bind.vu, the `cx_put(c.ffi, c.ht_alias, t, a)` after
+union_of) and taken off a shell (`cx_del`, 2 sites; `ckl_del` of `ht_aargs`, 1); `t_iorigin` copied
+onto an instantiation; `lazy_inst`/`lazy_icomb`/`lazy_meth` removed when the member is typed (that
+fill is step 3's) and `lazy_inst` set again from `cyc_lazy`; `order_decl` set to -1 for a mapped
+object's properties; `tidx` changed in place (tyops.mapped_add_tidx's `ckl_put`) and removed (chk);
+`yidx` set on objects already made (chk, 10 puts, 2 removals); `tp_con`'s -1 placeholder and
+removals (rel.vu, the constraint's lazy fill); `smore` appended as declarations merge (binding);
+`noshow_t` marked on types already made (10 sites). Counts by handle: `grep -ohE
+"(cx_put|ckl_set|ckl_add|ckl_put|cx_del|ckl_del)\(c\.ffi, c\.\w+" *.vu | sort | uniq -c`.
+
+Shared, left (identity: the value is a row made on demand, so two workers making their own would
+give one declaration two types, and a union of the two prints twice; most are lazy fills, step 3):
+`enum_type` (with its member symbols, `nsym_put`), `fsig` (a function's signature), `sigs_cache`
+(a list: a `ckl_` column by `t << 1 | ctor`), `tcache` (a type node's type), `base_ctor`,
+`cinit_narrow`, `js_this`/`js_expando`/`js_this_base`, `fail_ret`, `imp_target` (-2 while
+resolving), `cjs_exp_t`/`cjs_mod_t`/`cjs_xs_t` (-3 while typed), `lib_unsup` (a message: as
+`unsup_msg`), `var_cache`/`var_unrel` (measured variance: a pure answer, but costly), and the
+symbols' types in `hstype` already publish once (`sty_put`).
+
+Binding (shared; complete before checking only with VTSC_EAGER_BIND, else written as scopes are
+named): `globals`, `gtypes`, `locals`, `ltypes`, `nsym` (set once, `nsym_put`), `parent`, `mexports`,
+`mexp_order`, `mtexports`, `ns_file`, `export_eq`, `amb`, `amb_short`, `amb_order`, `amb_bodies`,
+`aug_target`, `ns_kids`, `ns_inner`, `ns_chain`, `ns_kid_seen`, `umd_pending`, `mod_flag`,
+`class_at`, `hoisted`, `last_assign`, `cjs_roots`, `cjs_exp`, `file_index`, `pkg_*`, `cjs_ts`,
+`cjs_dts`, `js_imps`, `file_redirect`, `frank`.
+
+Per worker (Vu maps as today, each worker's own, empty at the start): what's keyed by a node of the
+file being checked (`ntype`, `nctx`, `ptype_ctx`, `ret_ctx`, `ret_ctx_raw`, `fn_arg_raw`,
+`resolved_sig`, `call_sig`, `call_memo`, `ovl_*`, `ctx_used`, `ctx_rmap`, `fn_ctxt`, `fn_csig`,
+`lit_ctx`, `meth_this`, `prov_this`, `forin_*`, `chain_*`, `jsx_*`, `const_at`, `spread_*` of
+literals, `computed_lits`, `as_approx`, `as_early`, `evo_arg`, `auto_evo`, `arr_*`, `tq_flow`,
+`targ_*`, `expect_*`, `deco_checked`, `es_deco_ok`, `value_refs`, `implicit_at`, `checked_fns`,
+`redo_fns`, `checked_log`, `body_by_infer`, `pred_inf`, `gen_yields`, `gen_ann`, `never_stmts`,
+`noinfer_p`, `inf_fixed`, `exact_targets`, `noshow_args`); the stacks, flags and depths (`narrow`,
+`loop_rec`, `try_rec`, `rel_*`, `inf_*`, `spec*`, `ret_*` stacks, `epoch_*`, `trace_*`, `show_*`,
+every Bool and Int field); the busy sets (`tl_busy`, `cond_busy`, `cond_shell`, `shell_busy`,
+`lazy_busy`, `alias_busy`, `pat_busy`, `mod_busy`, `sym_reenter`, `cyc_*`, `defer_*`,
+`fn_var_hook`, `ret_pending`, `ret_circ`, `st_tmp`); the caches of answers that are already
+canonical ids or Bools (`rel_cache`, `ident_cache`, `ident_unk`, `weak_cache`, `gen_cache`,
+`mtp_cache`, `disc_cache`, `disc_info`, `disc_lists`, `optp_cache`, `inter_memo`, `sred_cache`,
+`never_red`, `never_inter_memo`, `concrete_objs`, `mention_cache`, `mentions_this`, `narrow_cache`,
+`ck_*`, `si_memo`, `ckr_memo`, `lookup_cache`, `prop_cache`, `alias_top`, `alias_closed`,
+`closed_t`, `tvar_arr`, `facts_*`, `umem_*`, `enum_mm`, `enum_rt*`, `cond_free`, `cond_miss`,
+`cond_nmiss`, `rel_taint`, `spread_union`, `const_spread_*`, `spread_pick`);
+the diagnostics (`diags`, `kept`, `spec_keep`, `unsupported`, `marks`, `touch_moved`) and the
+statistics. (Whether each cached answer is canonical, an interned union or intersection, is from
+the comments: a cache whose value is a type made fresh belongs in the identity group above.)
 
 With the caches kept between runs (`$XDG_CACHE_HOME/vlint`: the vtsc file cache, the tsconfig
 cache, the module records; 261 MB for the job), the CI job's pattern takes 33.9 s and 214 cpu-s

@@ -132,7 +132,7 @@ static inline int64_t ct_len(void *h) { return __atomic_load_n(&((const int64_t 
 static inline int64_t ct_get0(void *h, int64_t i) {
   const int64_t *p = h;
   if ((uint64_t)i >= (uint64_t)ct_len0(p)) return 0;
-  return p[i];
+  return __atomic_load_n(&p[i], __ATOMIC_RELAXED);
 }
 // a Float kept in an Int column (its bits)
 static inline void ct_putf(void *h, int64_t r, double v) {
@@ -294,22 +294,25 @@ static inline const int64_t *ckl_rp(const cl_t *h, int64_t k) {
   return rp;
 }
 static inline bool ckl_has(void *p, int64_t k) { return ckl_rp(p, k) != NULL; }
+// (the length read with a relaxed load: another task may set the row meanwhile)
+static inline int64_t ckl_n(const int64_t *rp) { return __atomic_load_n(&rp[1], __ATOMIC_RELAXED); }
+static inline int64_t ckl_off(const int64_t *rp) { return __atomic_load_n(&rp[0], __ATOMIC_RELAXED); }
 static inline int64_t ckl_len(void *p, int64_t k) {
   const int64_t *rp = ckl_rp(p, k);
-  return rp ? rp[1] : 0;
+  return rp ? ckl_n(rp) : 0;
 }
 static inline int64_t ckl_at(void *p, int64_t k, int64_t i) {
   const cl_t *h = p;
   const int64_t *rp = ckl_rp(h, k);
-  if (!rp || (uint64_t)i >= (uint64_t)rp[1]) vu_panic(0, "ckl_at: index out of range", 26);
-  return h->pool[rp[0] + i];
+  if (!rp || (uint64_t)i >= (uint64_t)ckl_n(rp)) vu_panic(0, "ckl_at: index out of range", 26);
+  return h->pool[ckl_off(rp) + i];
 }
 static inline void ckl_fill(void *p, int64_t k, int64_t *out, int64_t n) {
   const cl_t *h = p;
   const int64_t *rp = ckl_rp(h, k);
   if (!rp) return;
-  if (n > rp[1]) n = rp[1];
-  for (int64_t i = 0; i < n; i++) out[i] = h->pool[rp[0] + i];
+  if (n > ckl_n(rp)) n = ckl_n(rp);
+  for (int64_t i = 0; i < n; i++) out[i] = h->pool[ckl_off(rp) + i];
 }
 // row k's list set to xs (written at the pool's end, then published)
 static inline void ckl_set(void *p, int64_t k, const int64_t *xs, int64_t n) {
@@ -322,7 +325,15 @@ static inline void ckl_set(void *p, int64_t k, const int64_t *xs, int64_t n) {
   __atomic_store_n(&rp[0], at, __ATOMIC_RELEASE);
   ct_cover(h->row, 2 * k + 2);
 }
-// v appended to row k's list (a list made when it has none)
+// entry i of row k's list set (in place)
+static inline void ckl_put(void *p, int64_t k, int64_t i, int64_t v) {
+  cl_t *h = p;
+  const int64_t *rp = ckl_rp(h, k);
+  if (!rp || (uint64_t)i >= (uint64_t)ckl_n(rp)) vu_panic(0, "ckl_put: index out of range", 27);
+  h->pool[ckl_off(rp) + i] = v;
+}
+// v appended to row k's list (a list made when it has none): the list written again after the
+// pool's end with v, then published, so a reader sees the old list or the new one whole
 static inline void ckl_add(void *p, int64_t k, int64_t v) {
   cl_t *h = p;
   const int64_t *rp = ckl_rp(h, k);
@@ -330,13 +341,19 @@ static inline void ckl_add(void *p, int64_t k, int64_t v) {
     ckl_set(p, k, &v, 1);
     return;
   }
-  cl_add(p, k, v);
+  int64_t off = ckl_off(rp), n = ckl_n(rp);
+  int64_t at = cl_res(h, n + 1);
+  for (int64_t i = 0; i < n; i++) h->pool[at + i] = h->pool[off + i];
+  h->pool[at + n] = v;
+  int64_t *w = &h->row[2 * k];
+  __atomic_store_n(&w[1], n + 1, __ATOMIC_RELAXED);
+  __atomic_store_n(&w[0], at, __ATOMIC_RELEASE);
 }
 static inline void ckl_del(void *p, int64_t k) {
   cl_t *h = p;
   if ((uint64_t)k >= (uint64_t)(ct_len0(h->row) >> 1)) return;
   __atomic_store_n(&h->row[2 * k], 0, __ATOMIC_RELEASE);
-  h->row[2 * k + 1] = 0;
+  __atomic_store_n(&h->row[2 * k + 1], 0, __ATOMIC_RELAXED);
 }
 
 // Object types' properties by (object, name): the key object << 32 | name (both under 2^31). A fixed

@@ -1,5 +1,6 @@
 # ctab_stress: many tasks find-or-adding the same keys in ctab.h's shared tables at once (ik_*
-# interned lists, ns_* names, ph_* properties, ct_publish, list columns, row groups), then every
+# interned lists, ns_* names, ph_* properties, ct_publish, list columns, row groups; cx_* and ckl_*
+# attributes kept by row, written by their row's task while the others read them), then every
 # task's answers compared: one id per key, whoever added it. Prints "ok" or what differed.
 # Run it under ThreadSanitizer: CC=clang ../vu build --tsan ctab_stress.vu -o OUT && OUT
 # (ts/NOTES.md, "Checking one program on several workers").
@@ -19,6 +20,9 @@ extern "ctab.h":
   fn ct_publish(ffi: Ffi, t: Tab, i: Int, v: Int) -> Int
   fn ct_addr(ffi: Ffi, t: Tab) -> Int
   fn ct_view(ffi: Ffi, a: Int) -> Tab
+  fn cx_has(ffi: Ffi, t: Tab, k: Int) -> Bool
+  fn cx_get(ffi: Ffi, t: Tab, k: Int, d: Int) -> Int
+  fn cx_put(ffi: Ffi, t: Tab, k: Int, v: Int)
   type Lst drop cl_keep
   fn cl_new(ffi: Ffi, st: Store) -> Lst
   fn cl_init(ffi: Ffi, l: Lst, r: Int)
@@ -28,6 +32,13 @@ extern "ctab.h":
   fn cl_set(ffi: Ffi, l: Lst, r: Int, xs: [Int])
   fn cl_addr(ffi: Ffi, l: Lst) -> Int
   fn cl_view(ffi: Ffi, a: Int) -> Lst
+  fn cl_row(ffi: Ffi, l: Lst) -> Int
+  fn ckl_new(ffi: Ffi, st: Store) -> Lst
+  fn ckl_has(ffi: Ffi, l: Lst, k: Int) -> Bool
+  fn ckl_len(ffi: Ffi, l: Lst, k: Int) -> Int
+  fn ckl_at(ffi: Ffi, l: Lst, k: Int, i: Int) -> Int
+  fn ckl_set(ffi: Ffi, l: Lst, k: Int, xs: [Int])
+  fn ckl_add(ffi: Ffi, l: Lst, k: Int, v: Int)
   type Ph drop ph_keep
   fn ph_new(ffi: Ffi, st: Store) -> Ph
   fn ph_get(ffi: Ffi, h: Ph, o: Int, name: Int) -> Int
@@ -66,6 +77,10 @@ fn worker(ffi: Ffi, own addrs: [Int], k: Int, own out: Chan[[Int]]):
   let grp = cg_view(ffi, addrs[4])
   let col = ct_view(ffi, addrs[5])
   let lst = cl_view(ffi, addrs[6])
+  let cx = ct_view(ffi, addrs[7])
+  let kl = cl_view(ffi, addrs[8])
+  let rl = cl_view(ffi, addrs[9])
+  var xbad = 0
   var r: [Int] = []
   for _q in 0..(4 * KEYS): r.push(-1)
   var news = 0
@@ -100,6 +115,19 @@ fn worker(ffi: Ffi, own addrs: [Int], k: Int, own out: Chan[[Int]]):
       cl_set(ffi, lst, row + 1, [k, i, j])
       cl_add(ffi, lst, row + 1, -k)
       rows.push(row)
+    # (attributes of this task's own keys, k * ROUNDS + i, while another task's are read: a value
+    # seen is the whole one)
+    if i % 10 == 0:
+      let q = k * ROUNDS + i
+      cx_put(ffi, cx, q, -1 - q)
+      ckl_set(ffi, kl, q, [q, k])
+      if i % 30 == 0: ckl_add(ffi, kl, q, i)
+      let q2 = ((k + 1) % TASKS) * ROUNDS + i
+      if cx_has(ffi, cx, q2) and cx_get(ffi, cx, q2, 7) != -1 - q2: xbad += 1
+      if ckl_has(ffi, kl, q2) and (ckl_len(ffi, kl, q2) < 2 or ckl_at(ffi, kl, q2, 0) != q2): xbad += 1
+      let rr = cl_row(ffi, rl)
+      cl_set(ffi, rl, rr, [k, i])
+  r.push(xbad)
   r.push(news)
   for x in rows: r.push(x)
   out.send(r)
@@ -113,8 +141,11 @@ fn main(ffi: Ffi) throws:
   let grp = cg_new(ffi, st)
   let col = ct_new(ffi, st)
   let lst = cl_new(ffi, st)
+  let cx = ct_new(ffi, st)
+  let kl = ckl_new(ffi, st)
+  let rl = cl_new(ffi, st)
   for j in 0..KEYS: ct_put(ffi, pub, j, -1)
-  let addrs = [ik_addr(ffi, ik), ns_addr(ffi, ns), ph_addr(ffi, ph), ct_addr(ffi, pub), cg_addr(ffi, grp), ct_addr(ffi, col), cl_addr(ffi, lst)]
+  let addrs = [ik_addr(ffi, ik), ns_addr(ffi, ns), ph_addr(ffi, ph), ct_addr(ffi, pub), cg_addr(ffi, grp), ct_addr(ffi, col), cl_addr(ffi, lst), ct_addr(ffi, cx), cl_addr(ffi, kl), cl_addr(ffi, rl)]
   let out: Chan[[Int]] = chan(TASKS)
   for k in 0..TASKS:
     spawn worker(ffi, types_copy(addrs), k, out)
@@ -135,8 +166,9 @@ fn main(ffi: Ffi) throws:
     for j in 0..(4 * KEYS):
       if r[j] < 0 and r[j] != -1: bad.push("table {j / KEYS} key {j % KEYS}: {r[j]}")
       elif r[j] >= 0 and r[j] != want[j]: bad.push("table {j / KEYS} key {j % KEYS}: {r[j]} against {want[j]}")
-    news += r[4 * KEYS]
-    for x in (4 * KEYS + 1)..r.len:
+    if r[4 * KEYS] != 0: bad.push("{r[4 * KEYS]} attributes read torn")
+    news += r[4 * KEYS + 1]
+    for x in (4 * KEYS + 2)..r.len:
       let row = r[x]
       if row in taken or (row + 1) in taken: bad.push("row {row} taken twice")
       taken[row] = 1
@@ -153,6 +185,21 @@ fn main(ffi: Ffi) throws:
   for j in 0..KEYS:
     if want[j] < 0 or ik_get(ffi, ik, 3, j % 7, [j, j * 3, -j]) != want[j]: bad.push("ik key {j} after")
     if want[KEYS + j] < 0 or ns_find(ffi, ns, "name{j}") != want[KEYS + j]: bad.push("ns key {j} after")
+  # (every task's attributes, each list row cl_row gave once)
+  var rseen: {Int: Bool} = {}
+  for k in 0..TASKS:
+    for i in 0..ROUNDS:
+      let q = k * ROUNDS + i
+      if i % 10 == 0:
+        if cx_get(ffi, cx, q, 7) != -1 - q: bad.push("cx {q}")
+        var n = 2
+        if i % 30 == 0: n = 3
+        if ckl_len(ffi, kl, q) != n or ckl_at(ffi, kl, q, 1) != k or (n == 3 and ckl_at(ffi, kl, q, 2) != i): bad.push("ckl {q}")
+      elif cx_has(ffi, cx, q) or ckl_has(ffi, kl, q): bad.push("key {q} never written")
+  for rr in 0..(TASKS * ROUNDS / 10):
+    let key = cl_at(ffi, rl, rr, 0) * ROUNDS + cl_at(ffi, rl, rr, 1)
+    if cl_len(ffi, rl, rr) != 2 or key in rseen: bad.push("cl_row {rr}")
+    rseen[key] = true
   if bad.len == 0: print("ok")
   else:
     print("{bad.len} differ")
