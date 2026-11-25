@@ -51,6 +51,10 @@ typedef struct {
     pthread_t reader; int has_reader;
     /* the request being answered when the process died (it gets "!", "!t" when it was stuck) */
     int died_gen, died_to; long died_t;
+    /* what its answers took: each request's sending time (by ticket), the time it was busy on the
+       requests answered (an answer's time less its request's sending or the previous answer's,
+       whichever is later), how many, and the last answer's time */
+    double *sent_at; long scap; double busy, last_ans; long served;
 } vl_worker;
 static vl_worker vlw[VL_MAXW];
 static pthread_mutex_t vl_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -61,6 +65,16 @@ static char **vl_env = NULL;      /* the processes' environment: vlint's, with N
 static char *vl_prelude = NULL;   /* lines */
 static size_t vl_prelude_len = 0;
 static int vl_slots = 1, vl_next_slot = 0, vl_inited = 0;
+/* With the number of lint requests known (vl_node_expect), the calls go to the first vl_inuse
+   processes, each to the one with the fewest requests waiting, and another process is started
+   only when the work left (the requests not sent yet, at the time the answers so far took each)
+   is more than VL_SPAWN_SECS for each process in use: a process costs about 0.2 s of CPU to start
+   (node, the host, the plugins), so a package of a few dozen files used to start four of them for
+   a fraction of a second of work. Unknown (-1): every thread keeps to one of vl_slots processes. */
+static long vl_expect = -1, vl_nsent = 0;
+static int vl_inuse = 1;
+static double vl_spawned_at = 0;
+#define VL_SPAWN_SECS 0.5
 static char vl_pool[32] = "";     /* --v8-pool-size=N for the processes, or "" */
 static __thread int vl_slot = -1;
 
@@ -92,6 +106,7 @@ static void vl_stop(vl_worker *w) {
     w->nans = 0;
     pthread_mutex_unlock(&w->rmu);
     w->timed_out = 0;
+    w->last_ans = 0;
     w->pid = -1; w->in = w->out = -1;
     w->have = w->next = 0;
 }
@@ -110,6 +125,7 @@ static void vl_init_once(void) {
         vlw[i].tickets = vlw[i].serving = 0; vlw[i].gen = 0; vlw[i].broken = 0; vlw[i].timed_out = 0;
         vlw[i].ans = NULL; vlw[i].alen = NULL; vlw[i].nans = vlw[i].acap = 0; vlw[i].has_reader = 0;
         vlw[i].died_gen = -1; vlw[i].died_t = -1; vlw[i].died_to = 0;
+        vlw[i].sent_at = NULL; vlw[i].scap = 0; vlw[i].busy = vlw[i].last_ans = 0; vlw[i].served = 0;
     }
     atexit(vl_atexit);
     const char *t = getenv("VLINT_JS_TIMEOUT");
@@ -260,6 +276,13 @@ static void *vl_reader(void *arg) {
         }
         char *a = malloc(w->len + 1);
         memcpy(a, w->buf, w->len);
+        if (w->nans < w->scap) {
+            double now = vl_now(), from = w->sent_at[w->nans];
+            if (w->last_ans > from) from = w->last_ans;
+            if (now > from) w->busy += now - from;
+            w->last_ans = now;
+            w->served++;
+        }
         w->ans[w->nans] = a;
         w->alen[w->nans] = w->len;
         VL_DBG("process %d: answer %ld, %zu bytes", (int)w->pid, w->nans, w->len);
@@ -442,7 +465,14 @@ static bool vl_send(vl_worker *w, const vu_str *req, long *t, int *g) {
     bool ok = vl_write_req(w, req->data, (size_t)req->len) && vl_write(w, w->in, "\n", 1);
     pthread_mutex_lock(&w->rmu);
     VL_DBG("process %d: request of %lld bytes sent (%s), ticket %ld", (int)w->pid, (long long)req->len, ok ? "ok" : "failed", w->tickets);
-    if (ok && !w->broken) { *t = w->tickets++; *g = w->gen; }
+    if (ok && !w->broken) {
+        if (w->tickets >= w->scap) {
+            w->scap = w->scap ? w->scap * 2 : 1024;
+            w->sent_at = realloc(w->sent_at, (size_t)w->scap * sizeof *w->sent_at);
+        }
+        w->sent_at[w->tickets] = vl_now();
+        *t = w->tickets++; *g = w->gen;
+    }
     else if (ok) *g = -1;  /* (it died meanwhile, found by a reader: no answer will come) */
     else {
         /* (the process died: its waiters give up, the request goes again) */
@@ -458,12 +488,50 @@ static bool vl_send(vl_worker *w, const vu_str *req, long *t, int *g) {
 /* The answer to a request from this thread's process, or "!" when node can't be started or died
    answering it. A request queued behind the one that made the process die is sent again (up to
    3 times) to the new process. */
+/* The number of lint requests the run will send (at most): see vl_expect. */
+void vl_node_expect(int64_t n) {
+    pthread_mutex_lock(&vl_mu);
+    vl_expect = n < 0 ? -1 : (long)n;
+    pthread_mutex_unlock(&vl_mu);
+}
+
+/* the process a call goes to (vl_mu held) */
+static int vl_pick(void) {
+    if (vl_expect < 0) {
+        if (vl_slot < 0) vl_slot = (vl_next_slot++) % vl_slots;
+        return vl_slot;
+    }
+    vl_nsent++;
+    double busy = 0;
+    long served = 0, bestq = -1;
+    int best = 0;
+    for (int i = 0; i < vl_inuse; i++) {
+        vl_worker *w = &vlw[i];
+        pthread_mutex_lock(&w->rmu);
+        long q = w->tickets - w->nans;
+        busy += w->busy;
+        served += w->served;
+        pthread_mutex_unlock(&w->rmu);
+        if (bestq < 0 || q < bestq) { bestq = q; best = i; }
+    }
+    if (vl_inuse < vl_slots && served >= 4 && bestq > 0) {
+        double now = vl_now();
+        double left = (double)(vl_expect - vl_nsent) * busy / (double)served;
+        if (now - vl_spawned_at > 0.05 && left / vl_inuse > VL_SPAWN_SECS) {
+            vl_spawned_at = now;
+            VL_DBG("%ld of %ld requests sent, %.2f s of work left: process %d added", vl_nsent, vl_expect, left, vl_inuse);
+            best = vl_inuse++;
+        }
+    }
+    return best;
+}
+
 vu_str vl_node_call(const vu_str *req) {
     pthread_mutex_lock(&vl_mu);
     vl_init_once();
-    if (vl_slot < 0) vl_slot = (vl_next_slot++) % vl_slots;
+    int slot = vl_pick();
     pthread_mutex_unlock(&vl_mu);
-    vl_worker *w = &vlw[vl_slot];
+    vl_worker *w = &vlw[slot];
     for (int attempt = 0; attempt <= 3; attempt++) {
         long t = 0;
         int g = 0;

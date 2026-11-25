@@ -69,10 +69,57 @@ type Graph:
   cwd: Str
   scc: [[Int]]        # no-cycle: each record's strongly connected component (ignoreTypes false, true),
   cyc: [[Bool]]       # and whether that component holds a cycle
-  full: Bool          # follow everything a dependency in node_modules imports (no-barrel-file counts it)
+  full: Bool          # no-barrel-file is on: what it counts is followed whole (fullv)
+  fullv: [Bool] = []  # each record: everything it imports is followed, a dependency's too (it is
+                      # reachable from what a linted file re-exports whole, which no-barrel-file counts)
+  placed: [Bool] = [] # each record: parsed and placed
+  root: [Bool] = []   # each record: a linted file (or one of its sections)
 
 fn new_graph() -> Graph:
   return Graph(false, [], {}, {}, "", [], [], false)
+
+fn add_rec(var g: Graph, path: Str) -> Int:
+  let i = g.recs.len
+  g.recs.push(new_rec(path))
+  g.fullv.push(false)
+  g.placed.push(false)
+  g.root.push(false)
+  return i
+
+# the requests of a linted file's record that no-barrel-file counts the modules of: `export * from`,
+# `export * as ns from`, and a namespace import exported again (`import * as ns`, `export { ns }`)
+fn nb_seeds(r: Rec) -> [Bool]:
+  var out = [false] * r.rq.len
+  for x in r.star_rq: out[x] = true
+  for e in 0..r.ind_rq.len:
+    if r.ind_rq[e] >= 0 and (r.ind_ik[e] == 1 or r.ind_ik[e] == 2): out[r.ind_rq[e]] = true
+  for e in 0..r.ie_n.len:
+    if r.ie_k[e] == 1 and r.ie_n[e] >= 0:
+      for ln in r.le_ln:
+        if ln == r.ie_local[e]: out[r.ie_n[e]] = true
+  return out
+
+# record x and all it reaches followed whole (no-barrel-file counts them): a dependency placed
+# before gets the requests it didn't follow then
+fn mark_full(var g: Graph, x: Int, var todo: [Job]):
+  var st: [Int] = [x]
+  while st.len > 0:
+    let y = st.pop()
+    if g.fullv[y]: continue
+    g.fullv[y] = true
+    if not g.placed[y]: continue
+    for j in 0..g.recs[y].rq.len:
+      let target = g.recs[y].rq_path[j] + ""
+      if target == "" or not valid_ext(target): continue
+      var ti = g.recs[y].rq_res[j]
+      if ti < 0:
+        if target in g.at: ti = g.at[target]
+        else:
+          ti = add_rec(&g, target)
+          g.at[target] = ti
+          todo.push(Job(ti, target + ""))
+        g.recs[y].rq_res[j] = ti
+      if not g.fullv[ti]: st.push(ti)
 
 # oxc's VALID_EXTENSIONS
 fn js_ext(p: Str) -> Bool:
@@ -533,9 +580,11 @@ fn place(var g: Graph, var gr: GRes, pshown: {Str: Str}, var todo: [Job]):
   let p = g.recs[gr.idx].path + ""
   var slots: [Int] = []
   for mi in 0..gr.more.len:
-    slots.push(g.recs.len)
-    g.recs.push(new_rec(p))
+    let si = add_rec(&g, p)
+    g.root[si] = g.root[gr.idx]
+    slots.push(si)
   slots.push(gr.idx)
+  var marks: [Int] = []
   if p in pshown:
     let sh = pshown[p]
     for si in 0..gr.sec.len: g.shown["{sh}#{gr.sec[si]}"] = slots[si]
@@ -545,23 +594,32 @@ fn place(var g: Graph, var gr: GRes, pshown: {Str: Str}, var todo: [Job]):
     else: swap(&r, &gr.rec)
     if r.path == "": r.path = p + ""
     # (a dependency in node_modules: only what it re-exports is loaded further; what else it
-    # imports can't lead back to the linted files, and no rule reads it)
-    let dep = not g.full and p.find("/node_modules/") >= 0
+    # imports can't lead back to the linted files (no-cycle doesn't go through node_modules), and
+    # no rule reads it, unless no-barrel-file counts it: then it is followed whole (fullv). oxlint
+    # follows every import of every dependency; the counts are the same)
+    let x = slots[si]
+    let dep = p.find("/node_modules/") >= 0 and not (g.full and g.fullv[x])
     var follow: [Bool] = []
     if dep:
       follow = [false] * r.rq.len
-      for x in r.star_rq: follow[x] = true
-      for x in r.ind_rq: follow[x] = true
+      for q in r.star_rq: follow[q] = true
+      for q in r.ind_rq: follow[q] = true
+    var seeds: [Bool] = []
+    if g.full and g.root[x]: seeds = nb_seeds(r)
+    let whole = g.full and g.fullv[x]
     for j in 0..r.rq.len:
       let target = r.rq_path[j] + ""
       if target != "" and valid_ext(target):
         if dep and not follow[j]: continue
         if not (target in g.at):
-          g.at[target] = g.recs.len
-          g.recs.push(new_rec(target))
-          todo.push(Job(g.at[target], target + ""))
+          let ti = add_rec(&g, target)
+          g.at[target] = ti
+          todo.push(Job(ti, target + ""))
         r.rq_res[j] = g.at[target]
-    swap(&g.recs[slots[si]], &r)
+        if whole or (seeds.len > 0 and seeds[j]): marks.push(r.rq_res[j])
+    swap(&g.recs[x], &r)
+    g.placed[x] = true
+  for y in marks: mark_full(&g, y, &todo)
 
 fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool, var kw: {Str: Int}, var t: ast.Ast, cdir: Str) -> Graph:
   let pcm: Memo[Str, PkgC] = memo()
@@ -577,9 +635,10 @@ fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool,
   for i in 0..files.len:
     if not valid_ext(files[i]): continue
     if not (files[i] in g.at):
-      g.at[files[i]] = g.recs.len
-      g.recs.push(new_rec(files[i]))
-      todo.push(Job(g.at[files[i]], files[i] + ""))
+      let ri = add_rec(&g, files[i])
+      g.at[files[i]] = ri
+      g.root[ri] = true
+      todo.push(Job(ri, files[i] + ""))
     if lpart.is_partial(files[i]): pshown[files[i]] = shown[i] + ""
     else: g.shown[shown[i]] = g.at[files[i]]
   if threads <= 1 or todo.len < 8:

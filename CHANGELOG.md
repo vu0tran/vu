@@ -3263,3 +3263,17 @@ check: with vtsc's signatures also moved to C, instructions on the three program
 and the check). Measured on macOS (arm64): run_ffi 52 of 52 with leak detection off (LeakSanitizer
 isn't supported there; with it, the same 18 fail on that alone as before), run_targeted.sh 776 of
 776, run_split.sh 17 of 17; the full gate not run (it can't pass on this Mac); not run on Linux.
+
+**vlint: node processes as the work needs them; no-barrel-file's graph scoped (2026-11-24).** On
+the CI job's pattern without type-aware rules, vlint's plain lint cost 240 cpu-s against oxlint's
+147: 341 node processes for JS plugins (one per two cores in every invocation, about 0.2 cpu-s each
+to start, most for packages of a few dozen files) and a module graph that followed every import of
+every dependency for no-barrel-file. Now a process is added only when the requests left are more
+than 0.5 s of work for each process in use (at the time the answers so far took), and a dependency
+is followed whole only when it is reachable from what a linted file re-exports whole. Measured
+alternated with oxlint 1.79: the plain-only job 190.4 and 189.9 cpu-s (35.5 s twice; node 130 -> 102
+cpu-s, 341 -> 170 processes), the full cold job 76.6 and 74.7 s, 459 and 461 cpu-s (from 78.4 and
+79.1 s, 501 and 497; oxlint 73.7 and 74.7 s, 470 and 472). All 88 outputs identical, the 133 probes
+the same, vtest's 3 failures unchanged. Tried and not kept: kind_of answered from folder listings
+(in Vu maps: more instructions; in C, shared by the process: 34,000 of 34,400 answers without a
+stat, cpu unchanged) and integer keys for the React Compiler's value cache (-0.4% instructions).

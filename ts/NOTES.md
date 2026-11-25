@@ -269,6 +269,63 @@ Later the same day (the module record cache, lmod: `PkgC`, `parse_cached`, `save
 - the measurement harness must give absolute paths for XDG_CACHE_HOME: one run from the linted
   folder with a relative one wrote its caches there.
 
+## The plain lint on the CI job's pattern (measured 2026-11-24, later)
+
+Measured with the plain-only job (the 88 invocations with VLINT_TYPE_AWARE=0) and a `node` wrapper
+on PATH that logs each node process's cpu (the session's scratch `m6/pj.sh`); oxlint's plain cost is
+its job's cpu less tsgolint's (an OXLINT_TSGOLINT_PATH wrapper logging tsgolint's own). Before:
+vlint 240-241 cpu-s (41 s), of it node 130 cpu-s in 341 processes and vlint's own processes about
+111; oxlint about 147 cpu-s (its JS plugins run in its own node process).
+
+Where vlint's own cpu goes, by VLINT_PHASE (0 startup, 1 read + parse + the module graph, 2 + scopes,
+9 everything), vlint's process alone: the largest package (12,400 files) 0.9 / 3.6 / 3.7 / 22.0 s, so
+the rules are 18 s (1.5 ms a file); a 1,100-file package 0.2 / 1.4 / 1.5 / 3.6; the plugin-heavy one
+(eslint-plugin-react-hooks as a JS plugin) 0.2 / 1.5 / 1.5 / 4.1 with node at 30.8 cpu-s.
+`--profile` puts the React Compiler at about 60% of the rules' samples on the largest package.
+Beware `--profile` on macOS: SIGPROF goes to any thread, so a thread blocked in ljs.call gets about a
+quarter of the samples, and the samples on stat calls (lresolve's `closure`, realpath_memo) overstate
+them: answering 34,000 of a package's 34,400 kind_of questions from folder listings shared by the
+process (C, no stat) changed neither instructions nor cpu, and integer keys for rc_imae's cached_vid
+(string formatting was 4% of the RC samples) took 0.4% off the instructions. Measure by ablation and
+instructions, not by profile shares.
+
+What oxlint does: its JS plugins run in its one node process (the plugin and host load once, the
+AST read lazily from a raw buffer); vlint ran one node process per two cores whatever the package,
+each costing about 0.2 cpu-s to start (node, the 26,000-line host from the compile cache, the plugin's
+.mts stripped by amaro): 341 starts, about 70 cpu-s, most of them for packages of a few dozen files.
+A JS lint request on a light plugin is mostly vlint's own transfer: on the largest package the main
+JS threads were busy 6.2 s, of which the plugin's rules 0.28 s, JSON.parse of the request about
+0.8 s, and building the ESTree and setting parents most of the rest. oxlint 1.79's `--debug=timings`
+printed nothing on these invocations (exit 0), so its per-rule costs weren't measured.
+
+What landed:
+- node processes as the work needs them (ljs_glue.c: vl_node_expect, vl_pick): told how many lint
+  requests the run sends, calls go to the least loaded of the processes in use, and another is added
+  only when the requests left, at the time the answers so far took, are more than 0.5 s for each
+  process in use. Small packages keep one process; the largest still get four within the first few
+  hundred files. 341 -> 170 processes, node 130 -> 102 cpu-s.
+- no-barrel-file's module graph scoped to what it counts (lmod: fullv, nb_seeds, mark_full): a
+  dependency is followed whole only when it is reachable from what a linted file re-exports whole
+  (`export * from`, `export * as ns from`, an exported namespace import); every other dependency
+  only through its re-exports, as with the rule off (no-cycle doesn't go through node_modules). The
+  counts are the same; most packages have no such file (the job reports two barrel files).
+Together: the plain-only job 190.4 and 189.9 cpu-s, 35.5 and 35.5 s (from 240.3 and 241.1, 41.0
+and 40.0; oxlint 146.8 and 148.0 cpu-s); the full cold job 76.6 and 74.7 s, 459 and 461 cpu-s
+(before 78.4 and 79.1 s, 501 and 497; oxlint 73.7 and 74.7 s, 470 and 472), every output identical.
+The plain numbers include the node wrapper (a python process per node process).
+
+What's left, by size (job-wide, vlint's own about 88 cpu-s, node about 102):
+- node: about 34 cpu-s of the 102 is still process starts (170); the rest is per-file work, on light
+  plugins mostly the transfer (JSON.parse, buildEstree, setParents). A binary transfer read lazily,
+  as oxlint's raw transfer, would cut most of it. A plugin that runs React's compiler itself is
+  heavy in both linters; four processes warm its JIT four times.
+- the React Compiler: about 60% of the rules' cpu on large packages, spread over passes
+  (infer_mutation_aliasing_effects about 37% of it: apply_effect, compute_signature, clone_state;
+  enter_ssa 9%; lowering 9%; rc_shapes.base, the registry built again for every file, 7%: one built
+  once and shared read-only, with each file's additions in an overlay, is the next small step).
+- the module graph: 1.2-2.7 s of read, parse and resolve per large package even with the record
+  cache; dependencies' re-exports are what import/named and friends need.
+
 ## Checking one program on several workers (design notes, measured 2026-11-24)
 
 tsgolint checks a program on several checkers over one parsed and bound program, the files split
