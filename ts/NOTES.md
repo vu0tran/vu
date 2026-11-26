@@ -2530,3 +2530,55 @@ about 230; what's left of the allocator's cost is mostly _tlv_get_addr (each fre
 thread-local, about 270 samples) and memmove/memset (about 490: vu_str_concat, rc_imae.clone_state,
 maps' entries). The cold job 77.2 -> 69.9 s wall, 407 -> 384 cpu-s, one run each on a loaded machine.
 
+
+### JS plugins in an embedded QuickJS instead of node (measured 2026-11-26, not kept)
+
+The question: would running `jsPlugins` in QuickJS-ng (0.18.0, an interpreter) inside vlint's own
+process beat starting node for them? On the CI job's pattern node still starts in every invocation
+(the monorepo's local plugin is in the root configuration), about 50 ms of cpu a process with the
+snapshot. No: the interpreter is 5-12 times slower than node's JIT per file, on the ESTree build and
+the rules alike, so it wins only on invocations of a few dozen files, and there it saves milliseconds.
+
+How it was measured (the session's scratch `m32/`): vlint 5612c6af run on the job's 88 invocations
+with `VLINT_JS_PROCS=1` and a host that copies everything it reads on fd 3 and every answer to files
+(`cap/IDX/PID.in`, `.out`); then each capture replayed alone (`nall.sh`: node with the host and its
+snapshot, as vlint starts it, `--v8-pool-size=1`; an instrumented host for the per-file times) and in
+QuickJS (`proto/qrun.c`: the same host, oxlint's runtime and estree.js, with main.js's loop replaced,
+node's globals and built-ins written in JS over a dozen C functions (`proto/qshim.js`: fs, path, url,
+module with CommonJS `require` and node's resolution, util, events, buffer, os, assert, process,
+timers; crypto and streams as stubs that throw when used), ES and CommonJS modules through
+QuickJS's module loader, .ts/.mts stripped beforehand by node's own `stripTypeScriptTypes`). Every
+answer of the 87 invocations with JS plugins was byte-identical between the two (the local plugin,
+eslint-plugin-n, jsx-a11y, eslint-comments, react-hooks' JS rules where they still run). Quiet
+machine (load 1.4-1.9).
+
+| idx | files | node wall / cpu-s | QuickJS wall = cpu-s | per file, ms: node rules / ESTree | QuickJS rules / ESTree |
+|---|---|---|---|---|---|
+| 59 | 12,428 | 2.07 / 2.6-2.7 | 20.7 | 0.08 / 0.06 | 0.68 / 0.98 |
+| 52 | 5,104 | 1.15 / 1.7 | 10.8 | 0.09 / 0.09 | 0.82 / 1.29 |
+| 31 | 1,435 | 0.55 / 0.9 | 3.9 | 0.17 / 0.13 | 1.20 / 1.52 |
+| 21 (eslint-plugin-n) | 902 | 2.36 / 3.0-3.2 | 17.6 | 2.12 / 0.13 | 17.5 / 1.17 |
+| 16 | 211 | 2.25 / 3.7-3.9 | 11.2 | 9.3 / 0.12 | 51.4 / 0.49 |
+| 23 | 88 | 1.15 / 1.6-1.9 | 3.0 | 8.1 / 0.23 | 28.4 / 1.18 |
+| 72 | 84 | 0.05 / 0.05 | 0.031 | | |
+| 69 | 20 | 0.05 / 0.05 | 0.023 | | |
+| 0 | 9 | 0.05 / 0.04-0.06 | 0.019 | | |
+| 5 | 3 | 0.04 / 0.03 | 0.012 | | |
+
+Start: QuickJS compiles the 1.26 MB host in 48 ms; from its bytecode (`JS_WriteObject` once,
+`JS_ReadObject` at start, 2.8 MB) it starts in 8.7 ms, against node's 30-45 ms of cpu with the
+snapshot. Handing the tree over is free in both (the frame's arrays read in place; 0.01 ms a file in
+QuickJS); building the ESTree from them is the cost (estree.js, interpreted). Peak memory of QuickJS
+alone: 14 MB on a small invocation, 367 MB on idx 59 (node about 400 MB on idx 21).
+
+The whole job's JS part, replayed: node 29.9 cpu-s; QuickJS (bytecode start) 113.6; QuickJS with
+the ESTree build counted as free (as if built natively from vlint's tree: an upper bound, not
+built) 63.7. The cheaper of the two per invocation: 28.9 (1.0 cpu-s saved), or 27.5 with the free
+ESTree (2.4 saved). QuickJS is cheaper on 43 of the 87 invocations, the largest 84 files (node 2.6
+cpu-s for those 43, QuickJS 1.6); the crossover is about 40-60 files of the local plugin alone
+(1.0-2.5 ms a file interpreted against 0.15-0.5 ms in node, 35 ms less to start). Those small
+invocations are bound by their type-aware check, off the JS path, so the job's wall wouldn't move;
+the heavy ones (59, 52, 21, 16) would take 5-12 times the cpu and, even split over four lint threads,
+more wall than one node process. Not tried: a faster interpreter build (only -O2), QuickJS's own
+tuning; neither is a factor of five.
+
