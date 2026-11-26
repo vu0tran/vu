@@ -2635,6 +2635,138 @@ baseline file to go stale. The way to run it:
 
     VTSC_LIB=$XDG_CACHE_HOME/vlint/tslib-b82676463eea69ca ./vtest.sh VTSC   # or any copy of the lib with that hash
 
+### Instantiation and packages' declarations: what they cost, what would save it (measured 2026-11-26, night, later)
+
+The question: instantiating generics is about 28% of the checks (the LIBM timer: the lib's 9.3%, the
+packages' 19.2%) and the packages' declarations are read, parsed and bound whole (85 G, 9.1% of the
+942 G). Why, and what would lazier instantiation, better keys, interning, or loading only the
+declarations a program uses save?
+
+How it was measured (the session's scratch `m35/`): `VTSC_INSTM=1` (below) on the 88 serial
+type-aware runs (`imr.sh`, libm.sh's setting: plain rules off, one checker, VTSC_PPARSE as the job's;
+`ana_im.py`, `ana_b.py` the sums); `sall2.sh` the same runs under /usr/bin/sample, folded by fold2.py
+(`instcall.py`: instantiate's samples by the caller category above it; `incl.py`: frames inclusive);
+`ana_a.py` and `ana_b.py` the wall model (m33's ana3: the serial checks' 0.149 s per G over each
+check's 4 or 8 threads, capped by the invocation's type-aware part beyond its linting, ph_base's,
+scaled to j_base's walls, then sim.py's two lanes). The timers are wall ns (shares to read, not
+seconds); load 2-6 on 10 cores.
+
+`VTSC_INSTM=1` (bind.im_*, tsprog.instm_report; off: probes 135/135 and shuffled 1 and 2, vtest 815
+ok, the job's 176 outputs as 4f3bf53b's (m33/j_base), serial instructions idx 52/31/16 within 0.5%;
+on: the outputs of idx 14, 25, 31, 52, 59, 86 as without), lines per pass:
+- INSTM: bind.IM_*'s counters: instantiate's calls, those past its "nothing to instantiate" returns
+  by kind of type and origin, every cache's hits and misses (inst_gcache, inst_icache, inst_acache,
+  alias_inst, the mappers' interning, compose_cache, gen_cache, cond_cache, ref_of's interning,
+  prop_cache, sigs_of's ht_sigs), the misses whose result t already got by another key, and those
+  whose mapper cut to the type parameters t may refer to (refs_any) was seen before; lazy members
+  made (get_prop of an instantiated type, mapped types' keys) and typed (in the check, by the
+  rules); the outermost instantiation's ns by origin, the outermost instantiate1 frames' ns and
+  what a better key would have saved of them (a frame counted whole, its inner frames then not);
+  compose1's and inst_sig's outermost ns; the composed pairs no instantiation looked up.
+- INSTPKG: by package, the instantiations counted, the outermost's ms, the files and bytes, those
+  with a symbol the check typed or resolved, and the bytes of the top-level statements declaring
+  them.
+- PKGUSE, PKGCLOSURE: the packages' files, bytes and nodes, those the check used (a symbol typed
+  by declared_type/type_of_sym, an object's members resolved, an import resolved through), what an
+  on-demand loader would still have to read (script files, declare global and declare module
+  blocks, files of re-exports only), and the statements reachable by name from the program's own
+  files (each identifier looked up by declared names in the file's dependencies, six deep, then
+  among the globals; then the same from each statement reached): a syntactic loader's set.
+
+(A) Instantiation, over the 123 programs (80.1 s of serial checks):
+- 43.3 M calls of instantiate, 32.7 M past the early returns (a median of 41 k a program, 7.4 M in
+  idx 86's two): type parameters looked up 48%, conditional 9.5%, anonymous 9.3%, an instantiated
+  anonymous type again 9.0%, indexed 7.4%, references 5.4%, unions 4.2%, intersections 2.7%; by
+  origin: packages' 40%, the lib's 21%, no declaration (unions, conditionals...) 39%.
+- The caches: inst_gcache (unions, conditionals, indexed, keyof, templates) 35.5% hits, inst_icache
+  (objects) 31.3%, alias_inst 42%, the mappers' interning 62%, compose 25.7%, cond_cache 27.1%,
+  ref_of's interning 74%, gen_cache 88.9%, prop_cache 82%, sigs_of 81%.
+- Duplicates: 55% of gcache misses and 5.5% of icache misses gave a result t already had by another
+  key; those frames are 5.6 s, 31% of the 17.8 s of outermost instantiate1 frames: what an oracle key
+  would save. A key cut to the type parameters t may refer to finds 1.9 M of the 11.3 M misses, 0.47
+  s (2.6%; 0.03 s more without the relation's flags in it): the rest are the same answer for
+  different arguments (conditional types 1.2 M, indexed 1.2 M, instantiated types 1.1 M), as tsc
+  computes them too. The same structure under other ids: none for mappers and references (both
+  interned by content), 37 k of 2.45 M anonymous instantiations (1.5%) a node and mapper made before.
+- Members: a reference's or instantiated type's members are made when asked for by name, their types
+  when read (hy_linst); mapped types make every key's member when resolved. 6.18 M and 2.92 M made;
+  typed in the check 24.7% and 23.7%, by the rules 3.17 M more: about 41% never typed.
+- Time: the outermost instantiations 16.9 s by the timer (21.1% of the checks, 2.7 s of it in the
+  rules), 26.8% of the run_libs samples. In the samples, the frame nearest above instantiate: a lazy
+  member typed (type_of_sym, get_prop, prop_type_for) 35%, inference (instantiate_call, inf_mapper)
+  25%, sigs_of 15%, declared types 9%, JSX 8%, call resolution 3%, relations 0.9% (relations
+  anywhere above 10%); under call resolution 71%, under the rules 17%. Inside it, inclusive:
+  conditional types evaluated 54% (their extends relations 21%), cond_compose's mappers 34%
+  (compose1's time is the targets' instantiation: 5,528 of 5,977 samples), inst_sig 36%
+  (instantiate_call 47% of it, sigs_of 41%), mapped types 32%, indexed access 17%. By package (the
+  outermost's ms): the lib 2.5 s, then single packages at 1.8, 1.6, 1.5 (@types/react), 0.6, 0.5 and 0.4 s (schema
+  validation, GraphQL schema building, ORM and type-utility libraries); 8.3 s for types with no declaration. idx 86 (the job's last): 3.7 s of
+  its 14 s of checks, one GraphQL schema-building package 1.5 s of it.
+- Composing mappers eagerly: the outermost compositions made 2.46 M pairs in 5.8 s; pairs no
+  instantiation then looked up 142 k, 0.10 s. At an instantiated type's composition 74% of the inner
+  mapper's pairs are ones its target may refer to.
+
+What each idea would save (of the 80.1 s of checks; the job by ana_a.py: 1% of the checks is 0.16 s
+of the invocations alone, about 0.1-0.2 s of the modeled 48.9 s job; all of instantiation, 28%, 3.4 s):
+| idea | measured target | est. saving | effort |
+|---|---|---|---|
+| lazy members: a mapped type's key member without its mapper (extend) and -? type until read; a reference's mapper made once, not per member (get_prop, sigs_of, index_type) | extend 454, the -? and as-clause instantiations within 1,192, get_prop's new_mapper 242 of 59,509 samples; 41% of members never typed | 0.5-1.5% of the checks (0.4-1.2 s), job about 0.1-0.2 s | 2-4 days |
+| better memo keys (a mapper cut to what t may refer to) | 0.47 s of instantiate1 frames | 0.6% (0.47 s), job under 0.1 s | a week (refs_any is exact only for unions, indexed and references) |
+| structural interning | 1.5% of anonymous instantiations | about 0 | - |
+| avoiding re-instantiation in relate | relations call instantiate directly for 0.9% of its samples | under 0.3% | - |
+| lazy composition (pairs instantiated when looked up) | 0.10 s of unused pairs; tsc keys conditional and mapped instantiations by every outer type parameter's mapping too, which forces them | about 0.1% | - |
+| lazy signature instantiation (sigs_of instantiates every overload's parameters and return) | sigs_of's inst_sig 41% of 6.1 s; sets of more than one 73 k of 576 k signatures | under 1% | a week |
+Instantiation is the work itself: inference, conditional types (schema-validation, schema-building, ORM and type-utility packages) and
+members typed when read, as tsc does it. No idea reaches 2% of the checks.
+
+(B) Packages' declarations, over the 123 programs:
+- 187,764 files, 1,162 MB, 72.3 M nodes read, parsed and bound; 11.9 M symbols bound, 4.38 M (36.7%)
+  typed or resolved by the check (or the rules).
+- Used: 23,974 files (12.8%) have a symbol the check used, but they are 45% of the bytes (@types/node,
+  @types/react, csstype, @tabler/icons-react's 7.5 MB file read for one icon); the top-level
+  statements declaring the used symbols are 15.6% of the bytes.
+- What must be read anyway (the program's file set is every file imports reach, used or not, so
+  every file is still read): script files' globals (5,996 files, 244 MB), declare global blocks
+  (1,577 files, 8.1 MB), declare module blocks (719 files, 1.5 MB), files of re-exports only
+  (11,004, 11.4 MB); triple-slash references and @types' auto-inclusion change nothing (they add files,
+  read as now).
+- Reachable by name from the program's files (PKGCLOSURE): 709 k of 2.75 M statements, 493 MB
+  (42%), in 72,736 files (908 MB, 78%); it finds 70% of the statements the check used (the rest come
+  through what names alone don't follow: the binder's resolution of export =, import("x"), JSX's
+  namespace, lib names merged with packages' declarations, inference); with them, 520 MB (45%).
+- So a loader by file parses 95% of the bytes anyway (with the files above), one by statement
+  47%. Of read+parse (68.9 G) the split is reading 58% (read_fsrc 5,201 samples: opening and
+  reading, which stay, as does resolving on main), parsing 42% (the scanner 54% of it, kept: a skim must lex every file for its
+  statements, names, imports and augmentations), merging into the program's tree about as much as
+  parsing (pmerge 3,727 samples), binding 16.5 G. Saved: by file 3.4 G, by statement 31.9 G (3.4%
+  of the 942 G), before the skim's index of names. The job (ana_b.py): by file 48.9 -> 48.6-48.8 s;
+  by statement 48.1 s if only the binding (main's) shortens the walls, 46.3 s if all of it counted
+  as main's serial time (the parse is on four tasks, so nearer the first).
+
+An exact on-demand loader, sketched (not built):
+- a skim of every file read (a lexer pass over the bytes, no tree): its top-level statements' spans
+  and declared names (namespace bodies too), its import and re-export specifiers, and where declare
+  global and declare module blocks are; parsed and bound whole: those blocks, re-exports, export =
+  and export default; every other statement parsed when a name reaches it.
+- before the check (the binding is shared read-only by the check's threads, so nothing can be bound
+  during it): the closure from the program's own files, by the binder's resolution, not by name
+  (imports through aliases and export *, export =, import("x") types, typeof, qualified names into
+  namespaces, a name's every declaration across files for merging, JSX's and React's implicit
+  names, lib symbols that packages' declarations merge into), each statement reached parsed,
+  appended to the tree and bound, until nothing new is reached; checked as VTSC_GRAFT=check is:
+  every program with and without it, outputs and types identical, and a statement asked for in the
+  check that wasn't loaded a panic, not a silent any.
+- effort: the skim and its index (a week), statement-level parsing into the program's tree and a
+  binder for partial files (scopes, exports, merges, ambient modules: two to three weeks), the
+  pre-check closure by the binder (two weeks), the check mode and the corpus's regressions (one to
+  two): six to eight weeks.
+
+Not built. (A): no change clears 2% of the checks; if any, the lazy mapped members and a
+reference's mapper made once (days, about 1% of the checks, a tenth of a second of the job) are
+the ones worth a gate. (B): a by-file loader saves nothing (95% of the bytes are parsed anyway); a
+by-statement one about 3% of the instructions and 0.8-2.6 s of the modeled job, for six to eight
+weeks and a binder that must find every declaration a name can reach before the check starts.
+
 ## Keeping the caches in CI
 
 What a CI job can keep between runs is one folder: `$XDG_CACHE_HOME/vlint` (`~/.cache/vlint`
