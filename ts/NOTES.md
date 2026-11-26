@@ -1247,22 +1247,28 @@ What it took:
   checked, K linted" and its NOLINT lines are part of each comparison below.
 
 Results (each threaded run against that round's run on one checker, the same switches: the
-output, the "checked, linted" lines and the NOLINT files; `m15/matrix.sh`, load 19-24 on 10
-cores; wall s / cpu s / G instructions / the check phase in s):
+output, the "checked, linted" lines and the NOLINT files; `m15/matrix.sh`, three rounds, each
+idx alone and its N alternated, load 14-24 on 10 cores; wall s, the three rounds, then the first
+round's cpu s / G instructions / check phase s):
 
-| idx (files) | one checker | 2 threads | 4 | 8 | all identical |
-|---|---|---|---|---|---|
-| 59 (14,449) | 27.7 / 29.5 / 181.0 / 23.3 | 18.6 / 33.9 / 195.5 / 14.4 | 13.6 / 40.8 / 210.1 / 9.2 | 11.2 / 53.1 / 221.8 / 6.8 | yes |
-| 86 (2,710) | 15.6 / 16.2 / 98.9 / 13.8 | 10.2 / 19.0 / 105.1 / 8.5 | 7.2 / 23.4 / 110.6 / 5.5 | 6.5 / 35.4 / 118.4 / 4.8 | yes |
-| 52 (5,108) | 7.4 / 8.6 / 62.5 / 5.8 | 5.1 / 9.4 / 64.7 / 3.4 | 3.7 / 10.1 / 65.8 / 2.0 | 3.1 / 11.8 / 67.7 / 1.4 | yes |
-| 31 (1,439) | 6.8 / 7.1 / 53.2 / 5.6 | 4.5 / 7.7 / 56.4 / 3.4 | 3.4 / 8.9 / 59.7 / 2.3 | 2.9 / 11.6 / 64.6 / 1.8 | yes |
+| idx (files) | one checker | 2 threads | 4 | 8 |
+|---|---|---|---|---|
+| 59 (14,449) | 27.7 28.1 32.2; 29.5 / 181.0 / 23.3 | 18.6 19.6 21.9; 33.9 / 195.5 / 14.4 | 13.6 13.9 15.0; 40.8 / 210.1 / 9.2 | 11.2 11.5 12.3; 53.1 / 221.8 / 6.8 |
+| 86 (2,710) | 15.6 18.5 17.4; 16.2 / 98.9 / 13.8 | 10.2 13.3 12.4; 19.0 / 105.1 / 8.5 | 7.2 8.7 8.4; 23.4 / 110.6 / 5.5 | 6.5 7.4 6.8; 35.4 / 118.4 / 4.8 |
+| 52 (5,108) | 7.4 8.8 8.3; 8.6 / 62.5 / 5.8 | 5.1 6.2 5.7; 9.4 / 64.7 / 3.4 | 3.7 4.0 4.0; 10.1 / 65.8 / 2.0 | 3.1 3.4 3.4; 11.8 / 67.7 / 1.4 |
+| 31 (1,439) | 6.8 7.9 7.6; 7.1 / 53.2 / 5.6 | 4.5 5.1 4.9; 7.7 / 56.4 / 3.4 | 3.4 3.7 3.8; 8.9 / 59.7 / 2.3 | 2.9 3.2 3.3; 11.6 / 64.6 / 1.8 |
 
-One round each so far. The check phase scales to 3.4x (idx 59) and 4.1x (idx 52) on 8 threads;
-the work grows with the threads (instructions +8% on 2 threads, +16% on 4, +23% on 8 for idx
-59): what each worker makes again (its own fills of what another worker is filling, the copies
-of the maps, the losers' rows) and the spinning of idle threads (cpu grows faster than
-instructions). With the switches off the serial check is +0.5 / +0.7 / +0.7 / +0.4% instructions
-on idx 59 / 86 / 52 / 31 (179.2 / 98.2 / 62.3 / 52.1 G against 178.3 / 97.5 / 61.9 / 51.9).
+Compared, 36 threaded runs: the output identical in all; the checked and linted files identical
+in 35. The other (idx 31, 2 threads, round 3): one file not checked ("a JSX component of this type")
+and through its importers 7 more, none with a diagnostic in one checker's output: which files a
+fill marks unchecked depends on timing (step 5). The check phase scales to 3.4x (idx 59) and 4.1x
+(idx 52) on 8 threads; the work grows with the threads (instructions +8% on 2 threads, +16% on 4,
++23% on 8 for idx 59): what each worker makes again (its own fills of what another worker is
+filling, the copies of the maps, the losers' rows) and idle threads spinning (cpu grows faster
+than instructions). With the switches off the serial check is +0.5 / +0.7 / +0.7 / +0.4%
+instructions on idx 59 / 86 / 52 / 31 (179.2 / 98.2 / 62.3 / 52.1 G against 178.3 / 97.5 / 61.9 /
+51.9), and the gate (176 job outputs, 135 probes and shuffled 1 and 2, vtests) is the same with
+the switches off and on.
 
 On the way (each found by a run above, fixed): 3 vtests differed on 2 threads (ns_file,
 concrete_objs, and evolving-array-push-decl by timing); idx 86 lost two rule diagnostics and 373 files' rules (the node types); idx 59
