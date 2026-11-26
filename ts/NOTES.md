@@ -1446,15 +1446,25 @@ the peak, the shards of a program finishing together instead of some early. On a
 loaded the extra cpu costs wall: the threads and the early start together took 2.5 s off the
 walls' halved sum where the invocations alone said about 11.
 
-Found, not fixed (from eedbf4d6's threads, not these changes): in the job, idx 59 (the
-14,449-file program on 8 threads) sometimes marks one more file unchecked, "a variable whose type
-evolves along branches or loops" (an untyped `let` read in a useMemo callback, chk.vu's
-unsup there), and its 8 importers after it: stderr says 16 files where it says 7, stdout the
-same. Seen in 1 of 6 job runs of eedbf4d6 and 4 of 29 since (2 of 4 with
-VLINT_VTSC_DEBUG=2), never in 14 runs of idx 59 alone or beside another large invocation, nor in
-the earlier dgate rounds. Likely the fill-timing case above: another worker types the callback's
-body for the symbol's type before the file's own check does, where the narrowing isn't known.
-None of the gate runs above showed it.
+Found, then fixed (from eedbf4d6's threads): in the job, idx 59 (the 14,449-file program on 8
+threads) sometimes marked one more file unchecked, "a variable whose type evolves along branches or
+loops", and its 8 importers after it (stderr 16 files where it says 7, stdout the same; 1 of 6 job
+runs of eedbf4d6, 4 of 29 since). The read was not of a `let`: it was a callback's parameter whose
+type was `auto` itself, the element of an evolving array (`const xs = []`, pushed in a loop,
+returned) another module's function returns. The cause: `c.auto_arr` (auto[], the evolving array's
+type) was made lazily by each worker (chk.auto_array; an interned reference, so the same id from
+every worker), and copied as -1 into workers made before any had it. A worker that hadn't made it
+yet read the array's symbol type another worker had published as auto[], took it for an ordinary
+array (`t == c.auto_arr` false, evolve_call returning early on -1), and inferred the function's
+return type with auto[] in it; the callback's parameter was then auto, read where it's declared.
+Now run_libs makes it before the workers start. `vtests/evolving-array-other-worker` shows it:
+before, with VTSC_THREADS=4, 16 of 20 vtest runs failed (VTSC_THREADS_MIN_FILES=1 by hand: 30 of
+30 on 4 and 8 threads, 4 of 30 on 2); after, 0 of 60 on 8 threads and 0 of 50 vtest runs. Serial
+runs don't reach the change (idx 59/86/52/31 178.8 / 97.6 / 62.5 / 52.5 G instructions against
+179.5 / 97.9 / 62.5 / 52.3). With it: the gate (176 job outputs, probes 135/135 and shuffled 1
+and 2, vtests the 3 known failures), 4 job runs with all 176 outputs as before, `dgate.sh` idx 31,
+52, 86, 59 at 1, 2, 4, 8 threads, 3 rounds: 48 of 48 the same. (Another per-worker lazy type left
+as is: `global_this_t`, compared by structure only.)
 
 What's left, by size:
 - each checker types the lib and the shared declarations again: forked shards (a 1,130-file
