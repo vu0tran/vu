@@ -1729,6 +1729,28 @@ Then (the same gate):
   three hosts of 60-150 MB each no longer stay through the type-aware part (idx 86: 10.4 -> 10.0-10.3
   GB at its peak; main itself stayed at 0.28 GB). VLINT_KEEP=1: neither.
 
+- Tried and dropped: read-ahead on pthreads of their own where the shards will be forked (Vu's
+  tasks start the runtime's threads for good, so a forking process read its files on one thread).
+  It took the 2,710-file program's first pass from 1.54-1.62 to 0.61-0.63 s, but since cf687b9b
+  such programs are checked on threads, where run_libs' prefetch tasks already read ahead (that
+  pass 0.61-0.71 s with them, 0.84-0.92 without; the pthreads in their place 0.69-0.78), and only
+  VTSC_THREADS_MIN_FILES > 0 or VTSC_THREADS_AUTO=0 forks now.
+
+The cold job, the three alternated twice (`jobm.sh` with jobp.py; load 23-29 on 10 cores from
+other work, so every number is high; the earlier 61 / 79 s were at a load of 14-27):
+| build | wall | cpu-s | peak RSS | peak phys_footprint |
+|---|---|---|---|---|
+| before (b4d9cb10) | 96.5, 86.7 | 449, 433 | 10.4, 10.6 GB | 10.5, 10.6 GB |
+| oxlint 1.79 | 110.3, 103.7 | 556, 516 | 9.7, 9.0 GB | 10.8, 10.9 GB |
+| after (eaac7364) | 71.1, 63.6 | 428, 428 | 10.1, 10.0 GB | 10.3, 10.3 GB |
+Every vlint output identical to j_base in all four runs.
+
+What's left before the check: the JS host's first answer (node's start, the host, the local plugin;
+about 0.1 s) is what the smallest 25 or so invocations wait for, their type-aware part done in
+0.07; the walk of the 14,449-file package (0.24 s, gitignore matching per entry) and its tsconfig's
+include matching (0.14) before its plan; the worker's result as 13 MB of JSON (0.07 s to read
+back); each compile of the host's rule schemas by ajv at load (not tried).
+
 The peak: `jobp.py` (job.py with the tree's RSS and phys_footprint per sample, mem.txt) puts it at
 idx 86, the last invocation, alone: its worker (1.09 GB parsed and bound when it forks) and 8 shards
 of 0.4 GB right after the fork growing to 1.1 GB each. phys_footprint counts the pages the shards
