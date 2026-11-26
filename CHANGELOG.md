@@ -3350,3 +3350,21 @@ across a write; a write reached through an outer `.value`) found only mistakes i
 expected sum, and a test that raced its own tasks' drops); round 2 (807: a list swapped out of
 `.unique`, Shared values in a list written through `.unique`, a map entry replaced; ASan, UBSan and
 the C audit clean) found nothing.
+
+**Smaller maps and SharedMaps (2026-11-26).** A type checker of 14,000 files (vlint's, on a large
+monorepo) kept some 15 M entries in maps with Int keys and 3.7 M in SharedMaps, about a third of
+its memory. A map with Int (or Byte, Bool) keys no longer keeps each entry's hash (an Int key's is
+two multiplications, done again when the index is rebuilt): an entry of `{Int: Int}` is 24 bytes,
+was 32. Every map's index holds 32-bit entry numbers, was 64 (past 4 G entries a map stops the
+program, as out of memory). A SharedMap slot is 24 bytes, was 32 (a Str key is one pointer to its
+length and bytes), and a shard grows once three quarters full, was half (each grown shard keeps its
+old arrays for readers still probing them, so a SharedMap took 160 bytes or more an entry).
+Measured on that checker, one program on one thread, the same output: malloc's bytes in use at the
+end 2,157 -> 1,549 MB, peak RSS 3.43 -> 2.81 GB, instructions 88.2 -> 87.8 G; the invocation as CI
+runs it (8 threads, its process tree) peaked at 6.5 GB, now 5.3. Attack round 1 (targeted 808: Int
+keys at both ends of the range, removals, index rebuilds, Bool and Byte keys; 809: Str keys from 4
+tasks at once, empty and 5,000-byte keys and prefixes; ASan, UBSan, the C audit, and ThreadSanitizer
+three runs of 809 and one of 788) found nothing. The full gate can't pass on macOS (its sanitizer
+leak checks, static linking, /proc and Python's Unicode version are Linux's); there, the suites that
+don't need those passed (targeted 802 of 802, the fixed point), and the selfhost case that failed
+(a 20,000-term expression) crashes Apple's clang with the old compiler too. Not run on Linux.

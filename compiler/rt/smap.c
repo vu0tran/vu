@@ -6,15 +6,19 @@
    Reads take no lock: the table is split into shards by the key's hash, each an open-addressed array of
    slots; a writer holds its shard's spin lock, writes a slot's key and value, then its hash word with a
    release store, and a reader that sees the hash word (acquire) sees the key and value. A shard that
-   fills past half is copied into one twice the size, published by pointer; the old array stays (until
-   the last handle goes), so a reader still probing it never reads freed memory: it may just miss what
-   was added since, as any read racing an add may. */
+   fills past three quarters is copied into one twice the size, published by pointer; the old array stays
+   (until the last handle goes), so a reader still probing it never reads freed memory: it may just miss
+   what was added since, as any read racing an add may. A slot is 24 bytes: a Str key is kept as a pointer
+   to its length and bytes (it was 32, with the bytes' pointer beside the length, and filled only to half:
+   a checker's caches of 3.7 M entries took 608 MB). */
 #include <sched.h>
 #define VU_SM_SHARDS 64
-typedef struct { uint64_t h; int64_t k; int64_t v; char *s; } vu_sm_slot;   /* h: 0 empty, else the hash | top bit; s: a Str key's bytes (k its length) */
+typedef struct { uint64_t h; int64_t k; int64_t v; } vu_sm_slot;   /* h: 0 empty, else the hash | top bit; k: the key (a Str key: a pointer to its length, then its bytes) */
+static inline int64_t vu_sm_slen(int64_t k) { int64_t n; memcpy(&n, (const void *)(intptr_t)k, 8); return n; }
+static inline const uint8_t *vu_sm_sbytes(int64_t k) { return (const uint8_t *)(intptr_t)k + 8; }
 typedef struct vu_sm_tab { int64_t cap; struct vu_sm_tab *old; vu_sm_slot sl[]; } vu_sm_tab;
 typedef struct { vu_sm_tab *t; int64_t n; int lk; char pad[64 - sizeof(void *) - sizeof(int64_t) - sizeof(int)]; } vu_sm_shard;
-typedef struct vu_smap { int64_t refs; vu_sm_shard sh[VU_SM_SHARDS]; } vu_smap;
+typedef struct vu_smap { int64_t refs; int strk; vu_sm_shard sh[VU_SM_SHARDS]; } vu_smap;   /* strk: it has Str keys (their copies freed with it) */
 
 static vu_smap *vu_smap_new(void) {
     vu_smap *m = (vu_smap *)calloc(1, sizeof *m);
@@ -31,9 +35,9 @@ static void vu_smap_release(vu_smap **p) {
     for (int i = 0; i < VU_SM_SHARDS; i++) {
         vu_sm_tab *t = m->sh[i].t;
         /* (the keys' bytes are shared by a shard's arrays: freed once, from the newest) */
-        if (t)
+        if (t && __atomic_load_n(&m->strk, __ATOMIC_RELAXED))
             for (int64_t j = 0; j < t->cap; j++)
-                if (t->sl[j].h) free(t->sl[j].s);
+                if (t->sl[j].h) free((void *)(intptr_t)t->sl[j].k);
         while (t) { vu_sm_tab *o = t->old; free(t); t = o; }
     }
     free(m);
@@ -55,13 +59,15 @@ static inline int64_t vu_sm_find(const vu_sm_tab *t, uint64_t mk, int64_t k, con
     for (uint64_t i = mk & mask;; i = (i + 1) & mask) {
         uint64_t h = __atomic_load_n(&t->sl[i].h, __ATOMIC_ACQUIRE);
         if (h == 0) return -1;
-        if (h == mk && t->sl[i].k == k && (!s || k == 0 || memcmp(t->sl[i].s, s, (size_t)k) == 0)) return (int64_t)i;
+        if (h != mk) continue;
+        if (!s) { if (t->sl[i].k == k) return (int64_t)i; }
+        else if (vu_sm_slen(t->sl[i].k) == k && (k == 0 || memcmp(vu_sm_sbytes(t->sl[i].k), s, (size_t)k) == 0)) return (int64_t)i;
     }
 }
 /* With the shard's lock held: room for one more entry */
 static void vu_sm_room(vu_sm_shard *sh) {
     vu_sm_tab *t = sh->t;
-    if (t && (sh->n + 1) * 2 <= t->cap) return;
+    if (t && (sh->n + 1) * 4 <= t->cap * 3) return;
     int64_t cap = t ? t->cap * 2 : 16;
     vu_sm_tab *nt = (vu_sm_tab *)calloc(1, sizeof *nt + (size_t)cap * sizeof(vu_sm_slot));
     if (!nt) vu_oom();
@@ -90,14 +96,15 @@ static int64_t vu_sm_add(vu_smap *m, uint64_t h, int64_t k, const uint8_t *s, in
     uint64_t mask = (uint64_t)t->cap - 1;
     uint64_t i = mk & mask;
     while (t->sl[i].h) i = (i + 1) & mask;
-    t->sl[i].k = k;
-    t->sl[i].v = v;
     if (s) {
-        char *c = (char *)malloc((size_t)k + 1);
+        uint8_t *c = (uint8_t *)malloc((size_t)k + 8);
         if (!c) vu_oom();
-        if (k) memcpy(c, s, (size_t)k);
-        t->sl[i].s = c;
-    }
+        memcpy(c, &k, 8);
+        if (k) memcpy(c + 8, s, (size_t)k);
+        t->sl[i].k = (int64_t)(intptr_t)c;
+        __atomic_store_n(&m->strk, 1, __ATOMIC_RELAXED);
+    } else t->sl[i].k = k;
+    t->sl[i].v = v;
     __atomic_store_n(&t->sl[i].h, mk, __ATOMIC_RELEASE);
     __atomic_store_n(&sh->n, sh->n + 1, __ATOMIC_RELAXED);
     vu_sm_unlock(&sh->lk);
