@@ -534,6 +534,140 @@ fn build_conf(o: lout.Opts, m: lmeta.Meta, rc: lconf.Rc, a: Args, root: Bool) ->
     exit(1)
   return c
 
+# ---- the type-aware run's inputs before the JS plugins are loaded
+
+# The root or a nested configuration as load_conf reads and builds it, but with the JS plugins not
+# loaded and their rules skipped (m.x_lenient), and nothing printed: nrules -1 on any error. js:
+# whether it names a JS plugin.
+type SpecC:
+  c: lconf.Conf
+  js: Bool
+
+fn bad_conf(m: lmeta.Meta) -> lconf.Conf:
+  var err: [Str] = []
+  var bad = lconf.build(m, lconf.empty_rc(), [], 0, 0, &err)
+  bad.nrules = -1
+  return bad
+
+fn spec_conf(fs: Fs, m: lmeta.Meta, path: Str, a: Args, root: Bool) -> SpecC:
+  var err: [Str] = []
+  let bad = bad_conf(m)
+  var rc = lconf.empty_rc()
+  if path != "":
+    if path.endswith(".ts") or path.endswith(".mts") or path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs") or path.endswith(".cts"): return SpecC(bad, false)
+    let e = lconf.read_file(fs, path, &rc)
+    if e != "": return SpecC(bad, false)
+    var stack = [path + ""]
+    rc = lconf.resolve_extends(fs, m, rc, &stack, &err)
+    if err.len > 0: return SpecC(bad, false)
+  var on = a.plugin_on
+  var off = a.plugin_off
+  if not root:
+    on = 0
+    off = 0
+  let js = rc.js_plugins.len > 0
+  let c = lconf.build(m, rc, a.filters, on, off, &err)
+  if err.len > 0: return SpecC(bad, js)
+  return SpecC(c, js)
+
+# The type-aware run's inputs (ta_work) as main will find them, computed before the configuration's
+# JS plugins are loaded, so that the programs' checks start that much sooner: the first answer of
+# the plugin host (node starting, the host, the plugin imported) took about 0.15 s of each of the
+# CI job's invocations, all of it before the type-aware plan began, and the type-aware part is the
+# critical path of most. Only the native rules' severities and options make a file's type-aware
+# rules (ltyped.ruleset), so the JS plugins' rules are skipped; main compares these inputs with its
+# own (same_ta) and starts the run again when they differ. Files empty: nothing started (no JS
+# plugin, so nothing to gain; an error, which main reports; not type-aware; VLINT_TA_EARLY=0).
+fn spec_ta(fs: Fs, os: Os, ffi: Ffi, a: Args, o: lout.Opts, root_path: Str, files: [Str]) -> Work:
+  let none = Work([], [], [], [], [], rules.Cx(o, lmeta.Meta([], [], [], [], [], [], [], [], [], [], {}, {}, [], {}, {}), 1, lmod.new_graph(), false, ffi))
+  if a.type_check_only or a.rules or a.debug_files or a.print_config or os.env("VLINT_TYPE_AWARE") == "0" or os.env("VLINT_TA_EARLY") == "0": return none
+  var m = lmeta.load()
+  m.x_lenient = true
+  var r0 = spec_conf(fs, m, root_path, a, true)
+  if r0.c.nrules < 0: return none
+  var anyjs = r0.js
+  if not (a.type_aware or r0.c.type_aware == 1): return none
+  var c0 = bad_conf(m)
+  swap(&c0, &r0.c)
+  var confs: [lconf.Conf] = []
+  confs.push(c0)
+  var file_conf: [Int] = []
+  if a.nested and a.config == "":
+    var seen: {Str: Int} = {}
+    var cdir: [Str] = [""]
+    for f in files:
+      var d = lconf.dir_of(f)
+      var chain: [Str] = []
+      var found = 0
+      while d != "":
+        if d in seen:
+          found = seen[d]
+          break
+        chain.push(d + "")
+        let c = config_in(fs, d)
+        if c.startswith("!"): return none
+        if c != "" and c != root_path:
+          found = confs.len
+          cdir.push(d + "")
+          var rn = spec_conf(fs, m, c, a, false)
+          if rn.c.nrules < 0: return none
+          if rn.js: anyjs = true
+          var cn = bad_conf(m)
+          swap(&cn, &rn.c)
+          confs.push(cn)
+          seen[d] = found
+          break
+        if c != "" and c == root_path:
+          found = 0
+          break
+        d = parent_dir(d)
+      for x in chain: seen[x] = found
+      file_conf.push(found)
+  else:
+    for f in files: file_conf.push(0)
+  if not anyjs: return none
+  var kept: [Str] = []
+  var kept_conf: [Int] = []
+  for i in 0..files.len:
+    let cc = confs[file_conf[i]]
+    var ign = false
+    if cc.ignore.len > 0:
+      var g = lglob.gi_new(cc.dir)
+      for p in cc.ignore: lglob.gi_add(&g, p)
+      ign = lglob.gi_ignores(g, files[i], false)
+    if not ign:
+      kept.push(files[i] + "")
+      kept_conf.push(file_conf[i])
+  var sevs: [[Int]] = []
+  var optss: [[Str]] = []
+  var sev_at: {Str: Int} = {}
+  var sev_of: [Int] = []
+  for i in 0..kept.len:
+    let c = kept_conf[i]
+    let cc = confs[c]
+    var rel = kept[i]
+    if cc.dir != "" and kept[i].startswith(cc.dir + "/"): rel = kept[i][cc.dir.len + 1..kept[i].len]
+    var key = "{c}:"
+    for k in 0..cc.overrides.len:
+      let ov = cc.overrides[k]
+      if lglob.globset_match(ov.files, rel) and not lglob.globset_match(ov.exclude, rel): key += "{k},"
+    if not (key in sev_at):
+      sev_at[key] = sevs.len
+      sevs.push(lconf.resolve(m, cc, rel))
+      optss.push(lconf.resolve_opts(m, cc, rel))
+    sev_of.push(sev_at[key])
+  # (the shown paths aren't part of the inputs: type_aware_run takes main's)
+  return ta_work(kept, [], sevs, optss, sev_of, o, ffi)
+
+# Whether two type-aware runs' inputs are the same files with the same rules.
+fn same_ta(x: Work, y: Work) -> Bool:
+  let a = ta_in(x)
+  let b = ta_in(y)
+  if a.files.len != b.files.len: return false
+  for i in 0..a.files.len:
+    if a.files[i] != b.files[i] or a.sets[i] != b.sets[i]: return false
+  return true
+
 # ---- linting
 
 type Work:
@@ -1525,6 +1659,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   # (the caches' key for this build, from the executable's bytes, for this process and its workers:
   # a CI job that installs vlint afresh each run gets a new file, its times and inode new too)
   if os.env("VLINT_BUILD_ID") == "": lcache.setenv(ffi, "VLINT_BUILD_ID", lcache.exe_hash(fs, ffi))
+  if os.env("VLINT_T") != "": eprint("vlint T@ build id {os.clock()}")
   # (--threads is the plain lint's, as oxlint's is; the type-aware part, like tsgolint, uses the
   # CPUs this process may use (VLINT_CPUS: that many). Bounding it by --threads too was measured
   # on the CI job's pattern, two packages at a time with --threads=4, on 10 cores: 76.8 s against
@@ -1572,6 +1707,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
       k -= 1
     if r != cwd and ignored(w2, r, true): continue
     walk(fs, ffi, r, &w2, &files)
+  if os.env("VLINT_T") != "": eprint("vlint T@ walked {os.clock()}")
   # (paths that overlap, `seller-flow .`, name a file more than once: oxlint lints it once)
   if roots.len > 1:
     var seenf: {Str: Bool} = {}
@@ -1605,7 +1741,14 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
     if root_path != "": let _ = lconf.read_file(fs, root_path, &own)
     write(lprint.print_config(m, prc, pc, lconf.strip_comments(raw), own) + "\n")
     return
+  # (the type-aware run started before the JS plugins load: spec_ta)
+  let spec = spec_ta(fs, os, ffi, a, o, root_path, files)
+  let spch: Chan[lvtsc.Plan] = chan(1)
+  var spec_on = false
+  if spec.files.len > 0: spec_on = ta_start(fs, os, ffi, spec, false, spch)
+  if os.env("VLINT_T") != "": eprint("vlint T@ early type-aware {spec_on} {os.clock()}")
   var cf = Cfgs([""], [load_conf(fs, &jx, o, &m, root_path, a, true)])
+  if os.env("VLINT_T") != "": eprint("vlint T@ config {os.clock()}")
   let root_dir = cf.confs[0].dir + ""
   # --rules: the rules and which the configuration turns on (the default format's table, or JSON)
   if a.rules:
@@ -1689,6 +1832,7 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
       write("Failed to setup JS plugin options:\n{se}\n")
       exit(1)
     ljs.expect(ffi, kept.len)
+  if os.env("VLINT_T") != "": eprint("vlint T@ js setup {os.clock()}")
   if kept.len == 0:
     if not a.no_error_unmatched: write("No files found to lint. Please check your paths and ignore patterns.\n")
     finish_info(o, os.clock() - t0, 0, nrules, threads, false, "")
@@ -1771,8 +1915,16 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   # (the type-aware part reads its own copy of the files and rules)
   var work_ta = Work([], [], [], [], [], rules.Cx(o, lmeta.Meta([], [], [], [], [], [], [], [], [], [], {}, {}, [], {}, {}), 1, lmod.new_graph(), false, ffi))
   if type_aware: work_ta = ta_work(kept, shown, sevs, optss, sev_of, o, ffi)
-  let pch: Chan[lvtsc.Plan] = chan(1)
-  if type_aware: let _ = ta_start(fs, os, ffi, work_ta, type_check, pch)
+  if os.env("VLINT_T") != "": eprint("vlint T@ ta work {os.clock()}")
+  var pch: Chan[lvtsc.Plan] = chan(1)
+  if type_aware:
+    if spec_on and same_ta(spec, work_ta): pch = spch.share()
+    else:
+      # (begun with other inputs: that run finished and dropped first, so the two don't overlap)
+      if spec_on:
+        if os.env("VLINT_T") != "": eprint("vlint T@ early type-aware run dropped {os.clock()}")
+        let _p = spch.recv() else lvtsc.Plan({}, {}, {}, {})
+      let _ = ta_start(fs, os, ffi, work_ta, type_check, pch)
   let nfiles = kept.len
   var fixmask = 0
   if a.fix: fixmask = fixmask | 1
