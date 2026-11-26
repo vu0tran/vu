@@ -2598,6 +2598,43 @@ lib's instantiations with the program's types (9.3% of the checks) and the packa
 (9% of the instructions to read and bind, 25% of the checks to type and instantiate) are where the
 time is, and neither is the same from one invocation to the next.
 
+### vtest's two FAIL sets: where it ran, not what was built (fixed 2026-11-26)
+
+Gates from m21 on saw one of two FAIL sets, each stable, and compared against a baseline that
+was the other one at times: `esm-default-import-cjs, packages, this-function-expression` from
+ts/ copied into the session's scratch (gatecopy.sh, under /private/tmp), `globals, narrowing,
+packages` from a worktree under the home folder. The same vtsc (e8b5bd25) gives each set every
+time in its place (two runs each, byte-identical), and run hermetically (below) eedbf4d6's vtsc
+passes every case as the tip's does: no regression, no flakiness (the cases are far below the threads' 3,000 files), the
+lib unchanged (`~/.cache/vlint-parity/tslib` hashes to ltslib.vu's b82676463eea69ca, files
+dated 2026-11-21). The causes, by case:
+- globals, narrowing, packages' ambient.ts: given files (no use-project), vtsc takes every @types
+  package from the current folder up, as tsc does, so a checkout under the home folder also
+  loads `~/node_modules/@types/node` (an unrelated project's): `Process`, `Timeout`, `Buffer` in
+  the messages. Their expected.txt is tsc with the folder's tsconfig (its `types`): what vtsc
+  gives when nothing above the folder has a node_modules.
+- this-function-expression: the other way round. Its expected.txt was made under the home folder,
+  with that @types/node's `require`; elsewhere it's TS2591. Now a.ts declares `require` itself
+  (on a last line, so no line moves), what the case is about (`require("mocha")` is any).
+- esm-default-import-cjs: its message prints the package file's absolute path
+  (`typeof import("...")`); in the scratch copy the type passes 160 characters, where tsc
+  starts eliding and vtsc says "not checked" instead (show.finish). Depends on the path's length.
+- packages' main.ts (both places): `@sc/pkg`'s `dist/index.d.ts` was never committed: the
+  repository's `dist/` ignore (packaging's output) skipped it when the case was added
+  (fdfb5a68); it existed only in that checkout. Recreated (`make(): { id: number }`, which tsc
+  5.9 checks to the expected lines) and `.gitignore` re-includes `ts/vtests/**/dist/`.
+
+vtest.sh now: copies each case to a fresh folder under /tmp and checks it there (refusing a
+node_modules in any folder above), with LC_ALL=C (the case list and each case's file order),
+the VTSC_* variables unset but VTSC_LIB (VTEST_ENV=keep keeps them), and VTSC_LIB required and
+checked against ltslib.vu's TSLIB_HASH (exit 2 otherwise; before, a missing VTSC_LIB failed all
+815 cases one by one). It ends with `vtest: N ok, M FAIL`. Every case passes (815/815, the same
+from the worktree, from a copy under a 200-character path with VTSC_NO_PACKAGES=1 and
+LC_ALL=en_US.UTF-8 set, and for eedbf4d6's vtsc), so the gate is the exit status: 0, with no
+baseline file to go stale. The way to run it:
+
+    VTSC_LIB=$XDG_CACHE_HOME/vlint/tslib-b82676463eea69ca ./vtest.sh VTSC   # or any copy of the lib with that hash
+
 ## Keeping the caches in CI
 
 What a CI job can keep between runs is one folder: `$XDG_CACHE_HOME/vlint` (`~/.cache/vlint`
@@ -2639,7 +2676,9 @@ The run that fills an empty cache: 78.8-81.6 s.
 
 ## Checks before committing
 
-- vtsc: `VTSC_LIB=.../typescript/lib ./vtest.sh NEW_BUILD` (the cases in `vtests/`); a slow run:
+- vtsc: `VTSC_LIB=LIBDIR ./vtest.sh NEW_BUILD` (the cases in `vtests/`, copied to /tmp and checked
+  there; LIBDIR the lib vlint carries, e.g. `~/.cache/vlint/tslib-b82676463eea69ca`): it must exit 0,
+  every case ok (below, "vtest's two FAIL sets"); a slow run, with `VTEST_ENV=keep`:
   `VTSC_FILE_TIME=1` prints each file's check time (2: also before each), `VTSC_DEBUG=1` each
   generic call's inferences. Against tsc on a real project: the session's scratch `cmpts.py DIR`
   (vtsc and tsc 6 with the folder's tsconfig; the errors only one reports, in the files vtsc
