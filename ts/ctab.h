@@ -178,6 +178,7 @@ static inline int64_t ct_acq(void *h, int64_t i) {
 // The row object o's members are in (types.orow): res is ho_resolved (0 not filled, 1 its own row,
 // r >= 2 the row r - 2 a fill published), mine the worker's own column of the objects it is filling
 // (the row + 1). o is a row its group gave.
+static inline int64_t ct_get0(void *h, int64_t i);   // (below; a program that doesn't declare it, ctab_stress.vu, needs it here)
 static inline int64_t ct_orow(void *res, void *mine, int64_t o) {
   int64_t r = __atomic_load_n(&((const int64_t *)res)[o], __ATOMIC_ACQUIRE);
   if (__builtin_expect(r == 1, 1)) return o;
