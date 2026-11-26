@@ -761,6 +761,33 @@ static inline int64_t ct_maxrss(void) {
   return (int64_t)r.ru_maxrss >> 10;
 #endif
 }
+// (VTSC_LIBM) instructions and cycles retired so far (0 where unknown), and a
+// monotonic clock in nanoseconds
+#ifdef __APPLE__
+#include <libproc.h>
+#include <unistd.h>
+// (which 0, 1: this thread's instructions and cycles, from the kernel's per-thread counters, as
+// Instruments reads them; 2, 3: the process's)
+extern int thread_selfcounts(int type, void *buf, size_t nbytes);
+static inline int64_t ct_ins(int64_t which) {
+  if (which < 2) {
+    uint64_t b[2] = {0, 0};
+    if (thread_selfcounts(1, b, sizeof b) != 0) return 0;
+    return (int64_t)b[which];
+  }
+  struct rusage_info_v4 ri;
+  if (proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ri) != 0) return 0;
+  return which == 2 ? (int64_t)ri.ri_instructions : (int64_t)ri.ri_cycles;
+}
+static inline int64_t ct_now_ns(void) { return (int64_t)clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+#else
+static inline int64_t ct_ins(int64_t which) { (void)which; return 0; }
+static inline int64_t ct_now_ns(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+}
+#endif
 static inline void ph_free(void *p) {
   ph_t *h = p;
   free(h->head);
