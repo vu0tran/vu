@@ -539,7 +539,9 @@ static inline void ckl_del(void *p, int64_t k) {
 // tasks adding one key make one entry. The names in insertion order are a list column beside it
 // (types.add_prop).
 #define PH_BUCKETS ((int64_t)1 << 20)
-typedef struct { int64_t *head; int64_t *pool; } ph_t;
+// (bloom: per object, a word with a bit for each of its names' hashes, set before the entry is linked:
+// a name whose bit is clear is none of the object's, found without walking a chain)
+typedef struct { int64_t *head; int64_t *pool; int64_t *bloom; } ph_t;
 static inline void *ph_new(void *st) {
   ph_t *h = malloc(sizeof *h);
   if (!h) vu_panic(0, "ph_new: out of memory", 21);
@@ -547,19 +549,24 @@ static inline void *ph_new(void *st) {
   if (!h->head) vu_panic(0, "ph_new: out of memory", 21);
   h->pool = ct_mk();
   h->pool[-1] = 3;  // (offset 0 is "none")
+  h->bloom = ct_mk();
   cs_add(st, h, 2);
   return h;
 }
+// the entries in the table (VTSC_PHASES)
+static inline int64_t ph_count(void *p) { return (((ph_t *)p)->pool[-1] - 3) / 3; }
 static inline void ph_free(void *p) {
   ph_t *h = p;
   free(h->head);
   ct_free(h->pool);
+  ct_free(h->bloom);
   free(h);
 }
 static inline uint64_t ph_hash(int64_t k) {
   uint64_t x = (uint64_t)k * 0x9E3779B97F4A7C15ull;
   return x ^ (x >> 31);
 }
+static inline int64_t ph_bit(int64_t name) { return (int64_t)1 << (((uint64_t)name * 0x9E3779B97F4A7C15ull) >> 58); }
 // the entry of key k in the chain from e to stop (0: its end), 0 none
 static inline int64_t ph_walk(const int64_t *p, int64_t e, int64_t stop, int64_t k) {
   for (; e != stop; e = p[e])
@@ -569,6 +576,7 @@ static inline int64_t ph_walk(const int64_t *p, int64_t e, int64_t stop, int64_t
 // the symbol of o's property name, -1 none
 static inline int64_t ph_get(void *p, int64_t o, int64_t name) {
   const ph_t *h = p;
+  if ((uint64_t)o < (uint64_t)CT_MAX && (__atomic_load_n(&h->bloom[o], __ATOMIC_ACQUIRE) & ph_bit(name)) == 0) return -1;
   int64_t k = o << 32 | name;
   int64_t e = __atomic_load_n(&h->head[ph_hash(k) & (PH_BUCKETS - 1)], __ATOMIC_ACQUIRE);
   e = ph_walk(h->pool, e, 0, k);
@@ -587,6 +595,7 @@ static inline bool ph_put(void *p, int64_t o, int64_t name, int64_t sym) {
     __atomic_store_n(&pool[w + 2], sym, __ATOMIC_RELAXED);
     return false;
   }
+  if ((uint64_t)o < (uint64_t)CT_MAX) __atomic_fetch_or(&h->bloom[o], ph_bit(name), __ATOMIC_RELEASE);
   int64_t ne = __atomic_fetch_add(&pool[-1], 3, __ATOMIC_RELAXED);
   if (ne + 3 > CT_MAX) vu_panic(0, "ph_put: the table is full", 25);
   pool[ne + 1] = k;
