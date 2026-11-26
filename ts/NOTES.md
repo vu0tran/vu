@@ -2087,6 +2087,90 @@ two lanes, and idx 86 (type-aware, 5 s) starts at about 39.3 s and runs last, al
 39.3 + 4.9. Cutting cpu shows little because the job isn't saturated: 335 cpu-s in 44 s is 7.6 of 10
 cores, with other work on the machine.
 
+### The checker's threads and its hot paths on the CI job's pattern (measured 2026-11-26, later still)
+
+How it was measured (the session's scratch `m28/`): `sall2.sh` the 88 serial type-aware runs under
+/usr/bin/sample, folded by `fold2.py`, which names `<deduplicated_symbol>` frames by their address (the
+linker folds identical functions: most of those frames were `types.has_int` and the list pushes);
+`thr.sh` one invocation's check on N threads; VTSC_PHASES=2's `TWORK` lines (each checking thread's
+checks, its wait at the barrier and its rules); `allph.sh` + `crit.py` each invocation alone, bound by
+its type-aware check or by its linting; `sim.py` the two-lane schedule from a job's walls. Load 4-15
+on 10 cores (an M1 Max: 8 performance cores, 2 efficiency) from other work throughout.
+
+What landed (each: probes 135/135 and shuffled 1 and 2, vtests as m25's vt_base, the job's 176
+outputs as j_base, `dgate.sh` idx 31/52/86/59 at 1/2/4/8 threads 16 of 16, the two threaded vtests 50
+of 50 each at 8 threads):
+- Quadratic searches made linear (855b6c89): `has_int` over a growing list in `mprop_names` and
+  `ctx_discriminate` (the property names of a union's members), and `mapped_of1`'s keys, which also
+  made `types.members(cons)` again for every name. `types.push_new` searches while short, then a
+  set; `types.mem_set`/`mem_has` a union's members as a set once it has more than 16. has_int was
+  7.8% of idx 76's serial samples. Serial instructions idx 59 / 86 / 52 / 31 129.0 / 80.8 / 47.7 /
+  45.8 -> 126.5 / 80.2 / 47.7 / 37.4 G; 76 34.9 -> 29.1, 16 16.4 -> 14.4, 25 7.55 -> 6.15, 14 38.6 ->
+  37.9.
+- The threads' contention (14a1bdc3). ctab.h's `ct_slack_n` and `ct_wk` were `static`: a split build
+  (vu build's parts, each including the extern headers) gave every part its own. The part that calls
+  ct_slack isn't the one whose ct_cover reads it, so the slack was 0 everywhere it mattered (nm shows no
+  `ct_slack_n` at all: the stores were dead and dropped), every new row raised each column's length
+  with a compare-and-swap on the line every bounds check reads, and VTSC_CT_SLACK did nothing either.
+  `ct_wk` the same: a claim's wait couldn't follow the chain of workers waiting for each other, so a
+  cycle would have waited 10 s. Both are `VU_G` now (one for the program). With the slack working,
+  rows are also taken 64 at a time per worker (`cg_rowk`, a chunk in a cache line of the group's per
+  worker), so threads don't write one another's lines of every column. In the samples of idx 86's
+  8-thread check, new_obj, new_sym and mk were 6,150 of 23,271 busy samples (215 / 130 / 60 serially:
+  11-23 times as many for 1.5 times the rows); after, none in the top 25. idx 86's check on 8 threads
+  (thr.sh) 3.96-4.01 s and 29.2 cpu-s -> 2.46-2.74 s and 18.4-18.9 (the slack alone 2.80-2.96 s, 20.6-21.0
+  cpu-s); idx 59 on 8 threads 4.47 s, 35.7 cpu-s -> 3.12 s, 25.0. Serial runs don't reach it (the slack
+  is 0 there).
+- Per checker (a3736861): a contextual union's optional discriminants (`ctx_optd`, ctx_opt_discs: the
+  same for every literal that union types) and an object's keyof (`keyof_memo`, as tsc's
+  resolvedIndexType; kept only when the object's fill is done, so not a recursive type's partial
+  members). Serial instructions idx 31 37.7 -> 29.7 G, 76 29.3 -> 26.8, 16 14.6 -> 13.6, 25 6.20 ->
+  5.51, 14 38.6 -> 38.2; 59 / 86 / 52 within 0.5%.
+
+Thread scaling of idx 86's check after (thr.sh, check s / cpu-s / G instructions): 1 thread 10.9 /
+12.9 / 81.1; 2 6.18 / 13.7 / 85.0; 4 3.64 / 15.7 / 90.1; 8 2.52 / 18.5 / 95.9 (before, 8 threads
+3.96 / 29.5 / 99.2: the cpu per instruction on 8 threads was 2.2 times one thread's). Where the
+threads wait (TWORK, idx 86 on 8): checks 1.77-1.94 s each, 0.16 s at the barrier for the 7 that
+finish first, rules 0.39-0.57 s (balanced enough: the rules after the barrier already run on all the
+threads, each its own files). What's left of contention in the 8-thread samples: sched_yield 5% of
+the busy samples, nearly all in the runtime's SharedMap adds (a shard's spin lock, held while a
+shard doubles; smap.c, 64 shards) from the instantiation and conditional caches; claims (ct_claim)
+almost none. Making the shards' adds cheaper is a runtime change (the whole Vu gate): not done.
+
+Not kept:
+- The rules run on each thread as soon as its file is checked (with what's published for its nodes,
+  and run again after the barrier for a file whose nodes got more published types or that was
+  marked unchecked since, compared by a bit per node): no file needed it again on idx 86, 59, 52,
+  31, 25, 16 (a scratch build's count: the published types of a file's nodes it lacks never grew after its
+  check ended), but measured before the contention fix the check plus rules was the same (idx 86
+  3.92-4.10 s against 3.86; the barrier's idle 0.18 s became a tail of the last files' checks and
+  rules). Not tried again after.
+- VLINT_VTSC_SMALL_THREADS=6 (now that threads scale better): the job 38.8 and 39.0 s against 4's
+  39.4 and 38.6.
+- The slack at 1023 or 4095 rows instead of 63: idx 86's 8-thread check within the noise.
+- `tsprog` timestamps (VTSC_PHASES, "CONF proj made", "CONF returned") show what idx 86 spends
+  after its check: making the Proj 40 ms, freeing check_conf's results 45 ms, the worker's exit and
+  vlint reading its 12.5 MB of JSON 65 ms, then 90 ms of messages and records. Not changed.
+
+Found, not fixed: `gen_worker.py` no longer reproduces types.vu's worker_checker: it doesn't know
+NodeMap (the NodeMap fields' copies and their code were added by hand between its markers, which a
+run would drop), and the memos added since (dep_memo, dep_reasons, mp_then_memo, mp_void_memo) aren't
+copied into workers (they start empty, which a memo allows). New fields here (ctx_optd, keyof_memo)
+were added to worker_checker and worker_carry by hand.
+
+Where the time goes now (88 invocations alone, `crit.py`): 53 bound by the type-aware check (39.8 s
+of the 69.1 s summed), 35 by the linting (31, 59, 21, 16, 52, 23 the large ones: their JS plugins). In
+the serial samples the files' checks are 46% of busy, the rules 17%, reading 8.5% (opening files:
+`read_fsrc`'s opens 5% of busy, `stat_kind`'s stats 2.4%), parsing 5.3%. The biggest self times in
+the checks: get_prop 4.5%, sty 3.1%, new_mapper 2.5% (compose1, extend, ck_restrict, get_prop's
+OK_REF mapper made again for each member), add_prop 2.1%, the free lists' _tlv_get_addr 4%.
+
+The job, two rounds alternated with oxlint 1.79 and 1b5bfa73 (load 11-15): HEAD 39.1 and 38.7 s,
+285 and 280 cpu-s, 5.0 and 4.8 GB at the peak; 1b5bfa73 45.0 and 44.8 s, 336 and 334 cpu-s; oxlint
+79.1 and 77.6 s, 483 and 483 cpu-s, 9.3 and 8.9 GB. Every vlint run's 176 outputs as j_base. The
+walls summed 85.0 -> 74.5 s; idx 86, the last, 4.97 -> 3.58 s (it starts at 35.4 s instead of
+39.9), 59 9.25 -> 8.13, 29 2.73 -> 1.77, 76 3.12 -> 2.18, 37 2.31 -> 1.68.
+
 ## Keeping the caches in CI
 
 What a CI job can keep between runs is one folder: `$XDG_CACHE_HOME/vlint` (`~/.cache/vlint`
