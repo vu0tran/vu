@@ -180,6 +180,11 @@ static inline void ct_worker(void *mine, int64_t k) {
 static inline void ct_workers_done(void) {
   for (int i = 0; i < CT_NW; i++) __atomic_store_n(&ct_wk[i], NULL, __ATOMIC_SEQ_CST);
 }
+static inline int64_t ct_now_us(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
 static inline int64_t ct_now_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
