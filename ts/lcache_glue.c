@@ -363,6 +363,44 @@ void vl_flags_free(int64_t at, int64_t n) {
 }
 
 // A child's exit status (128 + the signal that stopped it; -1 when it can't be waited for).
+/* A program started with vlint's standard streams and environment, its arguments separated by \x01
+   (os.run without the wait: vl_poll_exit waits). Its pid, or -1. */
+#include <spawn.h>
+extern char **environ;
+int64_t vl_spawn(const vu_str *args) {
+  size_t n = 1;
+  for (int64_t i = 0; i < args->len; i++) if (args->data[i] == 1) n++;
+  char *all = malloc((size_t)args->len + 1);
+  memcpy(all, args->data, (size_t)args->len);
+  all[args->len] = 0;
+  char **argv = calloc(n + 1, sizeof *argv);
+  size_t k = 0;
+  char *p = all;
+  argv[k++] = p;
+  for (; p < all + args->len; p++) if (*p == 1) { *p = 0; argv[k++] = p + 1; }
+  argv[k] = NULL;
+  fflush(stdout);
+  fflush(stderr);
+  pid_t pid;
+  int rc = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
+  free(argv);
+  free(all);
+  return rc == 0 ? (int64_t)pid : -1;
+}
+
+/* pid's exit status as os.run gives it (128 + the signal), -2 while it runs, -1 when it can't be
+   waited for */
+int64_t vl_poll_exit(int64_t pid) {
+  int st = 0;
+  pid_t r;
+  do { r = waitpid((pid_t)pid, &st, WNOHANG); } while (r < 0 && errno == EINTR);
+  if (r == 0) return -2;
+  if (r < 0) return -1;
+  if (WIFEXITED(st)) return (int64_t)WEXITSTATUS(st);
+  if (WIFSIGNALED(st)) return 128 + (int64_t)WTERMSIG(st);
+  return 1;
+}
+
 int64_t vl_wait(int64_t pid) {
   int st = 0;
   pid_t r;
