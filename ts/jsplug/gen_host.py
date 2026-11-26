@@ -228,6 +228,35 @@ STARTUP = [
 ]
 
 
+# Where in the walk each diagnostic is reported, for vlint to put the diagnostics of the JS plugin
+# rules it runs natively among the host's in the host's order (rules.vu js_order): each enter and
+# exit call records its node (__vlAt) and which it is (__vlX: 0 enter, 1 exit), and a diagnostic
+# carries `at`: [node start, node end, __vlX, node type] in the walk, else the phase (0 a rule's
+# create, 2 after the walk). (old, new, how many times old is there; each applied once: --from-lhost
+# finds them made)
+WALK = [
+    ("enter !== null && enter(node)", "enter !== null && (__vlAt = node, __vlX = 0, enter(node))", 139),
+    ("exit !== null && exit(node)", "exit !== null && (__vlAt = node, __vlX = 1, exit(node))", 138),
+    ("visit !== null && visit(node)", "visit !== null && (__vlAt = node, __vlX = 0, visit(node))", 27),
+    ("visit !== null && visit(stepData[i])", "visit !== null && (__vlAt = stepData[i], __vlX = 0, visit(stepData[i]))", 1),
+    ("exit !== null && exit(stepData[i])", "exit !== null && (__vlAt = stepData[i], __vlX = 1, exit(stepData[i]))", 1),
+    ("function report(diagnostic, extraArgs, ruleDetails) {", "let __vlAt = null, __vlX = 0, __vlPh = 0;\nfunction report(diagnostic, extraArgs, ruleDetails) {", 1),
+    ("\t\truleIndex: ruleDetails.ruleIndex,\n", "\t\truleIndex: ruleDetails.ruleIndex,\n\t\tat: __vlAt === null ? __vlPh : [__vlAt.start, __vlAt.end, __vlX, __vlAt.type],\n", 1),
+    ("workspaceUri !== null && switchWorkspace(workspaceUri), setupFileContext(filePath);", "__vlAt = null, __vlPh = 0, workspaceUri !== null && switchWorkspace(workspaceUri), setupFileContext(filePath);", 1),
+    ("resetCompiledVisitor()), runAfterHooks(!0);", "resetCompiledVisitor()), __vlAt = null, __vlPh = 2, runAfterHooks(!0);", 1),
+]
+
+
+def walk_patches(host):
+    for old, new, n in WALK:
+        if new in host:
+            continue
+        if host.count(old) != n:
+            raise SystemExit("walk: %d times, not %d: %s" % (host.count(old), n, old[:60]))
+        host = host.replace(old, new)
+    return host
+
+
 def startup_patches(host):
     for old, new in STARTUP:
         if (new and new in host) or (not new and old not in host):
@@ -319,7 +348,7 @@ def write_snapshot(host, digest):
 
 def write_host(host):
     """writes jsplug/host.mjs and lhost.vu"""
-    host = startup_patches(host)
+    host = walk_patches(startup_patches(host))
     with open(os.path.join(here, "host.mjs"), "w", encoding="utf8") as f:
         f.write(host)
 
