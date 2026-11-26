@@ -3,9 +3,12 @@
 //   {"op":"setup", "json"}                      -> null, or the error message
 //   {"op":"lint", "path", "src", "bom", "jsx", "sourceType", "base", "tree", "rules", "opts",
 //    "settings", "globals"}                      -> null, or lintFile's answer (JSON text)
-import { writeSync as __vlWriteSync } from "node:fs";
-import { Socket as __vlSocket } from "node:net";
-import { isUtf8 as __vlIsUtf8 } from "node:buffer";
+// (the built-in modules taken as they are, not imported: an import makes each one's ES module
+// facade, which reads every export, node:fs's streams among them; about 4 ms of the host's start)
+const __vlBuiltin = (name) => process.getBuiltinModule ? process.getBuiltinModule(name) : import(name);
+const { writeSync: __vlWriteSync } = await __vlBuiltin("node:fs");
+const { Socket: __vlSocket } = await __vlBuiltin("node:net");
+const { isUtf8: __vlIsUtf8 } = await __vlBuiltin("node:buffer");
 
 // (standard output and error are vlint's: Node makes pipes non-blocking, which would make vlint's
 // own writes fail half-way; back to blocking, as oxlint's cli.js does)

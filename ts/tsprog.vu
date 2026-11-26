@@ -780,6 +780,7 @@ type FSrc:
   ok: Bool
   text: Str
   specs: [Str] = []   # its import("x") types' specifiers (import_type_specs), found once too
+  t: ast.Ast = ast.Ast([], [], [], [], [], [], {}, {}, {}, ast.Sev([], [], 0, false, false), 0)   # (a lib file's entry, lib_key) its tree, parsed once for every program
 
 fn read_fsrc(fs: Fs, p: Str) -> FSrc:
   let t = fs.read(p) else return FSrc(false, "")
@@ -799,6 +800,160 @@ fn prefetch(fs: Fs, own fm: Memo[Str, FSrc], own ch: Chan[Str]):
   while true:
     let p = ch.recv() else return
     let _v = fm.get(p, fn(k) => read_fsrc(fs, k))
+
+# A file to parse ahead (run_libs): its index in the program, path, and how it's read.
+type PJob:
+  fi: Int
+  path: Str
+  jsx: Bool
+  json: Bool
+  facts: Bool = false    # a program's file (not a lib file): its FFacts too
+  in_pkg: Bool = false   # a package's file (when queued)
+  lib: Bool = false      # a lib file: parsed once for the run (lib_tree)
+
+# A file parsed ahead on its own tree (ast.append_file adds it to the program's), with its source.
+# ok false: its text read as "" (unread, or empty): run_libs reads and parses it itself.
+type PRes:
+  fi: Int
+  ok: Bool
+  t: ast.Ast
+  ds: [parse.Diag]
+  src: Str
+  fx: FFacts = FFacts()
+  lib: Str = ""          # a lib file's: its tree is fm's, under this lib_key
+
+# What run_libs reads of a file's own tree, found where it's parsed (file_facts), with the tree's own
+# node ids (its first node 1): run_libs adds the nodes before it.
+type FFacts:
+  root: Int = 0          # its statement list (after the JSDoc types, for a program's JavaScript)
+  jw: Str = ""           # jsdoc_attach's answer
+  req: [Str] = []        # require("x") specifiers (.js, .cjs, .jsx; a program's .mjs)
+  cjs: Bool = false      # a CommonJS module (.js, .cjs, .jsx)
+  ce: Int = -1           # cjs_export_expr
+  refs: [[Str]] = []     # tsres.triple_slash
+  imps: [Str] = []       # import, export ... from and import x = require specifiers, in order
+  imp_is: [Bool] = []    # ... each an import statement's
+  ismod: Bool = false    # a module by its statements (moduleDetection force aside)
+  augs: [Str] = []       # declare module "m" names (not global), for a module file
+  in_pkg: Bool = false   # what it was found for
+
+# A file's FFacts from its own tree f (first node 1, root its last node), after the JSDoc types of a
+# program's JavaScript file are set (jsdoc_attach, which adds nodes and a new root).
+fn file_facts(var f: ast.Ast, src: Str, fi: Int, path: Str, in_pkg: Bool, var kw: {Str: Int}) -> FFacts:
+  var fx = FFacts()
+  fx.in_pkg = in_pkg
+  var root = f.nd.len - 1
+  if not in_pkg and (path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs") or path.endswith(".jsx")):
+    fx.jw = jsdoc_attach(&f, src, fi, 1, root, &kw)
+    root = f.nd.len - 1
+  fx.root = root
+  if path.endswith(".js") or path.endswith(".cjs") or path.endswith(".jsx"):
+    var ni = 1
+    while ni < root:
+      let rs = require_spec(f, ni)
+      if rs >= 0:
+        fx.req.push(f.names[f.nd[rs].s] + "")
+        fx.cjs = true
+      if f.nd[ni].k == ast.N_PROPACCESS and f.nd[f.nd[ni].a].k == ast.N_ID and f.names[f.nd[f.nd[ni].a].s] == "module" and f.names[f.nd[ni].s] == "exports": fx.cjs = true
+      if f.nd[ni].k == ast.N_ID and f.names[f.nd[ni].s] == "exports": fx.cjs = true
+      ni += 1
+    if fx.cjs: fx.ce = cjs_export_expr(f, root, 1)
+  if path.endswith(".mjs") and not in_pkg:
+    var nm0 = 1
+    while nm0 < root:
+      let rs = require_spec(f, nm0)
+      if rs >= 0: fx.req.push(f.names[f.nd[rs].s] + "")
+      nm0 += 1
+  fx.refs = tsres.triple_slash(src)
+  var sts: [Int] = []
+  for st in ast.items(f, root):
+    sts.push(st)
+    if f.nd[st].k == ast.N_MODULE and f.nd[st].b >= 0 and f.nd[f.nd[st].a].k == ast.N_STR:
+      for x in ast.items(f, f.nd[st].b): sts.push(x)
+  for st in sts:
+    let k = f.nd[st].k
+    var spec = -1
+    if k == ast.N_IMPORT or k == ast.N_EXPORT: spec = f.nd[st].a
+    if k == ast.N_IMPORTEQ and f.nd[st].a >= 0 and f.nd[f.nd[st].a].k == ast.N_EXTERNALREF: spec = f.nd[f.nd[st].a].a
+    if spec < 0 or f.nd[spec].k != ast.N_STR: continue
+    fx.imps.push(f.names[f.nd[spec].s] + "")
+    fx.imp_is.push(k == ast.N_IMPORT)
+  for st in ast.items(f, root):
+    let k0 = f.nd[st].k
+    if k0 == ast.N_IMPORT or k0 == ast.N_EXPORT or k0 == ast.N_EXPORTDEFAULT or k0 == ast.N_EXPORTASSIGN or k0 == ast.N_IMPORTEQ: fx.ismod = true
+    # (an exported declaration makes a module too, bind.is_module)
+    if k0 == ast.N_VAR and (f.nd[st].d & ast.M_EXPORT) != 0: fx.ismod = true
+    if (k0 == ast.N_FUNC or k0 == ast.N_CLASS or k0 == ast.N_ENUM or k0 == ast.N_MODULE) and (f.nd[st].f & ast.M_EXPORT) != 0: fx.ismod = true
+    if (k0 == ast.N_INTERFACE or k0 == ast.N_TYPEALIAS) and (f.nd[st].d & ast.M_EXPORT) != 0: fx.ismod = true
+  for st in ast.items(f, root):
+    if f.nd[st].k == ast.N_MODULE and f.nd[st].b >= 0 and f.nd[f.nd[st].a].k == ast.N_STR and (f.nd[st].f & ast.MOD_GLOBAL) == 0:
+      fx.augs.push(f.names[f.nd[f.nd[st].a].s] + "")
+  return fx
+
+# The merging task (run_libs): the files' trees, in order, added to t, which it sends back at the end.
+fn pmerge(own t0: ast.Ast, own inq: Chan[PRes], own outq: Chan[ast.Ast], own fm: Memo[Str, FSrc]):
+  var t = t0
+  while true:
+    var r = inq.recv() else break
+    if r.lib != "":
+      let lv = fm.get(r.lib, fn(k) => FSrc(false, ""))
+      ast.append_file(&t, lv.value.t)
+    else: ast.append_file_own(&t, &r.t)
+  outq.send(t)
+
+fn pparse(fs: Fs, own fm: Memo[Str, FSrc], own jobs: Chan[PJob], own res: Chan[PRes]):
+  var kw = scan.keywords()
+  while true:
+    let j = jobs.recv() else return
+    if j.lib:
+      let lk = lib_key(j.fi, j.path)
+      let lv = fm.get(lk, fn(k) => lib_tree(fs, fm, k))
+      var lr = PRes(j.fi, lv.value.ok, ast.blank(), [], "")
+      lr.lib = lk
+      res.send(lr)
+      continue
+    var src = read_shared(fs, fm, j.path)
+    if src == "":
+      res.send(PRes(j.fi, false, ast.blank(), [], ""))
+      continue
+    if j.json: src = "const __json = " + src + ";\nexport = __json;\n"
+    var t = ast.new_ast()
+    let ds = parse.parse_file_x(&t, src + "", j.fi, &kw, false, j.jsx)
+    var fx = FFacts()
+    if j.facts: fx = file_facts(&t, src, j.fi, j.path, j.in_pkg, &kw)
+    res.send(PRes(j.fi, true, t, ds, src, fx))
+
+# The parse of file fi, from the tasks parsing ahead: received (in any order) until fi's is in got.
+fn pp_take(res: Chan[PRes], var got: [PRes], var have: [Bool], base: Int, fi: Int) -> PRes:
+  while have.len <= fi - base or not have[fi - base]:
+    var r = res.recv() else return PRes(fi, false, ast.blank(), [], "")
+    let ix = r.fi - base
+    while have.len <= ix:
+      have.push(false)
+      got.push(PRes(-1, false, ast.blank(), [], ""))
+    have[ix] = true
+    swap(&got[ix], &r)
+  have[fi - base] = false
+  var out = PRes(fi, false, ast.blank(), [], "")
+  swap(&out, &got[fi - base])
+  return out
+
+# A lib file parsed once for all of a run's programs that have it at the same place (fi): its tree in
+# fm under lib_key (its text under its path, as any file's). (A program's libs differ by its target
+# and the libs its files reference; most of a run's have the same.)
+fn lib_key(fi: Int, path: Str) -> Str:
+  return "\0{fi}\0" + path
+
+fn lib_tree(fs: Fs, fm: Memo[Str, FSrc], key: Str) -> FSrc:
+  let at = key.find("\0", 1)
+  let fi = int(key[1..at]) else 0
+  let path = key[at + 1..key.len]
+  let src = read_shared(fs, fm, path)
+  if src == "": return FSrc(false, "")
+  var kw = scan.keywords()
+  var t = ast.new_ast()
+  parse.parse_file(&t, src + "", fi, &kw)
+  return FSrc(true, "", [], t)
 
 fn read_shared(fs: Fs, fm: Memo[Str, FSrc], p: Str) -> Str:
   let v = fm.get(p, fn(k) => read_fsrc(fs, k))
@@ -1110,6 +1265,47 @@ fn graft_check(var prev: Graft, libs: [Str], u1: Int, l1: Int, uf: Int, t: ast.A
   if bad.len == 0: eprint("GRAFT CHECK ok: {t.nd.len - u1} nodes, {srcs.len - uf} files moved by {df} files, {dn} nodes")
   else: eprint("GRAFT CHECK BAD: " + "; ".join(bad))
 
+# VTSC_PPARSE=check: the tree made from files parsed ahead (t) against the one parsed as before
+# (sh): every node, list item, name and side table the same.
+fn pp_check(t: ast.Ast, sh: ast.Ast):
+  var bad: [Str] = []
+  if t.nd.len != sh.nd.len: bad.push("nodes {t.nd.len} vs {sh.nd.len}")
+  if t.L.len != sh.L.len: bad.push("items {t.L.len} vs {sh.L.len}")
+  if t.names.len != sh.names.len: bad.push("names {t.names.len} vs {sh.names.len}")
+  var x = 0
+  while x < t.nd.len and x < sh.nd.len and bad.len < 12:
+    let p = t.nd[x]
+    let q = sh.nd[x]
+    if p.k != q.k or p.pos != q.pos or p.end != q.end or p.a != q.a or p.b != q.b or p.c != q.c or p.d != q.d or p.f != q.f or p.file != q.file or p.s != q.s:
+      bad.push("node {x}: k {p.k}/{q.k} pos {p.pos}/{q.pos} a {p.a}/{q.a} b {p.b}/{q.b} c {p.c}/{q.c} d {p.d}/{q.d} f {p.f}/{q.f} file {p.file}/{q.file} s {p.s}/{q.s}")
+    x += 1
+  var li = 0
+  while li < t.L.len and li < sh.L.len and bad.len < 12:
+    if t.L[li] != sh.L[li]: bad.push("item {li}: {t.L[li]} vs {sh.L[li]}")
+    li += 1
+  var ni = 0
+  while ni < t.names.len and ni < sh.names.len and bad.len < 12:
+    if t.names[ni] != sh.names[ni] or t.hh[ni] != sh.hh[ni] or t.hw[ni] != sh.hw[ni]: bad.push("name {ni}")
+    ni += 1
+  if graft_imap(t.npos) != graft_imap(sh.npos): bad.push("npos")
+  if graft_imap(t.mod_start) != graft_imap(sh.mod_start): bad.push("mod_start")
+  if graft_lmap(t.cdecos) != graft_lmap(sh.cdecos): bad.push("cdecos")
+  if graft_lmap(t.mdecos) != graft_lmap(sh.mdecos): bad.push("mdecos")
+  if graft_lmap(t.deco_files) != graft_lmap(sh.deco_files): bad.push("deco_files")
+  if graft_lmap(t.dirs) != graft_lmap(sh.dirs): bad.push("dirs")
+  var nc1 = ""
+  for k, v in t.nocheck: nc1 += "{k}={v},"
+  var nc2 = ""
+  for k, v in sh.nocheck: nc2 += "{k}={v},"
+  if nc1 != nc2: bad.push("nocheck")
+  var dp1 = ""
+  for k, v in t.deprec: dp1 += "{k}={v};"
+  var dp2 = ""
+  for k, v in sh.deprec: dp2 += "{k}={v};"
+  if dp1 != dp2: bad.push("deprec")
+  if bad.len == 0: eprint("PPARSE CHECK ok: {t.nd.len} nodes, {t.names.len} names")
+  else: eprint("PPARSE CHECK BAD: " + "; ".join(bad))
+
 fn graft_imap(m: {Int: Int}) -> Str:
   var out = ""
   for k, v in m: out += "{k}={v},"
@@ -1165,18 +1361,78 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
   var pdiags: [parse.Diag] = []
   var pkg_syntax: {Int: Str} = {}   # a package file the parser found a syntax error in
   var jsdoc_why: {Int: Str} = {}    # a JavaScript file whose JSDoc isn't read as tsc reads it
+  # (the lib files and the queued files parsed ahead by tasks, each on a tree of its own, added to
+  # t in order by ast.append_file: the same nodes and names as parsing each into t. Not where the
+  # shards will be forked. VTSC_PPARSE=0: off; N: N tasks; check: also each parsed into a second
+  # tree as before, the two compared at the end)
+  let ppe = os.env("VTSC_PPARSE")
+  var pp_n = 4
+  if ppe == "0": pp_n = 0
+  elif ppe != "" and ppe != "check": pp_n = int(ppe) else 4
+  let pp_on = nshards0 <= 1 and pp_n > 0
+  let pp_chk = pp_on and ppe == "check" and not grafting
+  let pp_w = int(os.env("VTSC_PPW")) else 256
+  let pjq: Chan[PJob] = chan(1024)
+  let prq: Chan[PRes] = chan(1024)
+  var pgot: [PRes] = []
+  var phave: [Bool] = []
+  var pp_sent = 0
+  var tsh = ast.blank()
+  var kw2 = scan.keywords()
+  if pp_chk: tsh = ast.new_ast()
+  if pp_on:
+    for _k in 0..pp_n: spawn pparse(fs, fm.share(), pjq.share(), prq.share())
+  # (each file parsed on a tree of its own (here or ahead), what run_libs reads of it found there
+  # (file_facts), and the trees added to t in order by a task of their own (pmerge), which has t
+  # until the files are read; nn and nl: t's nodes and list items by then. A grafting pass adds
+  # its lib files to t here: the graft needs t)
+  let mg_on = not grafting and nshards0 <= 1
+  let mq: Chan[PRes] = chan(int(os.env("VTSC_MQ")) else 1024)
+  let mback: Chan[ast.Ast] = chan(1)
+  var nn = t.nd.len
+  var nl = t.L.len
+  if mg_on:
+    var tm = ast.blank()
+    swap(&tm, &t)
+    spawn pmerge(tm, mq.share(), mback.share(), fm.share())
   for path in libs:
-    var src = read_shared(fs, fm, path)
-    if src == "": src = fs.read(path)?
     let fi = srcs.len
-    parse.parse_file(&t, src + "", fi, &kw)
+    if pp_on:
+      while pp_sent < libs.len and pp_sent + 1 < fi + pp_w:
+        pjq.send(PJob(fi: 1 + pp_sent, path: libs[pp_sent] + "", jsx: false, json: false, lib: true))
+        pp_sent += 1
+    var src = ""
+    var pr = PRes(fi, false, ast.blank(), [], "")
+    if pp_on: pr = pp_take(prq, &pgot, &phave, 1, fi)
+    else:
+      let lk0 = lib_key(fi, path)
+      let lv0 = fm.get(lk0, fn(k) => lib_tree(fs, fm, k))
+      pr.ok = lv0.value.ok
+      pr.lib = lk0
+    if pr.ok:
+      src = read_shared(fs, fm, path)
+      let lv = fm.get(pr.lib, fn(k) => FSrc(false, ""))
+      nn += lv.value.t.nd.len - 1
+      nl += lv.value.t.L.len
+      if not mg_on: ast.append_file(&t, lv.value.t)
+    else:
+      # (unread through fm: read here, parsed for this program alone)
+      src = read_shared(fs, fm, path)
+      if src == "": src = fs.read(path)?
+      pr = PRes(fi, true, ast.new_ast(), [], "")
+      parse.parse_file(&pr.t, src + "", fi, &kw)
+      nn += pr.t.nd.len - 1
+      nl += pr.t.L.len
+      if not mg_on: ast.append_file(&t, pr.t)
+    if pp_chk: parse.parse_file(&tsh, src + "", fi, &kw2)
     srcs.push(src)
     names.push(path + "")
-    roots.push(t.nd.len - 1)
+    roots.push(nn - 1)
+    if mg_on: mq.send(pr)
   let tlib = os.clock() - t0
   let user_from = srcs.len
-  let u1 = t.nd.len
-  let l1 = t.L.len
+  let u1 = nn
+  let l1 = nl
   # the files named, then the files they import (relative specifiers), each once
   var queue: [Str] = []
   var queued: {Str: Bool} = {}
@@ -1242,6 +1498,8 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
       var xl: [Str] = []
       for l in xlibs: xl.push(l + "")
       for l in early: xl.push(l + "")
+      if pp_on: pjq.close()
+      mq.close()
       return run_libs(fs, os, ffi, files, dir, target, pg, shard, nshards, wq, cap, fm, km, xl, Graft())?
   # (packages' files by their real paths, as tsc has them: a package reached through two links
   # is one package, and its imports resolve from where it really is)
@@ -1254,14 +1512,23 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
   # (the types option's packages come after the root files and all they import, as tsc
   # processes the automatic type directives after the root files: where two declare one global,
   # google-maps' googlemaps and @types/google.maps, the first file's wins)
+  # (read once: these were looked up for every file and specifier, 5% of the resolving)
+  let env_nopkg = os.env("VTSC_NO_PACKAGES") != ""
+  let env_pkgsyn = os.env("VTSC_PKG_SYNTAX") != ""
+  let env_dbglibs = os.env("VTSC_DEBUG_LIBS") != ""
+  let env_pkglog = os.env("VTSC_PKG_LOG") != ""
   var types_in = os.env("VTSC_NO_PACKAGES") != ""
   var qi = 0
   var tparse = 0.0
+  var tread = 0.0
+  var tjsd = 0.0
+  var tpw = 0.0
+  var tmg = 0.0
   # (the queued files read ahead by four tasks, into fm, while this one parses and resolves: a
   # program with packages' types reads thousands of files, about half its read+parse time. Not
   # where the shards will be forked: that needs this process to run no other thread.
   # VTSC_PREFETCH=0: off)
-  let pf_on = nshards0 <= 1 and os.env("VTSC_PREFETCH") != "0" and not grafting
+  let pf_on = nshards0 <= 1 and os.env("VTSC_PREFETCH") != "0" and not grafting and not pp_on
   let pfq: Chan[Str] = chan(1 << 16)
   var pf_sent = 0
   if pf_on:
@@ -1317,6 +1584,13 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
       while pf_sent < queue.len:
         pfq.send(queue[pf_sent] + "")
         pf_sent += 1
+    if pp_on and not grafting:
+      while pp_sent - libs.len < queue.len and pp_sent + 1 < srcs.len + pp_w:
+        let pq = queue[pp_sent - libs.len] + ""
+        let pjs = is_jsx_path(pq) or pq.endswith(".js") or pq.endswith(".mjs") or pq.endswith(".cjs")
+        let pin = pq in pkgset or pq.find("/node_modules/") >= 0
+        pjq.send(PJob(1 + pp_sent, pq, pjs, pq.endswith(".json"), true, pin))
+        pp_sent += 1
     if qi == queue.len:
       types_in = true
       for f in tfiles:
@@ -1327,81 +1601,90 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
       continue
     let path = queue[qi] + ""
     qi += 1
-    var src = read_shared(fs, fm, path)
-    if src == "" and not (path in pkgset): src = fs.read(path)?
-    if path.endswith(".json"):
+    let tr0 = os.clock()
+    let fi = srcs.len
+    var src = ""
+    var pr = PRes(fi, false, ast.blank(), [], "")
+    if pp_on:
+      let tw0 = os.clock()
+      pr = pp_take(prq, &pgot, &phave, 1, fi)
+      tpw += os.clock() - tw0
+    if path.endswith(".json"): pkgset[path] = true
+    let in_pkg = path in pkgset or path.find("/node_modules/") >= 0
+    let js_ext = path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs") or path.endswith(".jsx")
+    # (JavaScript is read with JSX too, getLanguageVariant)
+    let jsxv = is_jsx_path(path) or path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs")
+    if pr.ok:
+      swap(&src, &pr.src)
+      # (a JavaScript file found a package's after it was queued: its facts found again; not seen)
+      if js_ext and pr.fx.in_pkg != in_pkg:
+        pr = PRes(fi, true, ast.new_ast(), [], "")
+        pr.ds = parse.parse_file_x(&pr.t, src + "", fi, &kw, false, jsxv)
+        pr.fx = file_facts(&pr.t, src, fi, path, in_pkg, &kw)
+    else:
+      src = read_shared(fs, fm, path)
+      if src == "" and not (path in pkgset): src = fs.read(path)?
       # (a JSON module: its value's widened type, as the type of a const it initializes, the
       # module's export =; loaded for its type, not checked)
-      src = "const __json = " + src + ";\nexport = __json;\n"
-      pkgset[path] = true
-    let fi = srcs.len
+      if path.endswith(".json"): src = "const __json = " + src + ";\nexport = __json;\n"
+      pr = PRes(fi, true, ast.new_ast(), [], "")
+      pr.ds = parse.parse_file_x(&pr.t, src + "", fi, &kw, false, jsxv)
+      pr.fx = file_facts(&pr.t, src, fi, path, in_pkg, &kw)
+    tread += os.clock() - tr0
     # (a TypeScript file that's CommonJS under node16's rules: import x = require there is allowed)
     if pg.node16 and not (path in pkgset) and path.find("/node_modules/") < 0 and (path.endswith(".ts") or path.endswith(".tsx") or path.endswith(".cts")) and importer_cjs(fs, &rv, abs_of(cwd0, path)): cjs_ts[fi] = true
     # (a package's declaration file that's CommonJS: an ECMAScript module's default import of it
     # is its module.exports, the module itself)
     elif pg.node16 and pg.mod_node and (path in pkgset or path.find("/node_modules/") >= 0) and (path.endswith(".d.ts") or path.endswith(".d.cts")) and importer_cjs(fs, &rv, abs_of(cwd0, path)): cjs_dts[fi] = true
     let tp0 = os.clock()
-    # (a .tsx or .jsx file: '<' in an expression starts JSX, as tsc's LanguageVariant.JSX has it)
-    let nb0 = t.nd.len
-    # (JavaScript is read with JSX too, getLanguageVariant)
-    let jsxv = is_jsx_path(path) or path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs")
-    let ds = parse.parse_file_x(&t, src + "", fi, &kw, false, jsxv)
+    var ds: [parse.Diag] = []
+    swap(&ds, &pr.ds)
+    var fx = FFacts()
+    swap(&fx, &pr.fx)
+    if pp_chk: let _d2 = parse.parse_file_x(&tsh, src + "", fi, &kw2, false, jsxv)
+    # (the file's nodes follow t's nn: its own ids moved up by dn)
+    let dn = nn - 1
+    nn += pr.t.nd.len - 1
+    nl += pr.t.L.len
+    let tm0 = os.clock()
+    if mg_on: mq.send(pr)
+    else: ast.append_file(&t, pr.t)
+    tmg += os.clock() - tm0
     tparse += os.clock() - tp0
     # (a package's syntax errors aren't reported: tsc reports them, but they'd hide every other error)
-    let in_pkg = path in pkgset or path.find("/node_modules/") >= 0
     if not in_pkg:
       for d in ds: pdiags.push(parse.Diag(d.file, d.pos, d.end, d.code, d.msg + ""))
     elif ds.len > 0:
       pkg_syntax[fi] = "TS{ds[0].code} at {ds[0].pos}"
-      if os.env("VTSC_PKG_SYNTAX") != "": eprint("PKGSYNTAX {path} TS{ds[0].code} {ds[0].pos} {ds[0].msg}")
+      if env_pkgsyn: eprint("PKGSYNTAX {path} TS{ds[0].code} {ds[0].pos} {ds[0].msg}")
     srcs.push(src)
     names.push(path + "")
-    var root = t.nd.len - 1
-    # (a JavaScript file of the program's own: its JSDoc types set where TypeScript writes them)
-    if not in_pkg and (path.endswith(".js") or path.endswith(".mjs") or path.endswith(".cjs") or path.endswith(".jsx")):
+    # (a JavaScript file of the program's own: its JSDoc types set where TypeScript writes them,
+    # file_facts)
+    if pp_chk and not in_pkg and js_ext:
       var jfirst = 0
       if roots.len > 0: jfirst = roots[roots.len - 1] + 1
-      let jw = jsdoc_attach(&t, src, fi, jfirst, root, &kw)
-      if jw != "": jsdoc_why[fi] = jw
-      root = t.nd.len - 1
+      let _w2 = jsdoc_attach(&tsh, src, fi, jfirst, tsh.nd.len - 1, &kw2)
+    if fx.jw != "": jsdoc_why[fi] = fx.jw
+    let root = fx.root + dn
     roots.push(root)
-    # (a JavaScript file's require("x") calls: CommonJS imports, and the file a CommonJS module)
+    # (a JavaScript file's require("x") calls: CommonJS imports, and the file a CommonJS module;
+    # an ES module's own require calls: what const x = require("x") aliases)
     var req_specs: [Str] = []
-    if path.endswith(".js") or path.endswith(".cjs") or path.endswith(".jsx"):
-      var ni = 0
-      if roots.len > 1: ni = roots[roots.len - 2] + 1
-      let ni0 = ni
-      var cjs = false
-      while ni < root:
-        let rs = require_spec(t, ni)
-        if rs >= 0:
-          req_specs.push(t.names[t.nd[rs].s] + "")
-          cjs = true
-        if t.nd[ni].k == ast.N_PROPACCESS and t.nd[t.nd[ni].a].k == ast.N_ID and t.names[t.nd[t.nd[ni].a].s] == "module" and t.names[t.nd[ni].s] == "exports": cjs = true
-        if t.nd[ni].k == ast.N_ID and t.names[t.nd[ni].s] == "exports": cjs = true
-        ni += 1
-      if cjs:
-        cjs_roots[root] = true
-        let ce = cjs_export_expr(t, root, ni0)
-        if ce >= 0: cjs_exp[root] = ce
-    # (an ES module's require("x") calls, its own require's: what const x = require("x") aliases)
-    if path.endswith(".mjs") and not in_pkg:
-      var nm0 = 0
-      if roots.len > 1: nm0 = roots[roots.len - 2] + 1
-      while nm0 < root:
-        let rs = require_spec(t, nm0)
-        if rs >= 0: req_specs.push(t.names[t.nd[rs].s] + "")
-        nm0 += 1
+    for x in fx.req: req_specs.push(x + "")
+    if fx.cjs:
+      cjs_roots[root] = true
+      if fx.ce >= 0: cjs_exp[root] = fx.ce + dn
     var my_deps: [Str] = []
     var my_imps: [Str] = []
     var dep_rank: [Int] = []   # (each dep's place in tsc's visit: path refs, types refs, then imports)
     var abs_path = path + ""
     if not abs_path.startswith("/"): abs_path = bind.norm_path(cwd0 + "/" + path)
     # (/// <reference path="..." /> and types="...": declaration files)
-    if os.env("VTSC_NO_PACKAGES") == "":
-      for ref in tsres.triple_slash(src):
+    if not env_nopkg:
+      for ref in fx.refs:
         if ref[0] == "lib":
-          if os.env("VTSC_DEBUG_LIBS") != "": eprint("LIBREF {path}: {ref[1]}")
+          if env_dbglibs: eprint("LIBREF {path}: {ref[1]}")
           ref_libs.push(tsconf.lib_alias(ref[1].lower()))
           continue
         var rtarget = ""
@@ -1421,41 +1704,23 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
         my_deps.push(rtarget + "")
         if ref[0] == "path": dep_rank.push(0)
         else: dep_rank.push(1)
-    # (the statements of ambient modules and augmentations import too)
-    var sts: [Int] = []
-    for st in ast.items(t, root):
-      sts.push(st)
-      if t.nd[st].k == ast.N_MODULE and t.nd[st].b >= 0 and t.nd[t.nd[st].a].k == ast.N_STR:
-        for x in ast.items(t, t.nd[st].b): sts.push(x)
+    # (the statements of ambient modules and augmentations import too: file_facts)
     var sps: [Str] = []
     var sp_imp: [Bool] = []
     var sp_rank: [Int] = []
-    for st in sts:
-      let k = t.nd[st].k
-      var spec = -1
-      if k == ast.N_IMPORT or k == ast.N_EXPORT: spec = t.nd[st].a
-      if k == ast.N_IMPORTEQ and t.nd[st].a >= 0 and t.nd[t.nd[st].a].k == ast.N_EXTERNALREF: spec = t.nd[t.nd[st].a].a
-      if spec < 0 or t.nd[spec].k != ast.N_STR: continue
-      sps.push(t.names[t.nd[spec].s] + "")
-      sp_imp.push(k == ast.N_IMPORT)
+    for ii in 0..fx.imps.len:
+      sps.push(fx.imps[ii] + "")
+      sp_imp.push(fx.imp_is[ii])
       sp_rank.push(3)
     # (a module augmentation's module, declare module "m" in a module file: resolved as an import)
-    var is_mod = false
-    for st in ast.items(t, root):
-      let k0 = t.nd[st].k
-      if k0 == ast.N_IMPORT or k0 == ast.N_EXPORT or k0 == ast.N_EXPORTDEFAULT or k0 == ast.N_EXPORTASSIGN or k0 == ast.N_IMPORTEQ: is_mod = true
-      # (an exported declaration makes a module too, bind.is_module)
-      if k0 == ast.N_VAR and (t.nd[st].d & ast.M_EXPORT) != 0: is_mod = true
-      if (k0 == ast.N_FUNC or k0 == ast.N_CLASS or k0 == ast.N_ENUM or k0 == ast.N_MODULE) and (t.nd[st].f & ast.M_EXPORT) != 0: is_mod = true
-      if (k0 == ast.N_INTERFACE or k0 == ast.N_TYPEALIAS) and (t.nd[st].d & ast.M_EXPORT) != 0: is_mod = true
+    var is_mod = fx.ismod
     # (moduleDetection force: any file but a declaration file of the program's own)
     if pg.mod_force and not path.endswith(".d.ts") and not (path in pkgset) and path.find("/node_modules/") < 0: is_mod = true
     if is_mod:
-      for st in ast.items(t, root):
-        if t.nd[st].k == ast.N_MODULE and t.nd[st].b >= 0 and t.nd[t.nd[st].a].k == ast.N_STR and (t.nd[st].f & ast.MOD_GLOBAL) == 0:
-          sps.push(t.names[t.nd[t.nd[st].a].s] + "")
-          sp_imp.push(false)
-          sp_rank.push(5)
+      for x in fx.augs:
+        sps.push(x + "")
+        sp_imp.push(false)
+        sp_rank.push(5)
     # (react-jsx: a JSX file imports its runtime, as tsc's GetJSXRuntimeImportSpecifier adds it; here
     # whether or not it has an element)
     if is_jsx_path(path) and (pg.jsx == "react-jsx" or pg.jsx == "react-jsxdev"):
@@ -1532,7 +1797,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
           if is_imp: my_imps.push(hit + "")
           continue
       # (#name: the nearest package.json's imports, every moduleResolution TypeScript 7 has)
-      if sp.startswith("#") and os.env("VTSC_NO_PACKAGES") == "":
+      if sp.startswith("#") and not env_nopkg:
         rv.req = pg.node16 and importer_cjs(fs, &rv, abs_path)
         var ih = tsres.resolve_imports(&rv, fs, abs_path, sp)
         if ih != "":
@@ -1549,7 +1814,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
           my_deps.push(ih + "")
           if is_imp: my_imps.push(ih + "")
           continue
-      if os.env("VTSC_NO_PACKAGES") == "" and tsres.is_bare(sp):
+      if not env_nopkg and tsres.is_bare(sp):
         rv.req = pg.node16 and importer_cjs(fs, &rv, abs_path)
         # (import() in a CommonJS file resolves as an ECMAScript import: the "import" condition)
         if rv.req and sp in dyn_specs:
@@ -1576,7 +1841,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
           ptarget = real_or(ffi, &rdirs, tsres.resolve_types(&rv, fs, abs_path, sp))
           res_memo[rkey] = ptarget + ""
         ptarget = dedup_pkg(&rv, fs, &pid_pkg, &pid_first, ptarget)
-        if os.env("VTSC_PKG_LOG") != "": eprint("PKG {path} {sp} -> {ptarget}")
+        if env_pkglog: eprint("PKG {path} {sp} -> {ptarget}")
         if ptarget != "":
           pkg_res[path + "|" + sp] = ptarget + ""
           if not (ptarget in queued):
@@ -1662,6 +1927,11 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
     deps.push(my_deps)
     imps.push(my_imps)
   if pf_on: pfq.close()
+  if pp_on: pjq.close()
+  if mg_on:
+    mq.close()
+    t = mback.recv()?
+  if pp_chk: pp_check(t, tsh)
   # (a lib a file references that isn't loaded yet: read again with it)
   if not keys_only:
     var more: [Str] = []
@@ -1676,6 +1946,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
       if any_new: more.push(l + "")
     if more.len > 0:
       if os.env("VTSC_DEBUG_LIBS") != "": eprint("LIBS {",".join(more)} (have {",".join(xlibs)})")
+      if os.env("VTSC_PHASES") != "": eprint("RPSPLIT total {(os.clock() - t0) * 1000.0:.1} libs {tlib * 1000.0:.1} read {tread * 1000.0:.1} parse {tparse * 1000.0:.1} jsdoc {tjsd * 1000.0:.1} files {srcs.len - user_from} nodes {t.nd.len - u1} grafted restart ppwait {tpw * 1000.0:.1} merge {tmg * 1000.0:.1}")
       if os.env("VTSC_PHASES") != "": eprint("RESTART read+parse {(os.clock() - t0) * 1000.0:.0} (parse {tparse * 1000.0:.0}, libs {tlib * 1000.0:.0}) files {srcs.len} libs {",".join(more)}")
       var xl: [Str] = []
       for l in xlibs: xl.push(l + "")
@@ -1726,6 +1997,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
         odeps = []
         imps = []
       return run_libs(fs, os, ffi, files, dir, target, pg, shard, nshards, wq, cap, fm, km, xl, g)?
+  if os.env("VTSC_PHASES") != "": eprint("RPSPLIT total {(os.clock() - t0) * 1000.0:.1} libs {tlib * 1000.0:.1} read {tread * 1000.0:.1} parse {tparse * 1000.0:.1} jsdoc {tjsd * 1000.0:.1} files {srcs.len - user_from} nodes {t.nd.len - u1} grafted {grafting} ppwait {tpw * 1000.0:.1} merge {tmg * 1000.0:.1}")
   if prev.on and gmode == "check": graft_check(&prev, libs, u1, l1, user_from, t, srcs, names, roots, pdiags, pkg_syntax, jsdoc_why, cjs_ts, cjs_dts, cjs_roots, cjs_exp, fs, fm, &kw, queue, deps)
   let t1 = os.clock()
   let mem1 = types.ct_maxrss(ffi)
@@ -2111,6 +2383,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
   var nthr = pg.nthr
   if nthr == 0: nthr = int(os.env("VTSC_THREADS")) else 0
   if nthr > 1 and not dyn and not warm and nshards <= 1 and c.eager_bound:
+    let tq0 = os.clock()
     pi = plan.len
     var work: [Int] = []
     for fi in plan:
@@ -2148,6 +2421,9 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
         q += 2
     var ss: Shared[[Str]] = share([""])
     swap(&srcs, &ss.unique)
+    let tq1 = os.clock()
+    var tq_d0 = 0.0
+    var tq_d1 = 0.0
     # (VTSC_THREADS_SEQ=1, for debugging: thread k checks every nthr-th file from the k-th, one
     # thread at a time, each starting when the one before is done)
     let seq = os.env("VTSC_THREADS_SEQ") == "1"
@@ -2209,10 +2485,13 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
     if not seq:
       for k in 0..nthr:
         let _d = done1.recv()?
+        if k == 0: tq_d0 = os.clock()
+      tq_d1 = os.clock()
       go.close()
       for k in 0..nthr:
         let r = res.recv()?
         wk.push(r)
+    let tq2 = os.clock()
     if os.env("VTSC_RULE_WHY") != "":
       eprint("NTPUB {c.ntype_pub.len()} CSPUB {c.csig_pub.len()}")
       for w0 in wk:
@@ -2222,6 +2501,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
     merge_workers(&c, &wk, work, &out)
     wk = []
     swap(&srcs, &ss.unique)
+    if os.env("VTSC_PHASES") != "": eprint("TPHASE threads {nthr} files {work.len} pre {(tq1 - tq0) * 1000.0:.0} checks first done {(tq_d0 - tq1) * 1000.0:.0} last {(tq_d1 - tq1) * 1000.0:.0} rules {(tq2 - tq_d1) * 1000.0:.0} merge {(os.clock() - tq2) * 1000.0:.0}")
   while true:
     if pi >= plan.len and tickets_done and warm:
       # (the first files checked: now the shards, each the rest of its files)

@@ -1926,6 +1926,80 @@ remaining type-aware work is the checker's own (statements 60% of the serial sam
 largest rule cost left, no-unsafe-enum-assignment's search, can't be cut without changing which
 files are reported as not fully typed (above).
 
+### Reading and parsing on tasks (measured 2026-11-26, night)
+
+How it was measured (the session's scratch `m26/`): `allph.sh` each invocation alone with
+VTSC_PHASES, whose `RPSPLIT` line (one per run_libs pass, restarts and grafts included) splits a
+pass into libs, read, parse, the tasks' wait and the merge; `TPHASE` splits a threaded check into
+the threads' checks, the rules after the barrier and the merge. `sall.sh`/`sumc.py` the 88 serial
+samples with idle threads' stacks left out; `nw/node` a node wrapper logging each process's cpu.
+Load 4-17 on 10 cores from other work throughout.
+
+Before (cb3ce77a), the passes' wall summed over the 88 invocations alone: 21.8 s, of which the
+lib files 2.4, parsing 7.6, waiting for reads 0.3, the grafts 0.65 and resolving the rest (10.9:
+kind_of's stats, resolve_types and package.json reads, dedup_pkg, realpath, module_candidates).
+
+What landed (each with the gate: probes 135/135 and shuffled 1 and 2, vtests the same as m25's
+vt_base, the job's 176 outputs as j_base, `dgate.sh` idx 31/52/86/59 at 1/2/4/8 threads 16 of 16,
+the two threaded vtests 50 runs each at 8 threads, VTSC_GRAFT=check 19 of 19):
+- run_libs' files parsed ahead by four tasks (`pparse`, VTSC_PPARSE=N; 0 off; not where shards
+  fork) into a tree each (`ast.new_ast`), with what run_libs reads of the tree found there too
+  (`file_facts`: JSDoc types, require and import specifiers, module-ness, augmentations,
+  triple-slash references), and added to the program's tree in file order by a task of its own
+  (`pmerge`, `ast.append_file`: nodes and list items shifted, the file's names interned in its
+  order, so every node and name gets the id one parse into the tree gives; main follows the
+  counts, nn/nl). Main only resolves now. `VTSC_PPARSE=check` also parses every file into a
+  second tree as before and compares nodes, items, names and side tables (`pp_check`): every
+  program of idx 14, 25, 59, 86 identical.
+- lib files parsed once per run (`lib_key`/`lib_tree` in the file memo, by path and file index):
+  the programs of an invocation and the restarts share them (a restart's libs 10 -> 3 ms).
+- the scanner's `@deprecated` search: the next occurrence remembered (`dep_q`/`dep_at`) instead of
+  copying every JSDoc comment to search it.
+- the JS host (gen_host.py `STARTUP`, main.js): built-in modules by process.getBuiltinModule (no
+  ES module facade, which read every export of node:fs and loaded its streams), node:assert not
+  imported (nothing used it), uri-js's IPv6 pattern not tried on hosts without ':'. The first
+  answer 96 -> 87 ms a process (warm compile cache, alone); what's left is node itself (55 ms
+  for `node -e 0` here), its internal modules for net and tty, ajv's meta schema (6 ms) and the
+  `debug` package's tty and util.
+- After: 15.7 s (the tasks' wait 1.1 s of it, the lib files 1.1); the passes of idx 59 1.47 ->
+  0.95 s, 14 0.70 -> 0.45, 86 0.43 -> 0.32, 25 0.19 -> 0.12.
+
+Cost: the trees made twice (each file's own, then the program's) and names interned twice:
+serial instructions idx 59 / 86 / 52 / 31 126.1 / 80.4 / 47.4 / 45.4 -> 129.3 / 81.0 / 47.8 /
+45.9 G; idx 25 / 2 / 16 7.28 / 0.94 / 15.9 -> 7.56 / 0.91 / 16.3 G. Max RSS of the serial run:
+idx 59 3.08 -> 3.29 GB, 86 2.25 -> 2.29, 52 1.04 -> 1.02, 31 0.93 -> 0.97; not the windows (64 or
+32 files ahead and in the merge queue: the same), likely the small buffers made on the parse
+tasks' threads and freed on the merging task's (the runtime's free lists are per thread). Not
+looked into further.
+
+Not kept:
+- resolving ahead on the parse tasks (`warm`: kind_of's stats into the shared km, resolve_types'
+  answers by res_memo's key and package ids into Memos main read first, "\0" when absent): no
+  gain on idx 14/59/86 whether done after sending a file's tree or before, two runs each. Main
+  isn't waiting for the tasks (1.1 s in all) and the lookups cost about what they saved.
+- 6 or 8 parse tasks instead of 4: the same (the tasks aren't the bottleneck).
+- reserve per appended file: Vu's `reserve` makes room for exactly what's asked, so it copied
+  the tree each time; push's doubling instead (the same RSS, measured).
+
+The job, two rounds alternated (load 4-17): HEAD 46.3 and 44.6 s, 360 and 355 cpu-s, 4.6 and 5.0
+GB; cb3ce77a 46.2 and 46.6 s, 352 and 354 cpu-s, 4.9 and 5.0 GB; oxlint 1.79 78.5 and 76.3 s, 482
+and 476 cpu-s, 8.5 and 8.9 GB. Every vlint run's 176 outputs as j_base. About a second, within
+the noise: the 40 s asked for isn't reached. Why the pre-check's 6 s show so little:
+- the job is near CPU-bound: 355 cpu-s in 45 s on 10 cores (8 busy on average) with other work
+  on the machine; the tasks add cpu rather than remove it. Cutting cpu didn't show either:
+  VLINT_VTSC_SMALL_THREADS=2 (-12 cpu-s) 45.1 / 45.2 s against 45.6 / 44.8, VLINT_JS_PROCS=2
+  (-11 cpu-s, the React Compiler package 8.1 -> 9.4 s) 44.8 / 45.2 against 46.9 / 45.0.
+- the plan's order: the 2,710-file program (idx 86, 5.0 s) starts when the lanes are at 39.8 and
+  40.0 s and runs alone at the end, so the job is about 39.8 + its wall. Its wall is its check:
+  3.3 s of threads' checks (8 threads, balanced: first done 3.1, last 3.3), 0.78 s of rules after
+  the barrier, 0.06 merge; 10 threads instead of 8: 4.93 against 5.06 s alone.
+
+Where it goes now (the 88 serial samples, busy stacks only): the files' checks 48%, the
+type-aware rules 16%, resolving and the grafts 7.6% (kind_of 1.6, resolve_types 1.2), reading
+(open and read on the parse tasks) 7.3%, parsing 4.5%, binding 2.6%, merging 1.5%. Node: 98 cpu-s
+of the job's 360 in 137 processes; the React Compiler package's four 33.7, the 119 under a
+cpu-second 36.7 (median 0.28).
+
 ## Keeping the caches in CI
 
 What a CI job can keep between runs is one folder: `$XDG_CACHE_HOME/vlint` (`~/.cache/vlint`

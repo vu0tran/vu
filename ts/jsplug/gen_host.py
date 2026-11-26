@@ -202,8 +202,38 @@ def vu_unstr(s):
     return "".join(out)
 
 
+# Changes to oxlint's part that make the host start sooner, the same behaviour (each applied once:
+# --from-lhost finds them made)
+STARTUP = [
+    # (a built-in module taken as it is rather than imported: no ES module facade to build)
+    ('import { createRequire } from "node:module";\n',
+     'const { createRequire } = process.getBuiltinModule ? process.getBuiltinModule("node:module") : await import("node:module");\n'),
+    # (imported for nothing: nothing of it is used, and loading it loads node's assertion internals)
+    ('import "node:assert";\n', ''),
+    # (uri-js, as ajv compiles its meta schema at load: the IPv6 pattern, compiled on its first use,
+    # tried on hosts with no ':', which no IPv6 address lacks; about 5 ms of every start)
+    ('function _normalizeIPv6(host, protocol) {\n',
+     'function _normalizeIPv6(host, protocol) {\n\t\t\tif (host.indexOf(":") < 0) return host;\n'),
+    ('components.host && !protocol.IPV6ADDRESS.test(components.host)',
+     'components.host && (String(components.host).indexOf(":") < 0 || !protocol.IPV6ADDRESS.test(components.host))'),
+]
+
+
+def startup_patches(host):
+    for old, new in STARTUP:
+        if (new and new in host) or (not new and old not in host):
+            continue
+        if old not in host:
+            raise SystemExit("text not found: " + old[:60])
+        if host.count(old) != 1:
+            raise SystemExit("text found more than once: " + old[:60])
+        host = host.replace(old, new, 1)
+    return host
+
+
 def write_host(host):
     """writes jsplug/host.mjs and lhost.vu"""
+    host = startup_patches(host)
     with open(os.path.join(here, "host.mjs"), "w", encoding="utf8") as f:
         f.write(host)
 
@@ -224,7 +254,8 @@ if dist == "--from-lhost":
     # current ones)
     lines = prefix.split("\n")
     vl = [i for i, x in enumerate(lines) if x.startswith("import ") and " as __vl" in x]
-    at = vl[0] if vl else max(i for i, x in enumerate(lines[:40]) if x.startswith("import ")) + 1
+    imps = [i for i, x in enumerate(lines[:40]) if x.startswith("import ")]
+    at = vl[0] if vl else (max(imps) + 1 if imps else next(i for i, x in enumerate(lines) if not x.startswith("//")))
     lines = [x for i, x in enumerate(lines) if i not in vl]
     lines[at:at] = re.findall(r"^import .*;$", main, flags=re.M)
     write_host("\n".join(lines) + ours + re.sub(r"^import .*;\n", "", main, flags=re.M))
