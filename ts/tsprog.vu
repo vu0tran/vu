@@ -738,11 +738,11 @@ fn file_keys(fs: Fs, os: Os, ffi: Ffi, c: types.C, pg: Prog, dir: Str, target: S
   for x in user_from..names.len:
     var ys: [Int] = []
     for d in deps[x - user_from]:
-      let y = c.file_index.get(d, -1)
+      let y = c.bd.value.file_index.get(d, -1)
       if y >= 0: ys.push(y)
     dix.push(ys)
   for fx in user_from..names.len:
-    if fx in c.pkg_files: continue
+    if fx in c.bd.value.pkg_files: continue
     # (what it imports, all the way down: a sum, so the order doesn't matter)
     var sum = 0
     var n = 0
@@ -858,6 +858,127 @@ fn closure_shards(uord: [Int], fcost: [Int], impi: [[Int]], user_from: Int, skip
         load[best] += fcost[q]
     out[i] = best
   return out
+
+# A checking thread's results (VTSC_THREADS): its checker, its rules' diagnostics, and for each of
+# its checker's diagnostics the file whose check made it.
+type WRes:
+  c: types.C
+  rd: [trules.RDiag]
+  rf: [Int]
+  rbad: [Int]
+  why: [Str]       # for each of rbad: what stopped the rules (trules.run's c.rule_why)
+  dfile: [Int]
+
+# A checking thread: files from jobs until it's closed, each checked and linted as run_libs does.
+fn check_worker(ffi: Ffi, own c0: types.C, own jobs: Chan[Int], own res: Chan[WRes], own srcs: Shared[[Str]], own names: [Str], own pg: Prog, own done1: Chan[Int], own go: Chan[Int]):
+  var c = c0
+  var rcfs: {Str: trules.Cfg} = {}
+  var rd_all: [trules.RDiag] = []
+  var rf: [Int] = []
+  var rbad: [Int] = []
+  var why: [Str] = []
+  var dfile: [Int] = []
+  var mine: [Int] = []
+  # (its handle to the sources gone before it sends: the main one then has the only one)
+  if true:
+    let sv = srcs
+    # (the files checked, then, once every thread's are, their rules: a rule reads the types of
+    # the file's nodes, which another thread's fill may have typed instead, chk.nt_import)
+    while true:
+      let fi = jobs.recv() else -1
+      if fi < 0: break
+      c.node_file = fi
+      c.file_inst = 0
+      if c.debug: eprint("THREADFILE {names[fi]}")
+      chk.check_file(&c, c.bd.value.roots[fi])
+      mine.push(fi)
+      while dfile.len < c.diags.len: dfile.push(fi)
+    done1.send(1)
+    let _g = go.recv() else 0
+    for fi in mine:
+      c.node_file = fi
+      let root = c.bd.value.roots[fi]
+      chk.nt_import(&c, root)
+      var rl = pg.lint + ""
+      if fi in c.unsupported: rl = ""
+      if pg.lint_files.len > 0:
+        rl = ""
+        var an = names[fi] + ""
+        if not an.startswith("/") and pg.cwd != "": an = bind.norm_path(pg.cwd + "/" + an)
+        if an in pg.lint_files: rl = pg.lint_files[an] + ""
+      if c.debug_file == fi: chk.dump_ntype(c, root)
+      if rl != "" and rl != "[]":
+        if not (rl in rcfs): rcfs[rl + ""] = trules.parse_cfg(rl)
+        let rcf = rcfs[rl]
+        var rd: [trules.RDiag] = []
+        if not trules.run(&c, root, sv.value[fi], rcf, &rd):
+          rbad.push(fi)
+          why.push(c.rule_why + "")
+        for x in rd:
+          rd_all.push(trules.copy_diag(x))
+          rf.push(fi)
+      while dfile.len < c.diags.len: dfile.push(fi)
+  chk.flush_kept(&c)
+  while dfile.len < c.diags.len: dfile.push(-1)
+  res.send(WRes(c, rd_all, rf, rbad, why, dfile))
+
+# The threads' results into the main checker: diagnostics in the order of the files whose checks
+# made them (as one checker checking work in order would have them; a diagnostic made by several,
+# as a fill each did, is merged by the report), and the union of what the report reads.
+fn merge_workers(var c: types.C, var wk: [WRes], work: [Int], var out: Out):
+  var at: {Int: Int} = {}
+  for i in 0..work.len: at[work[i]] = i
+  # (diagnostics: by the checked file's place in work, then thread, then as made)
+  var keys: [Int] = []
+  var ds: [parse.Diag] = []
+  for k in 0..wk.len:
+    for j in 0..wk[k].c.diags.len:
+      let d = wk[k].c.diags[j]
+      var w = work.len
+      let f = wk[k].dfile[j]
+      if f >= 0 and f in at: w = at[f]
+      keys.push(((w * 64 + k) << 24) | j)
+      ds.push(parse.Diag(d.file, d.pos, d.end, d.code, d.msg + ""))
+  var ix: [Int] = []
+  for i in 0..keys.len: ix.push(i)
+  ix.sort(by: fn(a, b) => keys[a] < keys[b])
+  for i in ix: c.diags.push(parse.Diag(ds[i].file, ds[i].pos, ds[i].end, ds[i].code, ds[i].msg + ""))
+  # (rules' diagnostics: by file, in work's order)
+  var rix: [Int] = []
+  var rk: [Int] = []
+  var rds: [trules.RDiag] = []
+  var rfs: [Int] = []
+  for k in 0..wk.len:
+    for j in 0..wk[k].rd.len:
+      rk.push(((at[wk[k].rf[j]] * 64 + k) << 24) | j)
+      rds.push(trules.copy_diag(wk[k].rd[j]))
+      rfs.push(wk[k].rf[j])
+  for i in 0..rk.len: rix.push(i)
+  rix.sort(by: fn(a, b) => rk[a] < rk[b])
+  for i in rix:
+    out.rdiags.push(trules.copy_diag(rds[i]))
+    out.rfile.push(rfs[i])
+  var bad: [Int] = []
+  for k in 0..wk.len:
+    for f in wk[k].rbad: bad.push(f)
+  bad.sort(by: fn(a, b) => at[a] < at[b])
+  for f in bad: out.rbad.push(f)
+  for k in 0..wk.len:
+    # (why a file isn't checked: the shortest reason when threads found different ones)
+    for f, why in wk[k].c.unsupported:
+      if not (f in c.unsupported) or why.len < c.unsupported[f].len or (why.len == c.unsupported[f].len and why < c.unsupported[f]): c.unsupported[f] = why + ""
+    for f, ys in wk[k].c.marks:
+      if not (f in c.marks): c.marks[f] = []
+      for y in ys:
+        if not types.has_int(c.marks[f], y): c.marks[f].push(y)
+    for x, _ in wk[k].c.deco_checked: c.deco_checked[x] = true
+    for x, _ in wk[k].c.es_deco_ok: c.es_deco_ok[x] = true
+    for x, _ in wk[k].c.value_refs: c.value_refs[x] = true
+    for x, _ in wk[k].c.expect_presumed: c.expect_presumed[x] = true
+    for x, v in wk[k].c.class_at: c.class_at[x] = v
+    for x, _ in wk[k].c.decl_files: c.decl_files[x] = true
+    for f in wk[k].c.touch_moved: c.touch_moved.push(f)
+    c.rel_n += wk[k].c.rel_n
 
 fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: Prog, shard0: Int, nshards0: Int, own wq: Chan[Int], cap: Int, fm: Memo[Str, FSrc], km: Memo[Str, Int], xlibs: [Str]) -> Out throws:
   var shard = shard0
@@ -1415,43 +1536,43 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
   c.strict_sub_reads = os.env("VTSC_STRICT_SUB") == "1"
   c.tla_ok = pg.tla_ok
   c.exp_deco = pg.exp_deco
-  for k, v in pkg_present: c.pkg_present[k] = v
-  for k, v in pkg_js: c.pkg_js[k] = v + ""
-  for k, v in cjs_roots: c.cjs_roots[k] = v
-  for k, v in cjs_exp: c.cjs_exp[k] = v
+  for k, v in pkg_present: c.bd.unique.pkg_present[k] = v
+  for k, v in pkg_js: c.bd.unique.pkg_js[k] = v + ""
+  for k, v in cjs_roots: c.bd.unique.cjs_roots[k] = v
+  for k, v in cjs_exp: c.bd.unique.cjs_exp[k] = v
   # (moduleDetection force: every file but a declaration file is a module, its declare module
   # 'x' an augmentation)
   for ri0 in 0..roots.len:
     let rt0 = roots[ri0]
-    if bind.is_module_scan(c, rt0): c.mod_flag[rt0] = 1
-    elif pg.mod_force and ri0 >= user_from and not names[ri0].endswith(".d.ts"): c.mod_flag[rt0] = 1
-    else: c.mod_flag[rt0] = 0
-  for k, v in pkg_res: c.pkg_res[k] = v + ""
-  for k, _v in js_imps: c.js_imps[k + ""] = true
-  for k, _v in cjs_ts: c.cjs_ts[k] = true
-  for k, _v in cjs_dts: c.cjs_dts[k] = true
+    if bind.is_module_scan(c, rt0): c.bd.unique.mod_flag[rt0] = 1
+    elif pg.mod_force and ri0 >= user_from and not names[ri0].endswith(".d.ts"): c.bd.unique.mod_flag[rt0] = 1
+    else: c.bd.unique.mod_flag[rt0] = 0
+  for k, v in pkg_res: c.bd.unique.pkg_res[k] = v + ""
+  for k, _v in js_imps: c.bd.unique.js_imps[k + ""] = true
+  for k, _v in cjs_ts: c.bd.unique.cjs_ts[k] = true
+  for k, _v in cjs_dts: c.bd.unique.cjs_dts[k] = true
   # (JavaScript whose JSDoc isn't read as tsc reads it: not checked, its rules not run)
   for jf, jw0 in jsdoc_why: c.unsupported[jf] = "JavaScript: " + jw0
-  for k, v in redirects: c.file_redirect[k] = v + ""
+  for k, v in redirects: c.bd.unique.file_redirect[k] = v + ""
   for fx in 0..names.len:
-    c.files.push(names[fx] + "")
-    c.roots.push(roots[fx])
-    c.file_index[names[fx] + ""] = fx
+    c.bd.unique.files.push(names[fx] + "")
+    c.bd.unique.roots.push(roots[fx])
+    c.bd.unique.file_index[names[fx] + ""] = fx
     # (a package's files: loaded for its types, and whatever they import)
     if fx >= user_from and (names[fx] in pkgset or names[fx].find("/node_modules/") >= 0):
-      c.pkg_files[fx] = true
-      c.t.nocheck[fx] = true
+      c.bd.unique.pkg_files[fx] = true
+      c.t.unique.nocheck[fx] = true
   let tlink0 = os.clock()
   bind.link_parents(&c)
   # (globals merged in tsc's file order: the libs, then each root file after what it references
   # and imports, depth first, then the types option's packages; the declaration that comes first
   # wins a conflict, and merged declarations and overloads keep that order)
-  let gorder = tsc_order(cwd0, files, tfiles, pg.root_incl, pg.root_listed, user_from, odeps, c.file_index, roots.len)
-  c.frank = []
-  for fi0 in 0..roots.len: c.frank.push(-1)
+  let gorder = tsc_order(cwd0, files, tfiles, pg.root_incl, pg.root_listed, user_from, odeps, c.bd.value.file_index, roots.len)
+  c.bd.unique.frank = []
+  for fi0 in 0..roots.len: c.bd.unique.frank.push(-1)
   for oi in 0..gorder.len:
     let fi1 = gorder[oi]
-    if fi1 >= 0 and fi1 < roots.len: c.frank[fi1] = oi
+    if fi1 >= 0 and fi1 < roots.len: c.bd.unique.frank[fi1] = oi
   if os.env("VTSC_ORDER") != "":
     eprint("ORDER incl {pg.root_incl.len} listed {pg.root_listed}")
     for fi in gorder:
@@ -1461,7 +1582,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
     if not bind.is_module(c, root): bind.declare_globals(&c, root)
     else:
       bind.declare_global_blocks(&c, root)
-      if fi < user_from or fi in c.pkg_files: bind.note_umd(&c, root)
+      if fi < user_from or fi in c.bd.value.pkg_files: bind.note_umd(&c, root)
   var aug_files: [Int] = []
   for fi in gorder:
     if fi >= user_from: aug_files.push(fi)
@@ -1503,7 +1624,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
       vroots[i] = vroots[j]
       vroots[j] = tmp
       i -= 1
-  for fx in vroots: visit(fx, user_from, deps, &state, &order0, c.file_index)
+  for fx in vroots: visit(fx, user_from, deps, &state, &order0, c.bd.value.file_index)
   # this worker's files checked, and the declarations of what they import resolved (another
   # worker checks those files)
   var mine: [Bool] = []
@@ -1522,10 +1643,10 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
   var uord: [Int] = []
   var total = 0
   for fx in order0:
-    if fx >= user_from and not (fx in c.pkg_files) and not (fx in cached):
+    if fx >= user_from and not (fx in c.bd.value.pkg_files) and not (fx in cached):
       uord.push(fx)
       total += fcost[fx]
-  let impi = dep_index(imps, c.file_index)
+  let impi = dep_index(imps, c.bd.value.file_index)
   # (shards as processes, warmed: this process checks the first files of the order before they
   # fork, VTSC_WARM_PERMILLE of the work (0: forked cold, the default), so that what every shard
   # would type again, the lib's and the shared declarations' types, is typed once and comes to each
@@ -1594,7 +1715,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
     var skip: [Bool] = []
     var none: [Bool] = []
     for q in 0..roots.len:
-      skip.push(q in c.pkg_files or q in cached)
+      skip.push(q in c.bd.value.pkg_files or q in cached)
       none.push(false)
     let asg = closure_shards(uord, fcost, impi, user_from, skip, none, nshards)
     for i in 0..uord.len:
@@ -1613,7 +1734,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
   for fx in user_from..roots.len:
     if mine[fx]: want_deps_i(fx, user_from, impi, &want)
   # (packages' declarations: declared by every worker, never checked)
-  for fx, _ in c.pkg_files: want[fx] = true
+  for fx, _ in c.bd.value.pkg_files: want[fx] = true
   var deps_only = 0
   chk.shared_globals(&c, user_from)
   if os.env("VTSC_SHARDS") != "":
@@ -1623,9 +1744,9 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
     eprint("vtsc: worker {shard}: checks {nw} files")
   # (the lines each @ts-expect-error governs: the first after it that isn't blank or a comment)
   for fi in user_from..roots.len:
-    if not (fi in c.t.dirs): continue
+    if not (fi in c.t.value.dirs): continue
     var ds0: [Int] = []
-    for x in c.t.dirs[fi]: ds0.push(x)
+    for x in c.t.value.dirs[fi]: ds0.push(x)
     if ds0.len == 0: continue
     let ls0 = line_starts(srcs[fi])
     var rr: [Int] = []
@@ -1675,18 +1796,18 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
       var first = 1
       if fi > 0: first = roots[fi - 1] + 1
       for x in first..r0:
-        let kx = c.t.nd[x].k
+        let kx = c.t.value.nd[x].k
         if kx == ast.N_BLOCK or bind.scope_kind(kx): bind.scope_names(&c, x)
-        elif kx == ast.N_MODULE and c.t.nd[x].b >= 0 and c.t.nd[c.t.nd[x].b].k == ast.N_LIST: bind.scope_names(&c, c.t.nd[x].b)
+        elif kx == ast.N_MODULE and c.t.value.nd[x].b >= 0 and c.t.value.nd[c.t.value.nd[x].b].k == ast.N_LIST: bind.scope_names(&c, c.t.value.nd[x].b)
     # (and each JSX element's attributes as the object literal it is checked as: nodes added to the
     # tree now, so the tree isn't written while checking)
-    let nd0 = c.t.nd.len
+    let nd0 = c.t.value.nd.len
     for x in 0..nd0:
-      if c.t.nd[x].k == ast.N_JSXELEM: chk.jsx_obj(&c, x)
+      if c.t.value.nd[x].k == ast.N_JSXELEM: chk.jsx_obj(&c, x)
     c.eager_bound = true
     if os.env("VTSC_PHASES") != "": eprint("EAGERBIND {int((os.clock() - teb) * 1000.0)} ms, {types.ct_len(c.ffi, c.hsk)} symbols")
   c.checking_started = true
-  let nd_frozen = c.t.nd.len
+  let nd_frozen = c.t.value.nd.len
   types.freeze_names(&c)
   # (VTSC_PREDECL=1: the type aliases whose declared type starts as a shell, a union, tuple or array
   # alias without type parameters, declared before any file is checked, so a shell is never
@@ -1709,6 +1830,94 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
   for _q in 0..roots.len:
     done.push(false)
     checked0.push(false)
+  # (VTSC_THREADS=N: this worker's files checked by N threads at once, each with its own checker
+  # over the shared tables, tree and binding (types.worker_checker); what they found merged into
+  # this one: ts/NOTES.md, "Checking one program on threads")
+  let nthr = int(os.env("VTSC_THREADS")) else 0
+  if nthr > 1 and not dyn and not warm and nshards <= 1 and c.eager_bound:
+    pi = plan.len
+    var work: [Int] = []
+    for fi in plan:
+      done[fi] = true
+      if mine[fi]:
+        checked0[fi] = true
+        work.push(fi)
+      elif fi in c.bd.value.pkg_files:
+        if bind.is_module(c, roots[fi]): bind.scope_names(&c, roots[fi])
+      else:
+        chk.declare_only(&c, roots[fi])
+        deps_only += 1
+    c.nt_pub_on = true
+    # (what the checker would find lazily by a pass over the whole program, found now)
+    chk.scan_assigns(&c)
+    # (dotted namespaces' levels merged with the members of their names, bind.ns_kid: until every
+    # pair is seen, as merging adds levels)
+    var more = true
+    while more:
+      more = false
+      var pairs: [Int] = []
+      for ns, ks in c.bd.value.ns_kids:
+        for nme, _ in ks:
+          if not ("{ns} {nme}" in c.bd.value.ns_kid_seen):
+            pairs.push(ns)
+            pairs.push(nme)
+      var q = 0
+      while q < pairs.len:
+        bind.ns_kid(&c, pairs[q], pairs[q + 1])
+        more = true
+        q += 2
+    var ss: Shared[[Str]] = share([""])
+    swap(&srcs, &ss.unique)
+    # (VTSC_THREADS_SEQ=1, for debugging: thread k checks every nthr-th file from the k-th, one
+    # thread at a time, each starting when the one before is done)
+    let seq = os.env("VTSC_THREADS_SEQ") == "1"
+    let jobs_ch: Chan[Int] = chan(work.len + 1)
+    if not seq:
+      for fi in work: jobs_ch.send(fi)
+    jobs_ch.close()
+    let res: Chan[WRes] = chan(nthr)
+    let done1: Chan[Int] = chan(nthr)
+    let go: Chan[Int] = chan(1)
+    let go_now: Chan[Int] = chan(1)
+    go_now.close()
+    var stores: [types.Store] = []
+    var wk: [WRes] = []
+    for k in 0..nthr:
+      stores.push(types.cs_new(ffi))
+      var nm2: [Str] = []
+      for x in names: nm2.push(x + "")
+      if seq:
+        let jk: Chan[Int] = chan(work.len + 1)
+        var q = k
+        while q < work.len:
+          jk.send(work[q])
+          q += nthr
+        jk.close()
+        var wc = types.worker_checker(c, ffi, stores[k])
+        let carry = os.env("VTSC_THREADS_CARRY")
+        if carry != "" and wk.len > 0:
+          var cwant: {Str: Bool} = {}
+          for x in carry.split(","): cwant[x] = true
+          types.worker_carry(&wc, wk[wk.len - 1].c, cwant)
+        spawn check_worker(ffi, wc, jk, res, ss.share(), nm2, copy_prog(pg), done1, go_now)
+        let _d1 = done1.recv()?
+        let r1 = res.recv()?
+        wk.push(r1)
+      else: spawn check_worker(ffi, types.worker_checker(c, ffi, stores[k]), jobs_ch, res, ss.share(), nm2, copy_prog(pg), done1, go)
+    if not seq:
+      for k in 0..nthr:
+        let _d = done1.recv()?
+      go.close()
+      for k in 0..nthr:
+        let r = res.recv()?
+        wk.push(r)
+    if os.env("VTSC_RULE_WHY") != "":
+      eprint("NTPUB {c.ntype_pub.len()} CSPUB {c.csig_pub.len()}")
+      for w0 in wk:
+        for q2 in 0..w0.rbad.len: eprint("RULEWHY {names[w0.rbad[q2]]}: {w0.why[q2]}")
+    merge_workers(&c, &wk, work, &out)
+    wk = []
+    swap(&srcs, &ss.unique)
   while true:
     if pi >= plan.len and tickets_done and warm:
       # (the first files checked: now the shards, each the rest of its files)
@@ -1744,7 +1953,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
         out.keep.push(c)
         return out
       var skip2: [Bool] = []
-      for q in 0..roots.len: skip2.push(q in c.pkg_files or q in cached)
+      for q in 0..roots.len: skip2.push(q in c.bd.value.pkg_files or q in cached)
       let asg2 = closure_shards(uord, fcost, impi, user_from, skip2, prefix, nshards)
       for i in 0..uord.len:
         let fx = uord[i]
@@ -1767,7 +1976,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
       for _q in 0..roots.len: want2.push(false)
       for fx in user_from..roots.len:
         if mine[fx] and not prefix[fx]: want_deps_i(fx, user_from, impi, &want2)
-      for fx, _ in c.pkg_files: want2[fx] = true
+      for fx, _ in c.bd.value.pkg_files: want2[fx] = true
       for fi in order0:
         if want2[fi] and not done[fi]: plan.push(fi)
       let sfd = os.env("VTSC_SHARD_FILES")
@@ -1800,7 +2009,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
       gpos.sort()
       for gp in gpos:
         let fi2 = order0[gp]
-        if fi2 == fx or fi2 < user_from or mine[fi2] or declared[fi2] or fi2 in c.pkg_files or fi2 in cached: continue
+        if fi2 == fx or fi2 < user_from or mine[fi2] or declared[fi2] or fi2 in c.bd.value.pkg_files or fi2 in cached: continue
         # (an import later in the order, through a cycle: perhaps this worker's yet, so not
         # declared; its types come as they're asked for)
         if rank_of[fi2] > r: continue
@@ -1828,6 +2037,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
         var an = names[fi] + ""
         if not an.startswith("/") and pg.cwd != "": an = bind.norm_path(pg.cwd + "/" + an)
         if an in pg.lint_files: rl = pg.lint_files[an] + ""
+      if c.debug_file == fi: chk.dump_ntype(c, roots[fi])
       if rl != "" and rl != "[]":
         if not (rl in rcfs): rcfs[rl + ""] = trules.parse_cfg(rl)
         let rcf = rcfs[rl]
@@ -1838,7 +2048,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
         for x in rd:
           out.rdiags.push(trules.copy_diag(x))
           out.rfile.push(fi)
-    elif fi in c.pkg_files:
+    elif fi in c.bd.value.pkg_files:
       # (a package's declarations get their types when something uses them, as tsc's do)
       if bind.is_module(c, roots[fi]): bind.scope_names(&c, roots[fi])
     elif warm and fi >= user_from and not prefix[fi] and not (fi in cached):
@@ -1852,8 +2062,8 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
   if dbg_checked_on: fs.write(os.env("VTSC_SHARD_FILES") + "/checked{shard}.txt", "\n".join(dbg_checked) + "\n") else 0
   chk.flush_kept(&c)
   chk.global_conflicts(&c, user_from)
-  if c.so_check and c.eager_bound and c.t.nd.len != nd_frozen: panic("the tree grew while checking: {nd_frozen} nodes, then {c.t.nd.len}")
-  if c.so_check and c.t.names.len != c.names0: panic("the names table grew while checking: {c.names0} names, then {c.t.names.len}")
+  if c.so_check and c.eager_bound and c.t.value.nd.len != nd_frozen: panic("the tree grew while checking: {nd_frozen} nodes, then {c.t.value.nd.len}")
+  if c.so_check and c.t.value.names.len != c.names0: panic("the names table grew while checking: {c.names0} names, then {c.t.value.names.len}")
   # (a file importing one that isn't checked isn't checked either: decided by the caller, over
   # every worker's files)
   let t3 = os.clock()
@@ -1887,8 +2097,8 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
   var presumed_used: {Int: Bool} = {}
   var unused_dirs: {Int: Int} = {}
   for fi in user_from..roots.len:
-    if not (fi in c.t.dirs): continue
-    let ds = c.t.dirs[fi]
+    if not (fi in c.t.value.dirs): continue
+    let ds = c.t.value.dirs[fi]
     if ds.len == 0: continue
     let ls = line_starts(srcs[fi])
     var m: {Int: Int} = {}
@@ -1927,7 +2137,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
     # (and what its check found in other files)
     var mi = 0
     while mi + 1 < e.marks.len:
-      let y = c.file_index.get(e.marks[mi], -1)
+      let y = c.bd.value.file_index.get(e.marks[mi], -1)
       if y >= 0 and not (y in c.unsupported): c.unsupported[y] = e.marks[mi + 1] + ""
       mi += 2
   for fi, at in deco_dirs: c.unsupported[fi] = "a @ts-expect-error directive over a decorator at {at}"
@@ -1935,28 +2145,28 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
   if not c.exp_deco:
     var dfs: [Int] = []
     var dns: [Int] = []
-    for fi, ds in c.t.deco_files:
+    for fi, ds in c.t.value.deco_files:
       for d in ds:
         if not (d in c.es_deco_ok):
           dfs.push(fi)
           dns.push(d)
     for i in 0..dfs.len:
       let fi = dfs[i]
-      let dpos = c.t.nd[dns[i]].pos
+      let dpos = c.t.value.nd[dns[i]].pos
       # (a file the inferred program only imports: its errors aren't reported, and a decorator
       # doesn't change a class's type)
       if pg.inferred:
         var an2 = names[fi] + ""
         if not an2.startswith("/") and pg.cwd != "": an2 = bind.norm_path(pg.cwd + "/" + an2)
         if not (an2 in pg.lint_files): continue
-      if fi >= user_from and not (fi in c.pkg_files) and not (fi in c.unsupported): c.unsupported[fi] = "a decorator (without experimentalDecorators) at {dpos}"
+      if fi >= user_from and not (fi in c.bd.value.pkg_files) and not (fi in c.unsupported): c.unsupported[fi] = "a decorator (without experimentalDecorators) at {dpos}"
   for fi, at in unused_dirs:
     if not (fi in c.unsupported): c.unsupported[fi] = "a @ts-expect-error directive over a class noUnusedLocals may report at {at}"
   # (a project's own JavaScript, allowJs: checked where it's in the part the checker types as
   # TypeScript types it, as the inferred program's (lvtsc); else not, nor what imports it)
   # (in the inferred program, a JavaScript file it only imports: lvtsc decides for its own files)
   for fi in user_from..names.len:
-    if fi in c.pkg_files or fi in c.unsupported: continue
+    if fi in c.bd.value.pkg_files or fi in c.unsupported: continue
     let fnm = names[fi]
     if pg.inferred:
       var an3 = fnm + ""
@@ -1992,7 +2202,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
     if d.file < user_from and shard != 0: continue
     # as tsc: when any file has a syntax error, only syntax errors are reported
     if pdiags.len > 0: continue
-    if d.file in c.t.nocheck: continue
+    if d.file in c.t.value.nocheck: continue
     if pg.skip_lib and is_dts(names[d.file]): continue
     if d.file in dir_line:
       let hid = hidden_by(srcs[d.file], lstarts[d.file], dir_line[d.file], d.pos)
@@ -2003,8 +2213,8 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
     all_lib.push(d.file < user_from)
   if pdiags.len == 0:
     for fi, m in dir_line:
-      if fi in c.unsupported or fi in c.t.nocheck or not mine[fi]: continue
-      let ds = c.t.dirs[fi]
+      if fi in c.unsupported or fi in c.t.value.nocheck or not mine[fi]: continue
+      let ds = c.t.value.dirs[fi]
       var di = 0
       while di < ds.len:
         if ds[di + 2] == 2 and not (((fi << 32) | ds[di]) in dir_used) and not (((fi << 32) | ds[di]) in presumed_used) and not (((fi << 32) | ds[di]) in c.expect_presumed):
@@ -2040,7 +2250,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
     var bad: {Int: Bool} = {}
     for fx in out.rbad: bad[fx] = true
     for fx in user_from..names.len:
-      if not mine[fx] or ckey[fx] == "" or fx in deco_dirs or fx in unused_dirs or fx in c.t.nocheck: continue
+      if not mine[fx] or ckey[fx] == "" or fx in deco_dirs or fx in unused_dirs or fx in c.t.value.nocheck: continue
       var skip = false
       for pk, _ in presumed_used:
         if (pk >> 32) == fx: skip = true
@@ -2081,20 +2291,20 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
       out.unsup_fi.push(fi)
       out.unsup.push(c.unsupported[fi] + "")
       out.unsup_mine.push(mine[fi])
-      if not (fi in c.pkg_files): out.unsup_user = true
+      if not (fi in c.bd.value.pkg_files): out.unsup_user = true
   out.nsyntax = pdiags.len
   if os.env("VTSC_PHASES") != "": eprint("PHASES shard {shard}/{nshards} {target} {pg.cwd} files {files.len}: read+parse {(t1 - t0) * 1000.0:.0} (parse {tparse * 1000.0:.0}) bind+keys {(t2 - tk0) * 1000.0:.0} check {(t3 - t2) * 1000.0:.0} report {(os.clock() - t3) * 1000.0:.0} ms rel_cache {c.rel_cache.len} rels {c.rel_n} types {types.ct_len(c.ffi, c.htk)} objs {types.cl_rows(c.ffi, c.ho_order)} start {t0} end {os.clock()}; at check start: syms {syms0} of {types.ct_len(c.ffi, c.hsk)}, types {types0}, objs {objs0}, sigs {sigs0} of {types.ct_len(c.ffi, c.hs_node)}; left private: st_tmp {c.st_tmp.len} ({types.st_tmp_typed(c)} typed) dt_tmp {c.dt_tmp.len}")
   if shard == 0:
     out.user_from = user_from
     for fx in order0:
-      if not (fx in c.pkg_files): out.order.push(fx)
+      if not (fx in c.bd.value.pkg_files): out.order.push(fx)
     for fx in 0..names.len:
       out.names.push(names[fx] + "")
-      out.pkgs.push(fx in c.pkg_files)
+      out.pkgs.push(fx in c.bd.value.pkg_files)
     for dl in deps:
       var ix2: [Int] = []
       for d in dl:
-        if d in c.file_index: ix2.push(c.file_index[d])
+        if d in c.bd.value.file_index: ix2.push(c.bd.value.file_index[d])
         else: ix2.push(-1)
       out.deps.push(ix2)
   if c.debug_counts:
@@ -2109,7 +2319,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
         kk = kk / 2
         b += 1
       hist[b] += k0
-      let f0 = c.t.nd[n0].file
+      let f0 = c.t.value.nd[n0].file
       if not (f0 in byfile): byfile[f0] = 0
       byfile[f0] += k0
     eprint("HIST calls from nodes checked 1, 2-3, 4-7, 8-15, 16-31, 32-63, 64+ times: {hist[0]} {hist[1]} {hist[2]} {hist[3]} {hist[4]} {hist[5]} {hist[6]}")
@@ -2124,13 +2334,13 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
       if types.mp_n(c, mp0) > mmax: mmax = types.mp_n(c, mp0)
     eprint("MAPPERS {types.mp_count(c)} entries {msum} max {mmax} compose {c.compose_cache.len()} conds {c.cond_cache.len()}")
     for n0, k0 in c.cond_miss:
-      if k0 > 2000 and n0 > 0: eprint("CMISS {k0} x{c.cond_nmiss[n0]} n{n0} {names[c.t.nd[n0].file]}:{c.t.nd[n0].pos}")
-      if k0 > 1000 and n0 < 0: eprint("CEXPR {k0} n{-n0} {names[c.t.nd[-n0].file]}:{c.t.nd[-n0].pos}")
+      if k0 > 2000 and n0 > 0: eprint("CMISS {k0} x{c.cond_nmiss[n0]} n{n0} {names[c.t.value.nd[n0].file]}:{c.t.value.nd[n0].pos}")
+      if k0 > 1000 and n0 < 0: eprint("CEXPR {k0} n{-n0} {names[c.t.value.nd[-n0].file]}:{c.t.value.nd[-n0].pos}")
     tops.sort(by: fn(a, b) => c.stat_cnt[a] > c.stat_cnt[b])
     var shown = 0
     for n0 in tops:
       if shown < 4000:
-        eprint("CNT {c.stat_cnt[n0]} n{n0} k{c.t.nd[n0].k} {names[c.t.nd[n0].file]}:{c.t.nd[n0].pos}")
+        eprint("CNT {c.stat_cnt[n0]} n{n0} k{c.t.value.nd[n0].k} {names[c.t.value.nd[n0].file]}:{c.t.value.nd[n0].pos}")
         shown += 1
   out.timing = "vtsc: parse {(t1 - t0) * 1000.0:.1} ms, bind {(t2 - t1) * 1000.0:.1} ms, check {(t3 - t2) * 1000.0:.1} ms; {types.ct_len(c.ffi, c.htk)} types, {types.cl_rows(c.ffi, c.ho_order)} objects, {types.ct_len(c.ffi, c.hs_node)} signatures, {types.mp_count(c)} mappers, {types.ct_len(c.ffi, c.hsk)} symbols; memo hit {c.stats[6]} epoch {c.stats[7]} ctx {c.pcount[0]} rm {c.pcount[1]} loop {c.pcount[2]} narrow {c.pcount[3]}; not kept: diags {c.pcount[4]} bodies {c.pcount[5]}; stats {c.stats[0]} {c.stats[1]} {c.stats[2]} {c.stats[3]} {c.stats[4]} {c.stats[5]} sred {c.stats[8]} {c.stats[9]}"
   out.ok = true
@@ -2650,7 +2860,11 @@ fn check_conf(fs: Fs, os: Os, ffi: Ffi, cf: Conf, pg0: Prog, target: Str, lib: S
     return
   let ph = os.env("VTSC_PHASES") != ""
   let tq0 = os.clock()
-  let outs = run_all(fs, os, ffi, cf.files, lib, target, pg, jobs1, fm, km) else []
+  var outs: [Out] = []
+  match run_all(fs, os, ffi, cf.files, lib, target, pg, jobs1, fm, km):
+    ok(o0): outs = o0
+    err(e0):
+      if os.env("VTSC_PHASES") != "": eprint("CONF failed: {e0}")
   if outs.len == 0:
     p.err = "the checker failed"
     return
@@ -3530,17 +3744,17 @@ fn jsdoc_attach1(var t: ast.Ast, src: Str, fi: Int, first: Int, root: Int, var k
 fn predeclare_shells(os: Os, var c: types.C):
   let t0 = os.clock()
   var n = 0
-  for x in 0..c.t.nd.len:
-    if c.t.nd[x].k != ast.N_TYPEALIAS or c.t.nd[x].a >= 0: continue
-    var body = c.t.nd[x].b
-    while body >= 0 and c.t.nd[body].k == ast.N_TPAREN: body = c.t.nd[body].a
+  for x in 0..c.t.value.nd.len:
+    if c.t.value.nd[x].k != ast.N_TYPEALIAS or c.t.value.nd[x].a >= 0: continue
+    var body = c.t.value.nd[x].b
+    while body >= 0 and c.t.value.nd[body].k == ast.N_TPAREN: body = c.t.value.nd[body].a
     if body < 0: continue
-    let bk = c.t.nd[body].k
+    let bk = c.t.value.nd[body].k
     if bk != ast.N_TUNION and bk != ast.N_TTUPLE and bk != ast.N_TARRAY: continue
-    let s = bind.lookup_type(&c, x, c.t.nd[x].s)
+    let s = bind.lookup_type(&c, x, c.t.value.nd[x].s)
     if s < 0 or types.ct_at(c.ffi, c.hsdecl, s) != x: continue
     let saved = c.node_file
-    c.node_file = c.t.nd[x].file
+    c.node_file = c.t.value.nd[x].file
     bind.declared_type(&c, s)
     c.node_file = saved
     n += 1

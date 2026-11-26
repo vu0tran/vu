@@ -962,11 +962,12 @@ What it takes, decided:
      on existing types, the objects' members, `nsym`. The audit below has what's converted, what's
      private to its maker, and what's left.)
   4. `C` split as above, the workers as tasks behind a switch (VTSC_THREADS=N), the files taken
-     from a channel as the forked shards' dynamic order takes them.
+     from a channel as the forked shards' dynamic order takes them. (First version 2026-11-25:
+     "Checking one program on threads: the first threaded check", below.)
   5. Determinism: ids then depend on interleaving inside a file's check (M2 covered only the file
      order); union members are ordered by compareTypes with the id as the last tie-break. The gate
      is 1, 2, 4 and 8 threads, 20 runs each, byte-identical, and TSan (CC=clang `vu build --tsan`).
-- No program has been checked on several threads yet. Before steps 1-4, a threaded run would share
+- (Until 2026-11-25's step 4 no program had been checked on several threads.) Before steps 1-4, a threaded run would share
   half the state (types made by one worker, their attributes in another's maps) and print wrong
   types: a crash or a wrong answer, not a measurement. Steps 2 and 3 are the large ones (about 250
   fill sites, step 3's table above, and some 40 attribute maps).
@@ -1178,6 +1179,120 @@ the comments: a cache whose value is a type made fresh belongs in the identity g
 With the caches kept between runs (`$XDG_CACHE_HOME/vlint`: the vtsc file cache, the tsconfig
 cache, the module records; 261 MB for the job), the CI job's pattern takes 33.9 s and 214 cpu-s
 against oxlint's 74-76 s, outputs identical; the run that fills them 81.6 s.
+
+### Checking one program on threads: the first threaded check (2026-11-25)
+
+`VTSC_THREADS=N` (with VTSC_PREDECL=1 and VTSC_OFILL=1; VTSC_EAGER_BIND is on by default) checks
+the files of a program that one checker would check in-process (vtsc's one job, vlint's
+`VLINT_VTSC_SERIAL=1 VTSC_JOBS=1`) on N threads at once. Off by default; the forked shards stay
+vlint's default, and a program checked by shards (nshards > 1) isn't threaded.
+
+What it took:
+- The language: `s.unique` (SPEC "Shared values"), a Shared value's value writable while it has
+  no other handle, checked where it's used (a panic otherwise). So the tree and binding are one
+  `Shared` field each from the start, written while binding (`c.t.unique`, `c.bd.unique`: jsx_obj's
+  nodes, name_id before the names are frozen, binding's maps) and read everywhere as `.value`
+  (`c.t.value.nd[x]`, 7,700 sites; `c.bd.value.parent[x]` and the rest, about 700). A worker
+  writing one of them while others hold handles stops with that panic, which is how the binding
+  maps written while checking were found (below). Serial cost: +0.8% instructions for the tree,
+  +0.7% for binding (idx 31 and 52).
+- `types.Bnd`: binding's maps that are complete before the check (scopes' names and types,
+  parents, files and roots, ambient modules, CommonJS and package facts, the dotted namespaces'
+  levels). Each worker's own instead (copied when it starts): `globals` (a UMD global is added when
+  first looked up), the modules' exports (`mexports`, `mtexports`, `mexp_order`, `export_eq`, made
+  when a module is first imported: ensure_exports), `umd_pending`, `class_at`.
+- Before the threads start (tsprog.run_libs): the plan's files that aren't checked declared,
+  `scan_assigns` (a pass over the whole program the checker made lazily), and every dotted
+  namespace level merged with its name's member (bind.ns_kid, which adds declarations to shared
+  symbols), until every pair is seen.
+- `types.worker_checker` (made by `ts/gen_worker.py` from C's fields: rerun it after changing
+  them): the main checker's columns as views (`ho_mine` the worker's own, in a store of its own),
+  its SharedMaps, tree and binding as more handles, its settings, and a copy of every other map and
+  list as the main checker has them when the workers start; the diagnostics' lists empty.
+- Facts a maker finds about the rows it makes, read by other workers, moved to columns: a namespace
+  import's module file (`hy_nsfile`, was `ns_file`: vtests' ns-import-missing-member), an object
+  that mentions no type parameters (`ho_concrete`, was `concrete_objs`: without it a worker typed
+  a mapped type's lazy members, vtests' mapped-unknown-spread-ctx).
+- Readers of published words with acquire loads (TSan's first reports: plain reads of a declared
+  type another worker published, then of its object's columns): `types.dty`, `sty`, `cx_at`, and
+  every read of `ho_resolved`. The same instruction count on arm64 (ldar for ldr).
+- `fresh_of` read the next type row's columns to tell a literal made with its fresh copy (mk2);
+  with workers that row may be another's, not written yet (`ct_at` out of range): read with
+  `ct_get0`.
+- The rules read the checked types of their file's nodes (`ntype`, `call_sig`, trules.type_at).
+  A fill by one worker types another file's nodes (an initializer typed for its symbol's type);
+  that file's worker then finds the symbol's type published and doesn't type them again, so its
+  rules found them unchecked ("a rule's type of an expression not checked": 373 of idx 86's 2,696
+  files not linted on 2 threads, with only 2 diagnostics of the output missing). Now
+  (`types.nt_put`, `cs_put`, under `nt_pub_on`) a type or call signature found outside speculation
+  for a node of another file than the one being checked is published (`ntype_pub`, `csig_pub`,
+  first wins); each worker checks all its files first, then, once every worker has, takes its
+  files' published entries it lacks (`chk.nt_import`) and runs their rules; `type_at` looks there
+  last too.
+- The merge (tsprog.merge_workers): each worker's diagnostics in the order of the files whose
+  check made them (as one checker checking the files in order has them; one made by two workers'
+  fills is dropped by the program's merge, which keeps one per file, position, code and message),
+  the rules' diagnostics by file in the plan's order, `unsupported` by union (the shorter reason
+  when two workers found different ones), `marks`, `deco_checked`, `es_deco_ok`, `value_refs`,
+  `expect_presumed`, `class_at`, `decl_files` by union.
+- Debugging: `VTSC_THREADS_SEQ=1` runs the threads one after another, thread k checking every N-th
+  file from the k-th (a mismatch then isn't a race but state one worker has and another lacks);
+  `VTSC_THREADS_CARRY=a,b,...` (with SEQ) starts each thread with those maps of the thread before,
+  so removing names while the output stays right (a ddmin over the 200 map fields, the session's
+  scratch `m15/ddmin.py`) names the state that matters: it found `concrete_objs`, then `ntype` and
+  `call_sig`. `VTSC_DFILE` dumps the file's typed nodes before its rules, `VTSC_RULE_WHY` why each
+  file's rules didn't run, and VTSC_PHASES a failed program's error ("CONF failed").
+- Compare more than the output: a file the checker or its rules gave up on prints nothing, so the
+  output can match while hundreds of files went unlinted. VLINT_VTSC_DEBUG=2's "N of M files
+  checked, K linted" and its NOLINT lines are part of each comparison below.
+
+Results (each threaded run against that round's run on one checker, the same switches: the
+output, the "checked, linted" lines and the NOLINT files; `m15/matrix.sh`, load 19-24 on 10
+cores; wall s / cpu s / G instructions / the check phase in s):
+
+| idx (files) | one checker | 2 threads | 4 | 8 | all identical |
+|---|---|---|---|---|---|
+| 59 (14,449) | 27.7 / 29.5 / 181.0 / 23.3 | 18.6 / 33.9 / 195.5 / 14.4 | 13.6 / 40.8 / 210.1 / 9.2 | 11.2 / 53.1 / 221.8 / 6.8 | yes |
+| 86 (2,710) | 15.6 / 16.2 / 98.9 / 13.8 | 10.2 / 19.0 / 105.1 / 8.5 | 7.2 / 23.4 / 110.6 / 5.5 | 6.5 / 35.4 / 118.4 / 4.8 | yes |
+| 52 (5,108) | 7.4 / 8.6 / 62.5 / 5.8 | 5.1 / 9.4 / 64.7 / 3.4 | 3.7 / 10.1 / 65.8 / 2.0 | 3.1 / 11.8 / 67.7 / 1.4 | yes |
+| 31 (1,439) | 6.8 / 7.1 / 53.2 / 5.6 | 4.5 / 7.7 / 56.4 / 3.4 | 3.4 / 8.9 / 59.7 / 2.3 | 2.9 / 11.6 / 64.6 / 1.8 | yes |
+
+One round each so far. The check phase scales to 3.4x (idx 59) and 4.1x (idx 52) on 8 threads;
+the work grows with the threads (instructions +8% on 2 threads, +16% on 4, +23% on 8 for idx
+59): what each worker makes again (its own fills of what another worker is filling, the copies
+of the maps, the losers' rows) and the spinning of idle threads (cpu grows faster than
+instructions). With the switches off the serial check is +0.5 / +0.7 / +0.7 / +0.4% instructions
+on idx 59 / 86 / 52 / 31 (179.2 / 98.2 / 62.3 / 52.1 G against 178.3 / 97.5 / 61.9 / 51.9).
+
+On the way (each found by a run above, fixed): 3 vtests differed on 2 threads (ns_file,
+concrete_objs, and evolving-array-push-decl by timing); idx 86 lost two rule diagnostics and 373 files' rules (the node types); idx 59
+lost the no-unsafe-enum-assignment diagnostics of 5-7 files (the same); idx 31 gained wrong ones
+from published types of initializers another worker typed first (check_var_decl's recheck); a
+`ct_at` out of range (fresh_of's next row).
+
+Still wrong or not known:
+- A crash 1 run in 6 on idx 59 with 8 threads (before the last fixes; not seen in 8 runs of a
+  `--profile` build since): `ct_at` at index -1 under rel.structural (an id read as -1, an
+  unfinished value another worker published, by the look of it). Not found.
+- TSan (`CC=clang vu build --tsan vtsc.vu`, the session's scratch `m15/tsan_vt.sh`: every vtest
+  with 2 or more files and the projects, 4 threads, exit codes counted): 344 cases, 2 with reports,
+  both an object's members written where another worker reads them: resolve_decl's `ho_sidx`
+  against index_type, add_members' `hsflags` against check_access (the members written in place,
+  not into the fill's own row, in some path not found yet). Two whole programs (idx 31's and 86's)
+  under TSan on 4 threads: no reports, the output identical. vlint itself can't run under TSan
+  here: its par loops need OpenMP, Apple's clang has none, and Homebrew's clang 19 builds one that
+  segfaults before main (exit 139): counted as not run.
+- vtests (813 cases, `m15/vtt.sh`): on 2 and 8 threads and in the SEQ mode on 4 the same as one
+  checker (the 3 known failures). Before the recheck in check_var_decl, evolving-array-push-decl
+  was wrong in 3 of 12 runs on 2 threads; 12 of 12 right since.
+- Once (idx 59, 2 threads, before the two phases), a small program of the invocation failed
+  ("the checker failed": run_all's error, now printed under VTSC_PHASES); not seen again.
+- Determinism (step 5): the outputs above came out the same in every run compared, but nothing
+  makes them so; `noshow_t` and the `touch` of a file (which file is unsupported) depend on
+  timing.
+- Not yet: the job itself (threads for vlint's own programs in place of the forked shards, with
+  the main checker's own pre-check work and the copy per worker measured), N chosen from the
+  program's size, idle threads not spinning.
 
 ## Keeping the caches in CI
 

@@ -290,7 +290,8 @@ static inline int64_t cx_get(void *h, int64_t k, int64_t d) {
   return v == 0 ? d : v - CX_OFF;
 }
 static inline int64_t cx_at(void *h, int64_t k) {
-  int64_t v = ct_get0(h, k);
+  const int64_t *p = h;
+  int64_t v = (uint64_t)k >= (uint64_t)ct_len0(p) ? 0 : __atomic_load_n(&p[k], __ATOMIC_ACQUIRE);
   if (v == 0) vu_panic(0, "cx_at: no value for that row", 28);
   return v - CX_OFF;
 }
