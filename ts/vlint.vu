@@ -2221,12 +2221,37 @@ type BRes:
   out: Str
   err: Str
 
-fn bjob(fs: Fs, os: Os, ffi: Ffi, own i: Int, own av: [Str], own rq: Chan[ljs.RegReq], own gate: Chan[Int], own done: Chan[BRes]):
-  let _t = gate.recv() else 0
+fn bjob(fs: Fs, os: Os, ffi: Ffi, own i: Int, own av: [Str], own rq: Chan[ljs.RegReq], own done: Chan[BRes]):
+  let tr = os.env("VLINT_BATCH_TRACE") != ""
+  if tr: eprint("vlint batch: run {i} starts at {os.clock()}")
   var sk = Sink(direct: false, out: [], err: [], bat: true, rq: rq.share())
   let code = run_main(fs, os, ffi, av, &sk)
-  gate.send(1)
-  done.send(BRes(i, code, "".join(sk.out), "".join(sk.err)))
+  if tr: eprint("vlint batch: run {i} ends at {os.clock()}")
+  let r = BRes(i, code, "".join(sk.out), "".join(sk.err))
+  # (the run's memory given back: malloc keeps what a run freed, and the batch goes on; a run of
+  # 6,194 files left about 15 MB more resident each time without this)
+  lcache.release_memory(ffi)
+  done.send(r)
+
+# A run's size, for the order: the files its paths hold (as the walk finds them, with the ignore
+# patterns it's given and the .gitignore files below its paths; -1 for arguments that don't parse)
+fn bsize(fs: Fs, ffi: Ffi, own i: Int, own av: [Str], own ch: Chan[Int]):
+  var n = -1
+  match parse_args(av):
+    ok(a):
+      let cwd = lcache.cwd(ffi)
+      var w = Walker([], lglob.gi_new(cwd), not a.no_ignore, a.ignore_path)
+      for p in a.ignore_patterns: lglob.gi_add(&w.over, p)
+      var files: [Str] = []
+      var roots: [Str] = []
+      for p in a.paths: roots.push(abs_path(cwd, p))
+      if a.paths.len == 0: roots.push(cwd + "")
+      for r in roots:
+        if fs.exists(r + "/"): walk(fs, ffi, r, &w, &files)
+        elif fs.exists(r): files.push(r + "")
+      n = files.len
+    err(_e): n = -1
+  ch.send(i * 1000000000 + n + 1)
 
 fn batch_err(msg: Str) -> Int:
   eprint("vlint --batch: " + msg)
@@ -2266,13 +2291,35 @@ fn batch(fs: Fs, os: Os, ffi: Ffi, av: [Str]) -> Int:
   if k < 1: k = 1
   let rq: Chan[ljs.RegReq] = chan(64)
   spawn ljs.reg_serve(fs, os, ffi, rq.share(), ncpu)
-  let gate: Chan[Int] = chan(k + 1)
-  for _g in 0..k: gate.send(1)
+  # (the largest runs first, so that the last ones to start are short: in the plan's order the CI
+  # job's 4-second run started 27 s in and ended the batch 4 s after the rest; VLINT_BATCH_ORDER=plan
+  # keeps the plan's)
+  var order: [Int] = []
+  for i in 0..n: order.push(i)
+  if os.env("VLINT_BATCH_ORDER") != "plan" and n > 1:
+    let sc: Chan[Int] = chan(n + 1)
+    for i in 0..n:
+      var cp: [Str] = []
+      for x in argvs[i]: cp.push(x + "")
+      spawn bsize(fs, ffi, i, cp, sc.share())
+    var size = [0] * n
+    for _j in 0..n:
+      let v = sc.recv() else break
+      size[v / 1000000000] = v % 1000000000 - 1
+    # (by size, larger first; the plan's order among equals)
+    var keyed: [Int] = []
+    for i in 0..n: keyed.push((1000000000 - 1 - size[i] - 1) * 100000 + i)
+    keyed.sort()
+    order = []
+    for x in keyed: order.push(x % 100000)
   let done: Chan[BRes] = chan(n + 1)
-  for i in 0..n:
+  var started = 0
+  while started < n and started < k:
+    let i = order[started]
     var argv: [Str] = []
     swap(&argv, &argvs[i])
-    spawn bjob(fs, os, ffi, i, argv, rq.share(), gate.share(), done.share())
+    spawn bjob(fs, os, ffi, i, argv, rq.share(), done.share())
+    started += 1
   # (each run's output once it and the runs before it are done)
   var got: [BRes] = []
   var have = [false] * n
@@ -2281,6 +2328,12 @@ fn batch(fs: Fs, os: Os, ffi: Ffi, av: [Str]) -> Int:
   var worst = 0
   for _j in 0..n:
     var r = done.recv() else break
+    if started < n:
+      let si = order[started]
+      var argv: [Str] = []
+      swap(&argv, &argvs[si])
+      spawn bjob(fs, os, ffi, si, argv, rq.share(), done.share())
+      started += 1
     let ri = r.i
     if r.code > worst: worst = r.code
     swap(&got[ri], &r)
