@@ -302,6 +302,20 @@ static inline int64_t *cl_rp(cl_t *h, int64_t r) {
   return &h->row[2 * r];
 }
 static inline int64_t cl_len(void *p, int64_t r) { return cl_rp(p, r)[1]; }
+// A row's offset may carry CL_CAP: its list was written by cl_add into a reservation of cl_cap(n)
+// entries (a power of two, at least 4), so it grows in place while it fits, the row's own; else a
+// list that ends the pool's reserved part grows there (a compare-and-swap), and otherwise it's
+// written again into twice the room. (Without the doubling, a list that other tasks' reservations
+// keep from ending the pool was copied whole at every add: quadratic, and with 8 threads a pool ran
+// out of its 2^28 entries.) A shorter list (cl_pop) keeps its reservation, which is at least cl_cap
+// of its length, so the in-place test stays safe.
+#define CL_CAP ((int64_t)1 << 62)
+static inline int64_t cl_off(const int64_t *rp) { return rp[0] & (CL_CAP - 1); }
+static inline int64_t cl_cap(int64_t n) {
+  int64_t c = 4;
+  while (c < n) c <<= 1;
+  return c;
+}
 // a new row (an empty list) of a list column that numbers its own rows (a fetch-add on the row
 // region's reservation counter, which nothing else uses): its index
 static inline int64_t cl_row(void *p) {
@@ -314,13 +328,13 @@ static inline int64_t cl_at(void *p, int64_t r, int64_t i) {
   cl_t *h = p;
   const int64_t *rp = cl_rp(h, r);
   if (__builtin_expect((uint64_t)i >= (uint64_t)rp[1], 0)) vu_panic(0, "cl_at: index out of range", 25);
-  return h->pool[rp[0] + i];
+  return h->pool[cl_off(rp) + i];
 }
 static inline void cl_put(void *p, int64_t r, int64_t i, int64_t v) {
   cl_t *h = p;
   const int64_t *rp = cl_rp(h, r);
   if ((uint64_t)i >= (uint64_t)rp[1]) vu_panic(0, "cl_put: index out of range", 26);
-  h->pool[rp[0] + i] = v;
+  h->pool[cl_off(rp) + i] = v;
 }
 // n entries of the pool reserved (a fetch-add on its reservation counter): where they start
 static inline int64_t cl_res(cl_t *h, int64_t n) {
@@ -334,15 +348,20 @@ static inline int64_t cl_res(cl_t *h, int64_t n) {
 static inline void cl_add(void *p, int64_t r, int64_t v) {
   cl_t *h = p;
   int64_t *rp = cl_rp(h, r);
-  int64_t off = rp[0], n = rp[1], end = off + n;
-  if (n > 0 && __atomic_compare_exchange_n(&h->pool[-1], &end, end + 1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+  int64_t off = cl_off(rp), n = rp[1], end = off + n;
+  if ((rp[0] & CL_CAP) && n + 1 <= cl_cap(n)) {
+    h->pool[end] = v;
+  } else if (n > 0 && __atomic_compare_exchange_n(&h->pool[-1], &end, end + 1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
     if (end + 1 > CT_MAX) vu_panic(0, "cl: a list pool is full", 23);
     h->pool[end] = v;
+    rp[0] = off;
   } else {
-    int64_t at = cl_res(h, n + 1);
+    // (a first entry gets room for itself alone, as most lists stay that short)
+    int64_t c = n == 0 ? 1 : cl_cap(2 * n);
+    int64_t at = cl_res(h, c);
     for (int64_t i = 0; i < n; i++) h->pool[at + i] = h->pool[off + i];
     h->pool[at + n] = v;
-    rp[0] = at;
+    rp[0] = n == 0 ? at : (at | CL_CAP);
   }
   rp[1] = n + 1;
 }
@@ -363,12 +382,12 @@ static inline void cl_fill(void *p, int64_t r, int64_t *out, int64_t n) {
   cl_t *h = p;
   const int64_t *rp = cl_rp(h, r);
   if (n > rp[1]) n = rp[1];
-  for (int64_t i = 0; i < n; i++) out[i] = h->pool[rp[0] + i];
+  for (int64_t i = 0; i < n; i++) out[i] = h->pool[cl_off(rp) + i];
 }
 static inline bool cl_has(void *p, int64_t r, int64_t v) {
   cl_t *h = p;
   const int64_t *rp = cl_rp(h, r);
-  const int64_t *xs = &h->pool[rp[0]];
+  const int64_t *xs = &h->pool[cl_off(rp)];
   for (int64_t i = 0; i < rp[1]; i++)
     if (xs[i] == v) return true;
   return false;
