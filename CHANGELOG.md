@@ -3400,3 +3400,12 @@ ASan and UBSan runs of every test were clean. Not run: the full gate (it needs L
 static linking, /proc), ThreadSanitizer and the arm64 suite. On macOS: targeted 818 of 818, modules
 54 of 54 and json 97 of 97 (both with leak checks off), fmt, tests, debug and cli (but `--static`) passed; selfhost passed
 but the 20,000-term expression that crashes Apple's clang with the old compiler too.
+
+**vtsc's syntax tree in Int32 fields (2026-11-26).** All ten of `ts/ast.vu`'s `Node` fields are
+`Int32` now (its kind, offsets within a file, node and list indexes, interned names, flags up to
+2^21, the file's index): 40 bytes a node, was 80; no field access had to change. On the CI job's
+pattern (176 outputs, 2 at a time) the outputs are identical and the job's peak tree RSS went 5.8 ->
+5.1 GB. Its largest invocation alone, as the job runs it: peak 5.57 -> 4.51 GB; checked serially in
+vlint's process: max RSS 3.78 -> 3.25 GB, instructions 150.75 -> 150.95 G (the stores' checks). The
+next largest: 3.66 -> 3.15 GB, 2.77 -> 2.29 GB, 87.50 -> 88.02 G. vtsc's probes and vtests are
+unchanged (one measurement each, on a loaded machine).
