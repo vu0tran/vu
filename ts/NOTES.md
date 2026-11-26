@@ -2332,6 +2332,144 @@ The job, two rounds alternated with oxlint 1.79 and 1b5bfa73 (load 11-15): HEAD 
 walls summed 85.0 -> 74.5 s; idx 86, the last, 4.97 -> 3.58 s (it starts at 35.4 s instead of
 39.9), 59 9.25 -> 8.13, 29 2.73 -> 1.77, 76 3.12 -> 2.18, 37 2.31 -> 1.68.
 
+### The lib's typed state: what a build-time snapshot would save (measured 2026-11-26, night)
+
+The question: how much of the cold job is work that is the same in every invocation (the TypeScript
+lib files read, parsed, bound and typed), so it could be done at vlint's build time and loaded at
+start, as the JS host's V8 snapshot is; and, for comparison only, the same for packages' declarations
+(@types/node, @types/react...), which differ by version per repo (a per-repo cache: rejected, not
+to be built).
+
+How it was measured (the session's scratch `m33/`): `VTSC_LIBM=1` (below) on the 88 serial
+type-aware runs (ins_ta.sh's setting: plain rules off, one checker in vlint's process; `libm.sh`),
+with `VTSC_PPARSE=0` so reading and parsing are on the checking thread too; `ana3.py` the table and
+the wall model. Instructions are the checking thread's own (`thread_selfcounts`, as Instruments
+reads them; the process's counter took in vlint's other threads during the read). Load 2-16 on 10
+cores from other work.
+
+`VTSC_LIBM=1` (tsprog.libm_report, bind.lm_push; off, the job's outputs, probes and vtests as
+5612c6af's, serial instructions idx 31/52/86/59 within 0.4% of it):
+- a LIBM line per program: the lib files, the thread's instructions at each step (start, the lib
+  files done, before and after link_parents, the globals declared, bind done, EAGERBIND's start
+  and its first user file, before and after the warm-up below, the check's end), the lib files'
+  share of declare_globals, and rows by origin (symbols, typed symbols, objects, types: none, the
+  user's, the lib's, packages'), the lib symbols merged with a package's declarations or the user's;
+  `VTSC_LIBM=2` lists those (LIBMERGED).
+- the check's time by the origin of what it types: declared_type, type_of_sym and ensure_resolved
+  (typing a declaration; a lazy member's type, instantiated or combined, counts as instantiating) and
+  instantiate and inst_sig (instantiating) each enter the category of where the symbol, type or
+  signature is declared, and the time until they return is charged to the innermost category
+  entered (a clock read only where the category changes). Lib instantiations whose mapper maps only
+  to primitives, literals and the lib's own types are a category of their own (LM_LIB_INSTL: what a
+  snapshot could hold). Wall time, so the shares, not the seconds, are what to read; checked against
+  /usr/bin/sample: the typing functions are 49 / 78 / 78% of idx 59 / 86 / 25's check samples, the
+  timer's categories 38 / 66 / 72% of the same checks (a sample in a typing function
+  counts its calls into other categories too; the timer leaves them out).
+- `VTSC_LIBM_WARM=1`: every lib declaration typed before the check (declared types, values' types,
+  a declared or anonymous object's members' types), as a typed snapshot would have them; 2: the
+  packages' declarations too. The check's instructions after it, against without, are what such a
+  snapshot would save in the check (outputs identical with and without, all 88).
+
+Per invocation (G instructions of the checking thread, summed over its programs; w1 / w2 the check's
+saving with the lib / lib and packages warmed; s the serial seconds saved at 0.149 s per G, the 88
+serial checks' own rate):
+| idx | programs | files | lib parse | lib bind | lib decl | lib inst | inst, lib args | w1 | pkg parse | pkg bind | pkg decl | pkg inst | w2 | check | s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 2 | 1 | 166 | 0.023 | 0.030 | 0.004 | 0.000 | 0.000 | 0.008 | 0.119 | 0.029 | 0.004 | 0.000 | 0.009 | 0.024 | 0.008 |
+| 13 | 1 | 1,426 | 0.019 | 0.029 | 0.148 | 0.096 | 0.004 | 0.146 | 1.08 | 0.175 | 0.188 | 0.447 | 0.584 | 1.34 | 0.013 |
+| 25 | 1 | 1,710 | 0.205 | 0.031 | 0.076 | 0.471 | 0.025 | 0.060 | 1.66 | 0.211 | 0.194 | 0.532 | 1.03 | 2.42 | 0.037 |
+| 41 | 2 | 1,750 | 0.360 | 0.057 | 0.053 | 0.055 | 0.002 | 0.052 | 1.21 | 0.176 | 0.129 | 0.065 | 0.213 | 0.563 | 0.064 |
+| 64 | 2 | 1,613 | 0.058 | 0.058 | 0.235 | 0.721 | 0.026 | 0.141 | 0.933 | 0.210 | 0.547 | 2.06 | 0.937 | 9.95 | 0.023 |
+| 80 | 2 | 1,634 | 0.188 | 0.057 | 0.083 | 0.703 | 0.018 | 0.032 | 0.502 | 0.088 | 0.264 | 1.85 | 0.130 | 9.49 | 0.038 |
+| 16 | 1 | 6,773 | 0.046 | 0.029 | 0.183 | 1.42 | 0.147 | 0.075 | 0.308 | 0.430 | 1.02 | 2.25 | 3.75 | 6.34 | 0.014 |
+| 31 | 2 | 6,194 | 0.370 | 0.059 | 0.543 | 1.81 | 0.270 | 0.164 | 2.83 | 0.403 | 1.19 | 3.78 | 2.61 | 21.6 | 0.070 |
+| 52 | 1 | 6,137 | 0.045 | 0.029 | 0.440 | 1.15 | 0.042 | 0.070 | 0.063 | 0.108 | 0.328 | 1.16 | 0.531 | 32.9 | 0.014 |
+| 76 | 1 | 6,887 | 0.021 | 0.030 | 0.737 | 3.11 | 0.133 | 0.179 | 2.68 | 0.361 | 0.882 | 5.55 | 3.01 | 20.8 | 0.014 |
+| 14 | 9 | 1,823 | 0.568 | 0.259 | 1.03 | 1.11 | 0.054 | 0.565 | 3.25 | 0.700 | 0.976 | 4.37 | 1.25 | 27.1 | 0.144 |
+| 81 | 3 | 3,193 | 0.390 | 0.085 | 0.307 | 1.22 | 0.084 | 0.153 | 1.29 | 0.382 | 0.772 | 1.77 | 1.22 | 14.1 | 0.076 |
+| 86 | 2 | 5,476 | 0.226 | 0.058 | 0.439 | 6.02 | 0.189 | 0.085 | 0.372 | 0.206 | 0.755 | 24.6 | 3.22 | 72.6 | 0.046 |
+| 59 | 3 | 17,523 | 0.367 | 0.103 | 1.01 | 5.98 | 0.232 | 0.325 | 0.318 | 0.507 | 1.88 | 8.62 | 3.05 | 99.4 | 0.076 |
+| all 88 | 123 | | 10.7 | 3.4 | 11.2 | 51.1 | 3.4 | 5.3 | 68.9 | 16.5 | 30.2 | 104.8 | 66.8 | 546.4 | 2.3-2.6 |
+(files: the program's, the packages' declarations and lib files included; lib parse, each program's
+lib step: finding the lib files and their references and adding their trees, parsed once per run,
+0.01-0.2 G and 1-40 ms a pass; pkg parse and bind: the read+parse and binding split by the packages' share
+of the nodes.)
+
+So, of the 88 serial runs' 942 G instructions (546 G of them the checks):
+- the lib's reading, parsing and binding: 14.1 G (1.5%);
+- typing the lib's declarations in the check: 11.2 G by the timer (2.1% of the checks), of which
+  warming the whole lib first took 5.3 G off (1.0%); the warm-up itself cost 19.4 G (0.16 G a
+  program: typing all of the lib is cheap; a program uses a small part of it);
+- instantiating the lib's generics (Array, Promise, the DOM's, Partial and the other aliases): 51.1
+  G (9.3%), nearly all with the program's own types as arguments (3.4 G with lib types alone): not
+  the same in another program;
+- packages' declarations, for comparison: reading, parsing and binding 85.4 G (9.1%); typing them
+  30.2 G and instantiating them 104.8 G (5.5% and 19.2% of the checks); warming every package's
+  declarations took 66.8 G off the checks but cost 508 G itself.
+
+What's the same in every invocation:
+- the lib set: 23 different sets in the job's 123 programs (target, lib and the DOM libs; 47 to 94
+  files each), the five most common covering 85 programs; a set grows during a run when a package
+  names a lib it doesn't have (43 restarts: dom.iterable, esnext.disposable, es2025.float16,
+  webworker), so the set is known only after the files are read.
+- the options that change the lib's types: strictNullChecks off in 2 programs, exactOptionalPropertyTypes
+  on in 5: a snapshot per (set, these).
+- merging: 109 of the 123 programs have packages' declarations merging into lib symbols (19,133 in
+  all, up to 306 a program: the DOM's HTML*Element, Element, Document, Event and its init dictionaries,
+  Blob, AbortController, ErrorConstructor, ImportMeta, ...), and 21 have their own files merging into
+  1-123 (declare global). A merged interface's members, and every interface inheriting from it (all
+  the HTML*Element interfaces from HTMLElement), are those of the program, so their typed state
+  isn't reusable as it is: kept lazy in the snapshot and filled per program, with everything made
+  from their members (instantiations, keyof, the relation and instantiation caches' entries) left
+  out of it too. Of the 1.0% the warm-up saved, that leaves less, by an amount not measured.
+
+The wall model (`ana3.py`): each invocation's saving, the lib's parse and bind on the main thread
+plus the check's lib saving over its threads (4, or 8 for the 14,449-file program), capped at its
+type-aware part beyond its linting (ph_base's critical path: 59, 16, 21, 23, 53 bound by the
+linting gain nothing), scaled to the job's walls, then sim.py's two lanes on j_base's walls: the
+job 48.9 -> 47.5 s with the warm-up's saving, 47.4 s with the timer's (the walls summed 92.0 ->
+89.6 / 89.2). That is before loading the snapshot, which costs back part of the parse it replaces
+(below). About 1.4 s, 3%, at best.
+
+A snapshot, sketched (to judge the cost; not built):
+- what: the lib files' trees and names (the prefix of the program's tree and names table: the lib
+  files come first, so their nodes, names, files and bound symbols keep their ids, and the user's
+  are appended after), their binding (globals, gtypes, scopes, bd's tables for those files), and
+  the checker's rows made while typing them: ctab.h's columns and list pools, the property hashes,
+  the interned lists (ik) and strings (ns), the mappers, and the SharedMaps and Vu maps the typing
+  fills (the instantiation, union, alias and conditional caches; about 510 fields of C to audit, as
+  for the threads). Types, objects and signatures made lazily get the snapshot's ids 0..K and the
+  program's start after them, so nothing is remapped; what the program adds to a lib row (a merged
+  declaration in hy_more, a lazy member typed) is written over the loaded copy.
+- merging: after the program's files are bound, every lib symbol a package or user file merges
+  into, and every interface inheriting from one, has its fill and declared type reset to lazy; the
+  snapshot must not hold anything computed from those members, so it's built with the commonly
+  merged symbols (the DOM element and event interfaces, ErrorConstructor, ...) never filled, and a
+  table of which rows read which symbol's members, to drop more at load when a program merges
+  into another.
+- size: per program the lib is 24-184 k nodes (40 bytes each: up to 7 MB), about 52 k symbols in use
+  (62 k with the whole lib typed), 3-5 k objects, 5-7 k types, with the names, lists and
+  property tables some 15-25 MB a set; the five common sets about 100 MB in the executable.
+- threads, VTSC_PREDECL and OFILL: the loaded rows are published state (ho_resolved set, dty and
+  sty filled), read-only for every worker as published rows are now; predeclare_shells skips the
+  lib's aliases already declared; OFILL never claims a filled row. Forked shards would share the
+  mapped pages.
+- loading: ctab.h's columns could be mapped as they are, but the tree, names and binding are Vu
+  lists and maps, built again from a serialized form at each start (the 6-7 MB of nodes copied, the
+  maps rehashed): about what the lib step costs now (1-40 ms a pass), so the parse and bind
+  part, 1.5% of the instructions, would mostly be spent again loading.
+- effort: a serializer for ctab.h's tables (days), one for the tree, names and binding (a week), the
+  checker's maps and caches audited and saved field by field (two to three weeks, as the threads'
+  audit was), the merged-symbol invalidation and its checks (VTSC_GRAFT=check-style: every program
+  checked with and without the snapshot, identical), a build step per lib set: five to eight weeks.
+
+Not built: the reusable work is 1.5% (parse and bind, mostly spent again on loading) plus at most 1-2%
+(the lib's typing, less what merging leaves lazy) of the type-aware instructions, about 1.4 s of the
+job's 49 at best, for weeks of work and a second copy of the checker's state to keep in step. The
+lib's instantiations with the program's types (9.3% of the checks) and the packages' declarations
+(9% of the instructions to read and bind, 25% of the checks to type and instantiate) are where the
+time is, and neither is the same from one invocation to the next.
+
 ## Keeping the caches in CI
 
 What a CI job can keep between runs is one folder: `$XDG_CACHE_HOME/vlint` (`~/.cache/vlint`
