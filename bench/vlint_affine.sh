@@ -90,10 +90,20 @@ r=dict(name=name,wall=wall,user=float(t.get('User time (seconds)',0)),sys=float(
 print(f"{name:22} wall {wall:7.2f} s  cpu {cpu:8.2f} s  maxrss {rss:6} MB  tree peak {peak//1024:6} MB  diagnostics {n:6}  exit {p.returncode}", flush=True)
 open(log,'a').write(json.dumps(r)+'\n')
 P
+# AFFiNE's config sets options.typeAware: the plain mode runs with a copy without it (swapped in
+# before each run), the type-aware mode with the config as it is and --type-aware
+cp .oxlintrc.json $W/rc-ta.json
+python3 -c '
+import json,sys
+c=json.load(open(sys.argv[1])); o=c.get("options") or {}; o.pop("typeAware",None); o.pop("typeCheck",None)
+if o: c["options"]=o
+else: c.pop("options",None)
+json.dump(c,open(sys.argv[2],"w"),indent=2)' $W/rc-ta.json $W/rc-plain.json
 CL=$W/cache   # vlint's cache, emptied before each run (cold)
 run() { # NAME MODE(plain|ta) OUTFILE
   local name=$1 mode=$2 o=$3 ta="" env="XDG_CACHE_HOME=$CL"
   [ $mode = ta ] && ta=--type-aware
+  cp $W/rc-$mode.json .oxlintrc.json
   rm -rf $CL; mkdir -p $CL
   case $name in
     vlint-new) python3 $W/tm.py "$name $mode" $o $OUT/runs.jsonl "$env" $NEW --threads=$P $ta -f json ;;
@@ -102,9 +112,9 @@ run() { # NAME MODE(plain|ta) OUTFILE
   esac
 }
 TOOLS="oxlint-1.90.0 vlint-new vlint-old oxlint-1.79.0"
-echo "== warm-up (each tool and mode once: the page cache, node's first start; not counted)"
+echo "== warm-up (each tool once, type-aware: the page cache, node's first start; not counted)"
 : > $OUT/runs.jsonl
-for m in plain ta; do for t in $TOOLS; do run $t $m $W/warm.json; tail -c 600 $W/warm.json.err | tail -3; done; done
+for m in ta; do for t in $TOOLS; do run $t $m $W/warm.json; tail -c 600 $W/warm.json.err | tail -3; done; done
 mv $OUT/runs.jsonl $OUT/warmup.jsonl
 echo "== three rounds, alternated"
 for i in 1 2 3; do for m in plain ta; do for t in $TOOLS; do run $t $m $OUT/$t-$m-$i.json; done; done; done
@@ -131,16 +141,30 @@ for t in ['vlint-new','vlint-old','oxlint-1.90.0','oxlint-1.79.0']:
         print(t,m,"runs identical:", all(x==k[0] for x in k))
 P
 
+echo "== why vtsc doesn't fully type files (the new build, VLINT_VTSC_DEBUG=2)"
+cp $W/rc-ta.json .oxlintrc.json; rm -rf $CL; mkdir -p $CL
+XDG_CACHE_HOME=$CL VLINT_VTSC_DEBUG=2 timeout 900 $NEW --threads=$P --type-aware -f json > /dev/null 2> $W/vtsc-debug.txt
+gzip -c $W/vtsc-debug.txt > $OUT/vtsc-debug.txt.gz
+grep -oE 'vtsc: (NOLINT|RULEWHY)' $W/vtsc-debug.txt | sort | uniq -c
+grep -c 'NOLINT .*(type errors)' $W/vtsc-debug.txt | sed 's/^/NOLINT for type errors: /'
+grep 'NOLINT' $W/vtsc-debug.txt | head -5
+
 if [ -n "$PERFBIN" ] && command -v perf >/dev/null && perf --version >/dev/null 2>&1; then
   echo "== perf: the new build (frame pointers, -g) type-aware, cold"
-  rm -rf $CL; mkdir -p $CL
-  XDG_CACHE_HOME=$CL perf record -F 999 -g -o $W/perf.data -- $PERFBIN --threads=$P --type-aware -f json > $W/perf-out.json 2> $OUT/perf-record.txt \
-    || XDG_CACHE_HOME=$CL perf record -e cpu-clock -F 999 -g -o $W/perf.data -- $PERFBIN --threads=$P --type-aware -f json > $W/perf-out.json 2>> $OUT/perf-record.txt
-  tail -5 $OUT/perf-record.txt
-  perf report -i $W/perf.data --stdio --no-children -g none --sort sym --percent-limit 0.05 2>/dev/null | grep -v '^#' | grep -v '^$' | head -40 > $OUT/perf-top40-self.txt
-  perf report -i $W/perf.data --stdio --no-children -g none --sort comm,dso 2>/dev/null | grep -v '^#' | grep -v '^$' | head -30 > $OUT/perf-by-dso.txt
-  perf report -i $W/perf.data --stdio --children -g none --sort sym --percent-limit 0.5 2>/dev/null | grep -v '^#' | grep -v '^$' | head -60 > $OUT/perf-top-inclusive.txt
-  perf script -i $W/perf.data 2>/dev/null | python3 -c '
+  cp $W/rc-ta.json .oxlintrc.json; rm -rf $CL; mkdir -p $CL
+  XDG_CACHE_HOME=$CL perf record -F 499 -g -o $W/perf.data -- $PERFBIN --threads=$P --type-aware -f json > $W/perf-out.json 2> $OUT/perf-record.txt
+  echo "exit $? (vlint exits 1 with errors)"
+  if ! grep -q "Captured and wrote" $OUT/perf-record.txt; then
+    rm -rf $CL; mkdir -p $CL
+    XDG_CACHE_HOME=$CL perf record -e cpu-clock -F 499 -g -o $W/perf.data -- $PERFBIN --threads=$P --type-aware -f json > $W/perf-out.json 2>> $OUT/perf-record.txt
+  fi
+  grep -E "perf record|event" $OUT/perf-record.txt
+  R="timeout 900 perf report -i $W/perf.data --stdio"
+  $R --no-children -g none --sort sym --percent-limit 0.05 2>/dev/null | grep -v '^#' | grep -v '^$' | head -40 > $OUT/perf-top40-self.txt
+  $R --no-children -g none --comm vlint-perf --sort sym --percent-limit 0.01 2>/dev/null | grep -v '^#' | grep -v '^$' | head -40 > $OUT/perf-top40-self-vlint.txt
+  $R --no-children -g none --sort comm,dso 2>/dev/null | grep -v '^#' | grep -v '^$' | head -30 > $OUT/perf-by-dso.txt
+  $R --children --comm vlint-perf -g none --sort sym --percent-limit 0.5 2>/dev/null | grep -v '^#' | grep -v '^$' | head -60 > $OUT/perf-top-inclusive-vlint.txt
+  timeout 1500 perf script -i $W/perf.data 2>/dev/null | python3 -c '
 import sys,collections
 c=collections.Counter(); comm=None; fr=[]
 def flush():
@@ -158,7 +182,8 @@ for l in sys.stdin:
 flush()
 for k,v in c.most_common(): print(k,v)
 ' | gzip > $OUT/perf-folded.txt.gz
-  echo "self time, top 40:"; cat $OUT/perf-top40-self.txt; echo "by command and object:"; cat $OUT/perf-by-dso.txt
+  ls -l $OUT/perf-*
+  echo "self time, top 40:"; cat $OUT/perf-top40-self.txt; echo "vlint's own process, self, top 40:"; cat $OUT/perf-top40-self-vlint.txt; echo "by command and object:"; cat $OUT/perf-by-dso.txt
 else
   echo "== perf: not available, skipped" | tee $OUT/perf-skipped.txt
 fi
