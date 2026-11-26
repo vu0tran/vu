@@ -2093,7 +2093,8 @@ cores, with other work on the machine.
 The question: could the React Compiler package's JS rules (about 34 of node's cpu-s in the job, its
 invocation about 7 s of wall) run on rc_*.vu instead of in node, with the same output? Not yet: the
 native port is a different compiler, and on the job's own files the two disagree on 80 of the 121
-files where either reports anything. Nothing was routed.
+files where either reports anything. Byte-identical output was then dropped as a requirement: the
+next section routes the rules anyway, and sorts the differences by kind.
 
 What loads the rules: four invocations (three packages) list `{ "name": "react-hooks-js",
 "specifier": "eslint-plugin-react-hooks" }` in `jsPlugins`, all resolving to 7.1.1, its
@@ -2158,6 +2159,94 @@ a package named eslint-plugin-react-hooks at exactly the version ported; only th
 `react-hooks-js(...)` (the entry's name) with the plugin's messages and severity mapping;
 directives matched by that name; and node still started for the invocation's other JS plugins
 (every invocation of this job has the monorepo's local plugin, so node starts anyway).
+
+### eslint-plugin-react-hooks' compiler rules on the native React Compiler (2026-11-26, night)
+
+The rules now run natively when the plugin is 7.x, whatever 7.1.1 itself would print: what's asked
+is that they catch what the rules are meant to catch, not 7.1.1's output (its bugs included).
+
+How it's wired:
+- ljs.vu: `load_plugin` reads the package's name and version (`resolve_plugin`); for
+  eslint-plugin-react-hooks 7.x each rule gets its native category (`rh_cat`, rmore10.rule_ids'
+  order; -1 for the 8 the port lacks: preserve-manual-memoization, memoized-effect-dependencies,
+  config, gating, fbt, component-hook-factories, and the non-compiler rules-of-hooks and
+  exhaustive-deps) in `Meta.xnat`. For exactly 7.1.1 under an alias, `try_defer` registers its 29
+  rule names (`rh_rules`) without loading it in node; `vlint.vu needs_deferred` loads it after all
+  (`load_deferred`, its ruleNames checked against `rh_rules`) only when some configuration turns on
+  one of its rules that doesn't run natively. Rules in the host are numbered by registration, so a
+  rule's host id is kept apart (`Meta.xhost`) and requests and the options' setup translate.
+- A rule runs natively when it has a category and no options or `{}` (`runs_native`; its only
+  option is the compiler's configuration, which the port doesn't take). vlint.vu splits each file's
+  JS rules: those for node in the usual entry, the native ones ("category id severity") in a 7th
+  entry after the options (rmore.extra now counts 7), which rules.vu puts in `L.rcx`.
+- rmore10.vu compiles a file when either kind is on and keeps each diagnostic for the aliased rules
+  of its category (`C10.xd`); rules.vu `rc_alias_pass` reports them where the JS rules' diagnostics
+  go (after the native ones, before node's answers, as the plugin reports from `create`), in the
+  file's rule order, under the configuration's name (`react-hooks-js(purity)`), with that rule's
+  severity, the port's message and help, and directives matched by that name as for any JS rule
+  (`dirs_contain`: a directive naming `react-hooks-js/purity` is used by it, and unused ones are
+  reported as for JS rules). As before for every native rule, a directive naming any plugin's
+  `purity` also disables vlint's own `react/purity`, as oxlint matches them; `react/purity` doesn't
+  disable `react-hooks-js/purity`.
+- Suppressions as 7.1.1 has them: with validateExhaustiveMemoizationDependencies and
+  validateHooksUsage on (its lint's defaults), 7.1.1 looks for no eslint suppressions at all, so a
+  function with `eslint-disable-next-line react-hooks/exhaustive-deps` is still checked. The port
+  (oxc's, an older rule) skips such a function and reports rule-suppression. For the aliased rules
+  `rc_prog.lint` now takes `supp`: 2 (only aliased rules on) doesn't look, 1 (both kinds on) gives
+  the suppression's diagnostic to the react/ rules only and the function's compile to the aliased
+  ones only (`Diag.only`). On the job this found refs that the port had skipped, in a function
+  whose suppression was for exhaustive-deps.
+- Off: `VLINT_NATIVE_REACT_HOOKS=0`, or `"settings": {"vlint": {"nativeReactHooks": false}}` in the
+  configuration that lists the plugin (read when it's loaded; settings are free-form in oxlint, so
+  the file stays valid for it).
+- Tests: `ts/rh_native_test.sh VLINT PLUGIN_DIR` (needs an installed 7.1.1; fake 6.1.0 and 7.2.0
+  packages are made in its temporary folder), 9 cases: the names, severities, directives and
+  unused directives with no node process; react/purity alongside; a lacking rule
+  (rules-of-hooks) in node with the rest native; both opt-outs; options in node, `{}` native; 6.x
+  in node; 7.2.0's names from node with purity native.
+
+What's left different from 7.1.1, by kind (the job's 1,781 files, directives defaced, every rule
+on; counts are diagnostics, JS 139, native 187):
+
+| native catches, 7.1.1 doesn't | count | kind |
+|---|---|---|
+| `new Date()` in render (purity) | 6 | a later compiler's: the port's impure list has the Date constructor |
+| exhaustive-effect-dependencies | 26 | a later compiler's: 7.1.1 ships it off (`eprh_enableExhaustiveEffectDependenciesCompilerLint = 'off'`), the rule exists and never reports |
+| refs after `a?.['k']` | 1 | 7.1.1's bug: its invariant on a string-keyed optional member ends the compile before refs are checked |
+| refs: a ref passed inside an object to a call in render | 1 | a later compiler's |
+| refs, memo-dependencies at another span (the same finding) | 2 | presentation |
+| todo: throw inside try | 23 | the port's gap: 7.1.1 lowers it, the port bails, so those functions aren't checked at all |
+| todo: try/finally, try without catch at another span or wording, more of them | 48 vs 35 | presentation (neither supports them) |
+
+| 7.1.1 catches, native doesn't | count | kind |
+|---|---|---|
+| invariant: `a?.['k']`, "Expected value kind to be initialized" | 15 | 7.1.1's bugs |
+| todo: `??=` | 1 | 7.1.1's gap (the port compiles it) |
+| memo-dependencies: a local of the callback (a self-referencing arrow, a `let` set in a nested function, a `setTimeout` id) said to be missing | 3 | 7.1.1's false positives |
+| memo-dependencies in a function the port bails out of (a try without catch, a finally) | 2 | the port's gap: 7.1.1 records a lowering Todo and goes on validating; the port stops at the first |
+| memo-dependencies at another place in the same list, refs at another span | 1, 1 | presentation (the native-only rows above are their other halves) |
+| preserve-manual-memoization | 1 | not ported (stays in node) |
+| refs in a function with an exhaustive-deps suppression (with directives kept) | 2 | the port's (it skipped the function): fixed, see Suppressions |
+
+Not fixed, and why: throw inside try and going on after a lowering Todo are the two places where
+7.1.1 checks more than the port, both structural in rc_lower/rc_prog (the port's error handling is
+oxc's, which stops at the first error); the rest are 7.1.1's bugs or a later compiler's checks.
+Messages are the port's (oxc's wording, no code frame and no absolute path).
+
+On the job (176 outputs against m3w/j_base, two at a time): 174 identical. Idx 31 (5 rules as
+errors) gains 6 purity errors (`new Date()`) and 1 refs error (after a `?.['k']`); idx 23 (22
+rules) 1 exhaustive-effect-dependencies error (in a function with a `react-hooks/exhaustive-deps`
+suppression: 7.1.1 checks it and has the rule off) and 1 refs error (a ref passed in an object to a
+call in render; the line has a `react/refs` directive, which oxlint's native rule also needed).
+Idx 16 (14 rules as warnings, `--quiet`) and 24 (the plugin loaded, no rule on for its files)
+print the same. Idx 23 still starts node for the plugin (it turns on preserve-manual-memoization,
+config, gating, fbt and memoized-effect-dependencies), and every invocation starts node for the
+monorepo's local plugin, so the saving is the compile: idx 31 alone (warm host cache, three runs
+each, load about 7 from other work) 9.0-9.2 s and 35.2-35.7 cpu-s -> 1.56-1.58 s and 8.8-8.9
+cpu-s, the output as above. The whole job, two rounds alternated (load 7-16 from other work):
+this build 38.4 and 37.9 s, 263 and 260 cpu-s, peak tree RSS 4.8 and 4.9 GB; 5bba0523 43.0 and 42.2 s,
+290 and 292 cpu-s, 5.0 and 4.9 GB; oxlint 1.79 85.1 and 85.1 s, 503 and 509 cpu-s, 9.1 and 9.0 GB. Every
+run of this build gave the same 176 outputs (the two above changed), 5bba0523's all as j_base.
 
 ### The checker's threads and its hot paths on the CI job's pattern (measured 2026-11-26, later still)
 

@@ -686,8 +686,22 @@ with severities and options, `categories`, `plugins`, `env`/`globals` (globals r
 `denyWarnings`, `maxWarnings`, `reportUnusedDisableDirectives`, `respectEslintDisableDirectives`),
 JSON errors as serde words them. `oxlint.config.ts` is reported as needing a JavaScript runtime.
 `jsPlugins` (in the config and in overrides): run in Node as oxlint runs them (see "JS plugins"
-below). Ignore files: `.gitignore` (and the folders above, up
+below), except eslint-plugin-react-hooks 7.x's compiler rules, which vlint runs on its own React
+Compiler (below). Ignore files: `.gitignore` (and the folders above, up
 to the repository root, and `.git/info/exclude`), `.eslintignore`/`--ignore-path`.
+
+**eslint-plugin-react-hooks on the native React Compiler.** When `jsPlugins` loads
+eslint-plugin-react-hooks 7.x under an alias (`{ "name": "react-hooks-js", "specifier":
+"eslint-plugin-react-hooks" }`), each of its compiler rules that vlint's React Compiler port has
+(`purity`, `refs`, `immutability`, `set-state-in-effect`... 21 of its 29) runs natively, reported
+under the configuration's own name (`react-hooks-js(purity)`) with its severity, and disabled by
+directives that name it, unused ones reported as such. The rest (`preserve-manual-memoization`,
+`config`, `gating`, `fbt`, `memoized-effect-dependencies`, `component-hook-factories`,
+`rules-of-hooks`, `exhaustive-deps`) and any rule given options other than `{}` stay in node;
+with 7.1.1 and none of those on, node isn't started for the plugin at all. The messages are the port's, not the plugin's (no code frame), and
+the port is oxc's port of a later compiler, so the findings differ from 7.1.1's (ts/NOTES.md has
+them by kind). `VLINT_NATIVE_REACT_HOOKS=0`, or `"settings": { "vlint": { "nativeReactHooks":
+false } }` in the configuration, runs the plugin in node as before.
 
 **JS plugins** (`ljs.vu`, `ljs_glue.c`, `jsplug/`): vlint runs ESLint-style plugins with
 oxlint 1.90.0's own plugin runtime (its `dist`, MIT, embedded by `jsplug/gen_host.py` into
