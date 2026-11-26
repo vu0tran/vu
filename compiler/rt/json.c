@@ -139,6 +139,15 @@ static bool vu_jdec_Byte(vu_jp *j, uint8_t *out) {
     *out = (uint8_t)v;
     return true;
 }
+/* An Int32 field's value, read into an Int. */
+static bool vu_jdec_I32(vu_jp *j, int64_t *out) {
+    const uint8_t *a = j->p;
+    int64_t v;
+    if (!vu_jdec_Int(j, &v)) return false;
+    if (v != (int64_t)(int32_t)v) { j->p = a; vu_jws(j); return vu_jfail(j, "expected a number from -2147483648 to 2147483647"); }
+    *out = v;
+    return true;
+}
 static bool vu_jdec_Float(vu_jp *j, double *out) {
     const uint8_t *a;
     bool whole;

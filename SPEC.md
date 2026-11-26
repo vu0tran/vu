@@ -44,6 +44,7 @@ fn main():
 | `Float` | 64-bit IEEE float |
 | `Bool` | `true` / `false` |
 | `Byte` | 0..255, one byte in memory. Literals: `65`, `0x41` or `'A'`. Overflow stops the program. |
+| `Int32` | a struct field's type only: an `Int` kept in 4 bytes (see below) |
 | `Str` | an owned string of bytes: `s.len`, `s[i]` (a Byte), `s[a..b]` (a new Str), `+`, `+=`, `== <`, `s.reserve(n)` |
 | `[T]` | growable list: `xs.len`, `xs.push(v)`, `xs.pop()` (removes and returns the last element; stops the program if empty), `xs.truncate(n)` (keeps the first n), `xs.copy_within(to, from, n)` (as memmove; plain values only), `xs[i]` (bounds-checked), `xs[a..b]` (a slice, below), `xs.reserve(n)` |
 | `T?` | optional: either a `T` or `nil` (`Int?`, `Str?`, `[T]?`, a struct or enum...; not a capability or another optional). Recursive types must use it (or a list or map). Read it with `if x = opt:` or `opt else default` (see Errors). |
@@ -68,6 +69,24 @@ type Opts:
 
 let a = Opts(name: "a")          # limit 10, tags [] (each construction gets its own list)
 let b = Opts("b", 20)            # positional: fields with defaults can be left off the end
+```
+
+A struct field declared `Int32` holds an `Int` from -2147483648 to 2147483647 in 4 bytes instead of
+8, for structs kept by the million. Reading it gives an `Int`; storing into it (construction, `=`,
+`+=` and the rest, `from_json`) checks the range and stops the program when the value doesn't fit,
+in release builds too, as a Byte's range is checked (an out-of-range literal is a compile error, and
+`from_json` fails instead). It can't be passed with `&` (to a `var` parameter or `swap`), since it
+isn't an Int's 8 bytes: copy it into a variable and store it back. `Int32` is only a struct field's
+type: not a variable's, parameter's, list element's or enum variant's.
+
+```
+type Node:
+  k, pos, end: Int32               # 12 bytes, not 24
+  name: Str
+
+var n = Node(1, 0, 10, "x")
+n.end += 5                         # read as an Int, the sum checked to fit as it's stored
+let len = n.end - n.pos            # an Int
 ```
 
 A default is a constant: a literal, a const, `[]`, `{}`, `nil`, a list or map of those, or a struct
