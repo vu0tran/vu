@@ -780,6 +780,7 @@ type FSrc:
   ok: Bool
   text: Str
   specs: [Str] = []   # its import("x") types' specifiers (import_type_specs), found once too
+  t: ast.Ast = ast.Ast([], [], [], [], [], [], {}, {}, {}, ast.Sev([], [], 0, false, false), 0)   # (a lib file's entry, lib_key) its tree, parsed once for every program
 
 fn read_fsrc(fs: Fs, p: Str) -> FSrc:
   let t = fs.read(p) else return FSrc(false, "")
@@ -808,6 +809,7 @@ type PJob:
   json: Bool
   facts: Bool = false    # a program's file (not a lib file): its FFacts too
   in_pkg: Bool = false   # a package's file (when queued)
+  lib: Bool = false      # a lib file: parsed once for the run (lib_tree)
 
 # A file parsed ahead on its own tree (ast.append_file adds it to the program's), with its source.
 # ok false: its text read as "" (unread, or empty): run_libs reads and parses it itself.
@@ -818,6 +820,7 @@ type PRes:
   ds: [parse.Diag]
   src: Str
   fx: FFacts = FFacts()
+  lib: Str = ""          # a lib file's: its tree is fm's, under this lib_key
 
 # What run_libs reads of a file's own tree, found where it's parsed (file_facts), with the tree's own
 # node ids (its first node 1): run_libs adds the nodes before it.
@@ -888,17 +891,27 @@ fn file_facts(var f: ast.Ast, src: Str, fi: Int, path: Str, in_pkg: Bool, var kw
   return fx
 
 # The merging task (run_libs): the files' trees, in order, added to t, which it sends back at the end.
-fn pmerge(own t0: ast.Ast, own inq: Chan[PRes], own outq: Chan[ast.Ast]):
+fn pmerge(own t0: ast.Ast, own inq: Chan[PRes], own outq: Chan[ast.Ast], own fm: Memo[Str, FSrc]):
   var t = t0
   while true:
     var r = inq.recv() else break
-    ast.append_file(&t, &r.t)
+    if r.lib != "":
+      let lv = fm.get(r.lib, fn(k) => FSrc(false, ""))
+      ast.append_file(&t, lv.value.t)
+    else: ast.append_file_own(&t, &r.t)
   outq.send(t)
 
 fn pparse(fs: Fs, own fm: Memo[Str, FSrc], own jobs: Chan[PJob], own res: Chan[PRes]):
   var kw = scan.keywords()
   while true:
     let j = jobs.recv() else return
+    if j.lib:
+      let lk = lib_key(j.fi, j.path)
+      let lv = fm.get(lk, fn(k) => lib_tree(fs, fm, k))
+      var lr = PRes(j.fi, lv.value.ok, ast.blank(), [], "")
+      lr.lib = lk
+      res.send(lr)
+      continue
     var src = read_shared(fs, fm, j.path)
     if src == "":
       res.send(PRes(j.fi, false, ast.blank(), [], ""))
@@ -924,6 +937,23 @@ fn pp_take(res: Chan[PRes], var got: [PRes], var have: [Bool], base: Int, fi: In
   var out = PRes(fi, false, ast.blank(), [], "")
   swap(&out, &got[fi - base])
   return out
+
+# A lib file parsed once for all of a run's programs that have it at the same place (fi): its tree in
+# fm under lib_key (its text under its path, as any file's). (A program's libs differ by its target
+# and the libs its files reference; most of a run's have the same.)
+fn lib_key(fi: Int, path: Str) -> Str:
+  return "\0{fi}\0" + path
+
+fn lib_tree(fs: Fs, fm: Memo[Str, FSrc], key: Str) -> FSrc:
+  let at = key.find("\0", 1)
+  let fi = int(key[1..at]) else 0
+  let path = key[at + 1..key.len]
+  let src = read_shared(fs, fm, path)
+  if src == "": return FSrc(false, "")
+  var kw = scan.keywords()
+  var t = ast.new_ast()
+  parse.parse_file(&t, src + "", fi, &kw)
+  return FSrc(true, "", [], t)
 
 fn read_shared(fs: Fs, fm: Memo[Str, FSrc], p: Str) -> Str:
   let v = fm.get(p, fn(k) => read_fsrc(fs, k))
@@ -1341,7 +1371,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
   elif ppe != "" and ppe != "check": pp_n = int(ppe) else 4
   let pp_on = nshards0 <= 1 and pp_n > 0
   let pp_chk = pp_on and ppe == "check" and not grafting
-  let pp_w = 256
+  let pp_w = int(os.env("VTSC_PPW")) else 256
   let pjq: Chan[PJob] = chan(1024)
   let prq: Chan[PRes] = chan(1024)
   var pgot: [PRes] = []
@@ -1357,37 +1387,48 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
   # until the files are read; nn and nl: t's nodes and list items by then. A grafting pass adds
   # its lib files to t here: the graft needs t)
   let mg_on = not grafting and nshards0 <= 1
-  let mq: Chan[PRes] = chan(1024)
+  let mq: Chan[PRes] = chan(int(os.env("VTSC_MQ")) else 1024)
   let mback: Chan[ast.Ast] = chan(1)
   var nn = t.nd.len
   var nl = t.L.len
   if mg_on:
     var tm = ast.blank()
     swap(&tm, &t)
-    spawn pmerge(tm, mq.share(), mback.share())
+    spawn pmerge(tm, mq.share(), mback.share(), fm.share())
   for path in libs:
     let fi = srcs.len
     if pp_on:
       while pp_sent < libs.len and pp_sent + 1 < fi + pp_w:
-        pjq.send(PJob(1 + pp_sent, libs[pp_sent] + "", false, false))
+        pjq.send(PJob(fi: 1 + pp_sent, path: libs[pp_sent] + "", jsx: false, json: false, lib: true))
         pp_sent += 1
     var src = ""
     var pr = PRes(fi, false, ast.blank(), [], "")
     if pp_on: pr = pp_take(prq, &pgot, &phave, 1, fi)
-    if pr.ok: swap(&src, &pr.src)
     else:
+      let lk0 = lib_key(fi, path)
+      let lv0 = fm.get(lk0, fn(k) => lib_tree(fs, fm, k))
+      pr.ok = lv0.value.ok
+      pr.lib = lk0
+    if pr.ok:
+      src = read_shared(fs, fm, path)
+      let lv = fm.get(pr.lib, fn(k) => FSrc(false, ""))
+      nn += lv.value.t.nd.len - 1
+      nl += lv.value.t.L.len
+      if not mg_on: ast.append_file(&t, lv.value.t)
+    else:
+      # (unread through fm: read here, parsed for this program alone)
       src = read_shared(fs, fm, path)
       if src == "": src = fs.read(path)?
       pr = PRes(fi, true, ast.new_ast(), [], "")
       parse.parse_file(&pr.t, src + "", fi, &kw)
+      nn += pr.t.nd.len - 1
+      nl += pr.t.L.len
+      if not mg_on: ast.append_file(&t, pr.t)
     if pp_chk: parse.parse_file(&tsh, src + "", fi, &kw2)
     srcs.push(src)
     names.push(path + "")
-    nn += pr.t.nd.len - 1
-    nl += pr.t.L.len
     roots.push(nn - 1)
     if mg_on: mq.send(pr)
-    else: ast.append_file(&t, &pr.t)
   let tlib = os.clock() - t0
   let user_from = srcs.len
   let u1 = nn
@@ -1607,7 +1648,7 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
     nl += pr.t.L.len
     let tm0 = os.clock()
     if mg_on: mq.send(pr)
-    else: ast.append_file(&t, &pr.t)
+    else: ast.append_file(&t, pr.t)
     tmg += os.clock() - tm0
     tparse += os.clock() - tp0
     # (a package's syntax errors aren't reported: tsc reports them, but they'd hide every other error)
