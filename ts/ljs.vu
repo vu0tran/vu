@@ -35,7 +35,7 @@ type Js:
   orule: [Int]        # and the rule each is for
   oid: {Str: Int}     # "rule\toptions" -> id
   nhost: Int = 0      # the rules the host has registered (a rule's host id: lmeta.Meta.xhost)
-  deferred: [Str] = []  # plugins whose rules all run natively, not loaded in node (yet): "path\tload request\tfirst rule id"
+  deferred: [Str] = []  # plugins whose rules run natively, not loaded in node (yet): "path\tload request\tfirst rule id\tkind" (try_defer)
 
 fn new_js() -> Js:
   return Js(false, [], {}, ["[]"], [0], {})
@@ -205,23 +205,34 @@ fn resolve_plugin(fs: Fs, ffi: Ffi, dir: Str, spec: Str, var pkg: [Str]) -> Str:
   if found == "": return ""
   let real = lcache.realpath(ffi, found)
   if real != "": found = real
-  if not (spec.startswith(".") or spec.startswith("/")):
-    # the package's name: the package.json nearest to the file
-    var d = lconf.dir_of(found)
-    while d != "":
-      let txt = fs.read(d + "/package.json") else ""
-      if txt != "":
-        let pj = lconf.parse_json(txt)
-        let nm = lconf.get(pj, 0, "name")
-        if nm >= 0 and pj.v[nm].k == lconf.J_STR:
-          pkg.push(pj.v[nm].s + "")
-          let vv = lconf.get(pj, 0, "version")
-          if vv >= 0 and pj.v[vv].k == lconf.J_STR: pkg.push(pj.v[vv].s + "")
-          else: pkg.push("")
-        break
-      if d == "/": break
-      d = lconf.dir_of(d)
+  # (the package's name, for a package specifier: it names the plugin)
+  if not (spec.startswith(".") or spec.startswith("/")): pkg = package_of(fs, found)
   return found
+
+# The name and version in the package.json nearest to a file ([] none)
+fn package_of(fs: Fs, file: Str) -> [Str]:
+  var d = lconf.dir_of(file)
+  while d != "":
+    let txt = fs.read(d + "/package.json") else ""
+    if txt != "":
+      let pj = lconf.parse_json(txt)
+      let nm = lconf.get(pj, 0, "name")
+      if nm >= 0 and pj.v[nm].k == lconf.J_STR:
+        let vv = lconf.get(pj, 0, "version")
+        if vv >= 0 and pj.v[vv].k == lconf.J_STR: return [pj.v[nm].s + "", pj.v[vv].s + ""]
+        return [pj.v[nm].s + "", ""]
+      return []
+    if d == "/": break
+    d = lconf.dir_of(d)
+  return []
+
+# The package a plugin file is the entry of, for its kind (np_kind): a path specifier's too
+fn kind_package(fs: Fs, path: Str, pkg: [Str]) -> [Str]:
+  if pkg.len > 0:
+    var c: [Str] = []
+    for x in pkg: c.push(x + "")
+    return c
+  return package_of(fs, path)
 
 fn file_url(p: Str) -> Str:
   var b: [Byte] = []
@@ -238,12 +249,12 @@ fn file_url(p: Str) -> Str:
   return b.take_str()
 
 # Loads a plugin (once per file): "" or the message of oxlint's "Failed to load JS plugin" error
-fn load_plugin(fs: Fs, ffi: Ffi, var js: Js, var m: lmeta.Meta, dir: Str, spec: Str, alias: Str, nat: Bool) -> Str:
+fn load_plugin(fs: Fs, ffi: Ffi, var js: Js, var m: lmeta.Meta, dir: Str, spec: Str, alias: Str, mask: Int) -> Str:
   var pkg: [Str] = []
   let path = resolve_plugin(fs, ffi, dir, spec, &pkg)
   if path == "": return "Cannot find module '{spec}'"
   if path in js.paths: return ""
-  let rh = nat and rh_package(pkg)
+  let kd = native_kind(kind_package(fs, path, pkg), mask)
   var name = ""
   var has_name = false
   if alias != "":
@@ -279,8 +290,9 @@ fn load_plugin(fs: Fs, ffi: Ffi, var js: Js, var m: lmeta.Meta, dir: Str, spec: 
     m.xrid[full] = m.xname.len
     m.xname.push(full)
     var cat = -1
-    if rh: cat = rh_cat(res.v[r].s)
+    if kd >= 0: cat = np_cat(kd, res.v[r].s)
     set_x(&m, m.xname.len - 1, js.nhost, cat)
+    if kd == 2: m.xsite[full] = report_site(fs, path, res.v[r].s)
     js.nhost += 1
   m.xplug[pname] = true
   js.paths[path] = true
@@ -303,78 +315,163 @@ fn xhost_of(m: lmeta.Meta, id: Int) -> Int:
   if id < 0 or id >= m.xhost.len: return id
   return m.xhost[id]
 
-# ---- eslint-plugin-react-hooks' compiler rules on vlint's React Compiler (rmore10.vu)
+# ---- JS plugins whose rules vlint runs natively
 #
-# When a configuration's jsPlugins load eslint-plugin-react-hooks 7.x, each of its rules that the
-# native port implements runs natively under the configuration's name for it (react-hooks-js/purity),
-# with that rule's severity and disable directives; the rest (preserve-manual-memoization, config,
-# gating, fbt, memoized-effect-dependencies, the two hooks rules) stay in node. 7.1.1's rule names
-# are known here, so its plugin isn't loaded in node at all unless one of those is on
-# (load_deferred). Off with VLINT_NATIVE_REACT_HOOKS=0, or a configuration's
-# `settings.vlint.nativeReactHooks: false`.
+# When a configuration's jsPlugins load one of these packages (under any alias), each of its rules
+# that vlint implements runs natively under the configuration's name for it (react-hooks-js/purity,
+# jsx-a11y-js/control-has-associated-label), with that rule's severity and disable directives; the
+# rest, and rules given options the native side doesn't take, stay in node. For the exact versions
+# whose rule names are known here (np_known), the plugin isn't loaded in node at all unless one of
+# those is on (load_deferred). The kinds:
+#   0 eslint-plugin-react-hooks 7.x: its compiler rules on vlint's React Compiler (rmore10.vu)
+#   1 eslint-plugin-jsx-a11y 6.x: a port of 6.10.2's rules oxlint lacks or words otherwise (rxa11y.vu)
+#   2 @eslint-community/eslint-plugin-eslint-comments 4.x: a port of 4.7.2 (rxcomments.vu)
+# A rule's native category (Meta.xnat) is kind * 1000 + its index in np_native (kind 0: the React
+# Compiler's ErrorCategory). Off: VLINT_NATIVE_JS_PLUGINS=0 (all), VLINT_NATIVE_REACT_HOOKS=0,
+# VLINT_NATIVE_JSX_A11Y=0, VLINT_NATIVE_ESLINT_COMMENTS=0, or in the configuration that lists the
+# plugin `settings.vlint`: nativeJsPlugins, nativeReactHooks, nativeJsxA11y, nativeEslintComments
+# false.
 
-# 7.1.1's rules, in the order of its `rules` object (the host's ruleNames)
-fn rh_rules() -> [Str]:
-  return ["exhaustive-deps", "rules-of-hooks", "hooks", "capitalized-calls", "static-components", "use-memo", "void-use-memo", "preserve-manual-memoization", "memo-dependencies", "incompatible-library", "immutability", "globals", "refs", "memoized-effect-dependencies", "exhaustive-effect-dependencies", "set-state-in-effect", "no-deriving-state-in-effects", "error-boundaries", "purity", "set-state-in-render", "invariant", "todo", "syntax", "unsupported-syntax", "config", "gating", "rule-suppression", "fbt", "component-hook-factories"]
+fn np_kinds() -> Int:
+  return 3
 
-# The rule's ErrorCategory in the native port (rmore10.rule_ids' order), -1 when the port lacks it
-fn rh_cat(rule: Str) -> Int:
-  let cats = ["hooks", "capitalized-calls", "static-components", "use-memo", "void-use-memo", "", "memo-dependencies", "incompatible-library", "immutability", "globals", "refs", "exhaustive-effect-dependencies", "set-state-in-effect", "no-deriving-state-in-effects", "error-boundaries", "purity", "set-state-in-render", "invariant", "todo", "syntax", "unsupported-syntax", "", "", "rule-suppression"]
-  if rule == "": return -1
-  for i in 0..cats.len:
-    if cats[i] == rule: return i
+# The package's kind (-1: not one of these): its name and major version
+fn np_kind(pkg: [Str]) -> Int:
+  if pkg.len < 2: return -1
+  if pkg[0] == "eslint-plugin-react-hooks" and pkg[1].startswith("7."): return 0
+  if pkg[0] == "eslint-plugin-jsx-a11y" and pkg[1].startswith("6."): return 1
+  if pkg[0] == "@eslint-community/eslint-plugin-eslint-comments" and pkg[1].startswith("4."): return 2
   return -1
 
-fn rh_package(pkg: [Str]) -> Bool:
-  return pkg.len > 1 and pkg[0] == "eslint-plugin-react-hooks" and pkg[1].startswith("7.")
+fn np_package(kind: Int) -> Str:
+  return ["eslint-plugin-react-hooks", "eslint-plugin-jsx-a11y", "@eslint-community/eslint-plugin-eslint-comments"][kind] + ""
 
-# Whether a configuration lets eslint-plugin-react-hooks run natively (its settings as JSON text)
-fn rh_native_on(os: Os, settings: Str) -> Bool:
-  if os.env("VLINT_NATIVE_REACT_HOOKS") == "0": return false
-  if settings == "" or settings.find("nativeReactHooks") < 0: return true
+fn np_env(kind: Int) -> Str:
+  return ["VLINT_NATIVE_REACT_HOOKS", "VLINT_NATIVE_JSX_A11Y", "VLINT_NATIVE_ESLINT_COMMENTS"][kind] + ""
+
+fn np_setting(kind: Int) -> Str:
+  return ["nativeReactHooks", "nativeJsxA11y", "nativeEslintComments"][kind] + ""
+
+# The version whose rules (np_rules) are known, so that it needn't be loaded to know them
+fn np_known(kind: Int) -> Str:
+  return ["7.1.1", "6.10.2", "4.7.2"][kind] + ""
+
+# The known version's rules, in the order of its `rules` object (the host's ruleNames)
+fn np_rules(kind: Int) -> [Str]:
+  if kind == 0: return ["exhaustive-deps", "rules-of-hooks", "hooks", "capitalized-calls", "static-components", "use-memo", "void-use-memo", "preserve-manual-memoization", "memo-dependencies", "incompatible-library", "immutability", "globals", "refs", "memoized-effect-dependencies", "exhaustive-effect-dependencies", "set-state-in-effect", "no-deriving-state-in-effects", "error-boundaries", "purity", "set-state-in-render", "invariant", "todo", "syntax", "unsupported-syntax", "config", "gating", "rule-suppression", "fbt", "component-hook-factories"]
+  if kind == 1: return ["accessible-emoji", "alt-text", "anchor-ambiguous-text", "anchor-has-content", "anchor-is-valid", "aria-activedescendant-has-tabindex", "aria-props", "aria-proptypes", "aria-role", "aria-unsupported-elements", "autocomplete-valid", "click-events-have-key-events", "control-has-associated-label", "heading-has-content", "html-has-lang", "iframe-has-title", "img-redundant-alt", "interactive-supports-focus", "label-has-associated-control", "label-has-for", "lang", "media-has-caption", "mouse-events-have-key-events", "no-access-key", "no-aria-hidden-on-focusable", "no-autofocus", "no-distracting-elements", "no-interactive-element-to-noninteractive-role", "no-noninteractive-element-interactions", "no-noninteractive-element-to-interactive-role", "no-noninteractive-tabindex", "no-onchange", "no-redundant-roles", "no-static-element-interactions", "prefer-tag-over-role", "role-has-required-aria-props", "role-supports-aria-props", "scope", "tabindex-no-positive"]
+  return ["disable-enable-pair", "no-aggregating-enable", "no-duplicate-disable", "no-restricted-disable", "no-unlimited-disable", "no-unused-disable", "no-unused-enable", "no-use", "require-description"]
+
+# The rules that run natively (kind 0: the React Compiler's ErrorCategory order, rmore10.rule_ids;
+# "" where the port has none)
+fn np_native(kind: Int) -> [Str]:
+  if kind == 0: return ["hooks", "capitalized-calls", "static-components", "use-memo", "void-use-memo", "", "memo-dependencies", "incompatible-library", "immutability", "globals", "refs", "exhaustive-effect-dependencies", "set-state-in-effect", "no-deriving-state-in-effects", "error-boundaries", "purity", "set-state-in-render", "invariant", "todo", "syntax", "unsupported-syntax", "", "", "rule-suppression"]
+  if kind == 1: return ["control-has-associated-label", "interactive-supports-focus", "no-interactive-element-to-noninteractive-role", "no-noninteractive-element-interactions", "no-noninteractive-element-to-interactive-role", "no-onchange", "label-has-for"]
+  return np_rules(2)
+
+# The rule's native category, -1 when it has none
+fn np_cat(kind: Int, rule: Str) -> Int:
+  if rule == "" or kind < 0: return -1
+  let xs = np_native(kind)
+  for i in 0..xs.len:
+    if xs[i] == rule:
+      if kind == 0: return i
+      return kind * 1000 + i
+  return -1
+
+fn cat_kind(cat: Int) -> Int:
+  if cat < 1000: return 0
+  return cat / 1000
+
+# Which kinds a configuration lets run natively (its settings as JSON text): a bit per kind
+fn native_mask(os: Os, settings: Str) -> Int:
+  if os.env("VLINT_NATIVE_JS_PLUGINS") == "0": return 0
+  var mask = 0
+  for kd in 0..np_kinds():
+    if os.env(np_env(kd)) != "0": mask = mask | (1 << kd)
+  if settings == "" or settings.find("native") < 0: return mask
   let js = lconf.parse_json(settings)
-  if js.err != "" or js.v.len == 0 or js.v[0].k != lconf.J_OBJ: return true
+  if js.err != "" or js.v.len == 0 or js.v[0].k != lconf.J_OBJ: return mask
   let v = lconf.get(js, 0, "vlint")
-  if v < 0 or js.v[v].k != lconf.J_OBJ: return true
-  let n = lconf.get(js, v, "nativeReactHooks")
-  return not (n >= 0 and js.v[n].k == lconf.J_FALSE)
+  if v < 0 or js.v[v].k != lconf.J_OBJ: return mask
+  let all = lconf.get(js, v, "nativeJsPlugins")
+  if all >= 0 and js.v[all].k == lconf.J_FALSE: return 0
+  for kd in 0..np_kinds():
+    let n = lconf.get(js, v, np_setting(kd))
+    if n >= 0 and js.v[n].k == lconf.J_FALSE: mask = mask - (mask & (1 << kd))
+  return mask
 
-# A jsPlugins entry that needn't be loaded in node now: eslint-plugin-react-hooks 7.1.1 under an
-# alias (without one its name, react-hooks, is reserved). Its rules are registered by name, run
+# The package's kind if this configuration lets it run natively, else -1
+fn native_kind(pkg: [Str], mask: Int) -> Int:
+  let kd = np_kind(pkg)
+  if kd < 0 or (mask & (1 << kd)) == 0: return -1
+  return kd
+
+# A jsPlugins entry that needn't be loaded in node now: one of the known versions above, under an
+# alias or, when its own name isn't reserved, without one. Its rules are registered by name, run
 # natively or, when load_deferred loads it after all, in node. True when deferred.
-fn try_defer(fs: Fs, ffi: Ffi, var js: Js, var m: lmeta.Meta, dir: Str, spec: Str, alias: Str, nat: Bool) -> Bool:
-  if not nat or alias == "" or lconf.normalize_plugin(alias) != alias or lconf.plugin_flag(alias) >= 0: return false
+fn try_defer(fs: Fs, ffi: Ffi, var js: Js, var m: lmeta.Meta, dir: Str, spec: Str, alias: Str, mask: Int) -> Bool:
+  if mask == 0: return false
+  if alias != "" and (lconf.normalize_plugin(alias) != alias or lconf.plugin_flag(alias) >= 0): return false
   var pkg: [Str] = []
   let path = resolve_plugin(fs, ffi, dir, spec, &pkg)
   if path == "": return false
   if path in js.paths: return true
-  if not (rh_package(pkg) and pkg[1] == "7.1.1"): return false
-  if alias in m.xplug: return false
-  let req = "{{\"op\":\"load\",\"url\":\"" + lout.json_esc(file_url(path)) + "\",\"name\":\"" + lout.json_esc(alias) + "\",\"alias\":true}}"
+  let kp = kind_package(fs, path, pkg)
+  let kd = native_kind(kp, mask)
+  if kd < 0 or kp[1] != np_known(kd): return false
+  # (the name the host would give it: the alias, else the package's; eslint-plugin-jsx-a11y's meta.name
+  # and eslint-plugin-react-hooks' are reserved)
+  var name = alias + ""
+  if name == "":
+    # (a path specifier without an alias: the host names it by the plugin's meta, not modeled)
+    if pkg.len == 0: return false
+    name = lconf.normalize_plugin(pkg[0])
+    if kd != 2 or lconf.plugin_flag(name) >= 0: return false
+  if name in m.xplug: return false
+  var req = "{{\"op\":\"load\",\"url\":\"" + lout.json_esc(file_url(path)) + "\",\"name\":\"" + lout.json_esc(name) + "\",\"alias\":"
+  if alias != "": req += "true}}"
+  else: req += "false}}"
   let first = m.xname.len
-  for r in rh_rules():
-    let full = alias + "/" + r
+  for r in np_rules(kd):
+    let full = name + "/" + r
     m.xrid[full] = m.xname.len
     m.xname.push(full)
-    set_x(&m, m.xname.len - 1, -1, rh_cat(r))
-  m.xplug[alias] = true
+    set_x(&m, m.xname.len - 1, -1, np_cat(kd, r))
+    if kd == 2: m.xsite[full] = report_site(fs, path, r)
+  m.xplug[name] = true
   js.paths[path] = true
-  js.deferred.push(path + "\t" + req + "\t{first}")
+  js.deferred.push(path + "\t" + req + "\t{first}\t{kd}")
   return true
 
-# Whether a JS rule with these options (JSON text, "" none) runs natively: the port has it, and
-# no options but an empty object (7.1.1's only option is the compiler's configuration)
+# Whether a JS rule with these options (JSON text, "" none) runs natively: vlint has it, and no
+# options it doesn't take. Kind 0: none but an empty object (7.1.1's only option is the compiler's
+# configuration); kinds 1 and 2: the defaults (none, or an empty object for a rule whose schema is
+# an object).
 fn runs_native(m: lmeta.Meta, id: Int, opts: Str) -> Bool:
-  if xnat_of(m, id) < 0: return false
+  let cat = xnat_of(m, id)
+  if cat < 0: return false
   let o = opts.replace(" ", "")
-  return o == "" or o == "[{{}}]" or o == "[]"
+  if o == "" or o == "[]": return true
+  if o != "[{{}}]": return false
+  if cat_kind(cat) != 2: return true
+  # (eslint-comments: the rules whose schema is an object)
+  let r = np_native(2)[cat - 2000]
+  return r == "disable-enable-pair" or r == "no-use" or r == "require-description"
 
-# Loads the deferred plugins in node (after the others: their rules' host ids follow). "" or the error.
-fn load_deferred(ffi: Ffi, var js: Js, var m: lmeta.Meta) -> Str:
+# Loads the deferred plugins in node that a configuration needs (after the others: their rules'
+# host ids follow), need[k] for js.deferred[k]. "" or the error; plugin: the package failing.
+fn load_deferred(ffi: Ffi, var js: Js, var m: lmeta.Meta, need: [Bool], var plugin: Str) -> Str:
+  var left: [Str] = []
   for di in 0..js.deferred.len:
+    if not need[di]:
+      left.push(js.deferred[di] + "")
+      continue
     let f = js.deferred[di].split("\t")
     let req = f[1] + ""
     let first = int(f[2]) else 0
+    let kd = int(f[3]) else 0
+    plugin = np_package(kd)
     let ans = vl_node_call(ffi, req)
     if ans == "!" or ans == "": return "vlint: the JS plugin host (node) could not be started or stopped"
     var outer = lconf.parse_json(ans)
@@ -385,16 +482,70 @@ fn load_deferred(ffi: Ffi, var js: Js, var m: lmeta.Meta) -> Str:
     let ok = lconf.get(res, 0, "Success")
     if ok < 0: return "vlint: bad answer from the JS plugin host"
     let rn = lconf.get(res, ok, "ruleNames")
-    let want = rh_rules()
-    if rn < 0 or res.v[rn].kids.len != want.len: return "vlint: eslint-plugin-react-hooks 7.1.1 has other rules than vlint knows (VLINT_NATIVE_REACT_HOOKS=0 runs it in node)"
+    let want = np_rules(kd)
+    let bad = "vlint: {np_package(kd)} {np_known(kd)} has other rules than vlint knows ({np_env(kd)}=0 runs it in node)"
+    if rn < 0 or res.v[rn].kids.len != want.len: return bad
     for k in 0..want.len:
-      if res.v[res.v[rn].kids[k]].s != want[k]: return "vlint: eslint-plugin-react-hooks 7.1.1 has other rules than vlint knows (VLINT_NATIVE_REACT_HOOKS=0 runs it in node)"
+      if res.v[res.v[rn].kids[k]].s != want[k]: return bad
       m.xhost[first + k] = js.nhost
       js.nhost += 1
     js.prelude.push(req)
-  js.deferred = []
+  js.deferred = left
   vl_node_prelude(ffi, "\n".join(js.prelude))
   return ""
+
+# Where an eslint-comments rule's create calls context.report, as a stack trace names it
+# ("FILE:LINE:COL", the column of `report`): the package's lib/rules/RULE.js next to its index.js
+fn report_site(fs: Fs, index: Str, rule: Str) -> Str:
+  let f = lconf.dir_of(index) + "/lib/rules/" + rule + ".js"
+  let txt = fs.read(f) else ""
+  let cr = txt.find("create(")
+  if cr < 0: return f
+  let at = txt.find("context.report(", cr)
+  if at < 0: return f
+  var line = 1
+  var ls = 0
+  for i in 0..at:
+    if txt[i] == '\n':
+      line += 1
+      ls = i + 1
+  return "{f}:{line}:{at + 8 - ls + 1}"
+
+# The stack frames of the RangeError the host throws when a rule reports a column of -1 on the
+# first line (rxcomments.vu), above and below the rule's own frame, with the host's URL: from the
+# host's text (lhost.HOST_JS), the lines and columns V8 gives them. "" when not found.
+fn throw_frames(fs: Fs, os: Os, ffi: Ffi) -> [Str]:
+  # (node names its main module by its real path)
+  var hp = host_path(fs, os)
+  let real = lcache.realpath(ffi, hp)
+  if real != "": hp = real
+  let url = file_url(hp)
+  let h = lhost.HOST_JS
+  # (anchor, the text in its line whose column is the frame's, the function to start the search from)
+  let anchors = [["throw RangeError(\"Line/column pair translates to an out of range offset\")", "RangeError(", "function getOffsetFromLineColumn(lineCol)", "getOffsetFromLineColumn"], ["if (start = getOffsetFromLineColumn(startLineCol)", "getOffsetFromLineColumn(", "function report(diagnostic", "report"], ["report(diagnostic, extraArgs, ruleDetails);", "report(", "value(diagnostic, ...extraArgs) {{", "Object.value [as report]"], ["ruleDetails.rule.create(ruleDetails.context)", "create(", "function lintFileImpl(", "lintFileImpl"], ["lintFileImpl(filePath, bufferId", "lintFileImpl(", "function lintFile(", "lintFile"], ["return lintFile(req.path", "lintFile(", "function lintFileWrapper(", "lintFileWrapper"]]
+  var out: [Str] = []
+  for a in anchors:
+    let fn0 = h.find(a[2])
+    if fn0 < 0: return []
+    let at = h.find(a[0], fn0)
+    if at < 0: return []
+    var ls = at
+    while ls > 0 and h[ls - 1] != '\n': ls -= 1
+    let col = h.find(a[1], ls) - ls + 1
+    var line = 1
+    for i in 0..ls:
+      if h[i] == '\n': line += 1
+    out.push("    at {a[3]} ({url}:{line}:{col})")
+  return out
+
+# The deferred plugin a JS rule id belongs to (its index in js.deferred), -1 none
+fn deferred_of(js: Js, id: Int) -> Int:
+  for di in 0..js.deferred.len:
+    let f = js.deferred[di].split("\t")
+    let first = int(f[2]) else 0
+    let kd = int(f[3]) else 0
+    if id >= first and id < first + np_rules(kd).len: return di
+  return -1
 
 # The tree of a file as one JSON object: the nodes (9 numbers each: kind, start, end, a, b, c, d,
 # flags, name), the item lists, the names, the decorators, the file root.

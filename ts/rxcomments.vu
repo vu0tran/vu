@@ -1,0 +1,586 @@
+# @eslint-community/eslint-plugin-eslint-comments 4.7.2's rules, for a configuration that loads the
+# plugin in jsPlugins (ljs.try_defer): what each rule reports when oxlint's plugin host runs it, on
+# the text the host gives plugins. Every rule reports from `create`, so their diagnostics go before
+# the walk's, by the file's rule order (rules.xr_pass).
+#
+# The host has sourceCode.getDisableDirectives and not getInlineConfigNodes, so the plugin reads
+# directives two ways: require-description, no-unlimited-disable and no-use from every comment
+# with its own parser (eslint- comments only, and a line comment only for -line and -next-line);
+# the others from getDisableDirectives (eslint- and oxlint- comments, line comments too). A
+# location with column -1 (utils.toForceLocation) on the first line makes the host throw: the
+# file's JS diagnostics are then that error, as the host words it (rules.Cx.xframes).
+
+import lconf
+import rules
+import rjest
+from rules import L, D
+
+# The text the plugins see, its comments and lines, in UTF-16 units as the host counts them
+type Tx:
+  text: Str
+  base: Int          # where text starts in l.src
+  tab: [Int]         # UTF-16 offset -> byte offset (rules.u16_table), empty when ASCII
+  ls: [Int]          # each line's start (UTF-16)
+  cs: [Int]          # each comment: start, end (bytes in text)
+
+type Dir:
+  c: Int             # the comment (an index in Tx.cs / 2)
+  kind: Str
+  value: Str
+  desc: Bool         # it has a description (after " -- ")
+
+type Area:
+  c: Int
+  rule: Str
+  null_rule: Bool
+  line_kind: Bool
+  sl: Int            # start line and column
+  sc: Int
+  el: Int            # end (el 0: none yet)
+  ec: Int
+
+type Areas:
+  areas: [Area]
+  dup_c: [Int]       # duplicateDisableDirectives: comment, rule
+  dup_r: [Str]
+  dup_null: [Bool]
+  ue_c: [Int]        # unusedEnableDirectives
+  ue_r: [Str]
+  ue_null: [Bool]
+  rel_c: [Int]       # numberOfRelatedDisableDirectives, in insertion order
+  rel_n: [Int]
+
+fn new_areas() -> Areas:
+  return Areas([], [], [], [], [], [], [], [], [])
+
+fn run(c: rules.Cx, var l: L):
+  var any = false
+  for cat in l.xr_cat:
+    if cat >= 2000 and cat < 3000: any = true
+  if not any: return
+  var tx = text_of(l)
+  var dirs_own: [Dir] = []
+  var own_done = false
+  var ar = new_areas()
+  var ar_done = false
+  for k in 0..l.xr_cat.len:
+    let cat = l.xr_cat[k]
+    if cat < 2000 or cat >= 3000: continue
+    let rule = cat - 2000
+    # (ljs.np_native(2)'s order)
+    if rule == 4 or rule == 7 or rule == 8:
+      if not own_done:
+        dirs_own = own_directives(tx)
+        own_done = true
+    elif rule != 3 and rule != 5:
+      if not ar_done:
+        ar = areas_of(tx)
+        ar_done = true
+    var reps: [Int] = []   # line, column, end line, end column; then the message
+    var msgs: [Str] = []
+    if rule == 8:
+      # require-description (no `ignore`)
+      for d in dirs_own:
+        if not d.desc: force(tx, d.c, &reps, &msgs, "Unexpected undescribed directive comment. Include descriptions to explain why the comment is necessary.")
+    elif rule == 4:
+      # no-unlimited-disable
+      for d in dirs_own:
+        if d.kind != "eslint-disable" and d.kind != "eslint-disable-line" and d.kind != "eslint-disable-next-line": continue
+        if d.value == "": force(tx, d.c, &reps, &msgs, "Unexpected unlimited '{d.kind}' comment. Specify some rule names to disable.")
+    elif rule == 7:
+      # no-use (no `allow`)
+      for d in dirs_own: force(tx, d.c, &reps, &msgs, "Unexpected ESLint directive comment.")
+    elif rule == 2:
+      # no-duplicate-disable
+      for i in 0..ar.dup_c.len:
+        if ar.dup_null[i]: force(tx, ar.dup_c[i], &reps, &msgs, "ESLint rules have been disabled already.")
+        else:
+          var msg = "'{ar.dup_r[i]}' rule has been disabled already."
+          if ar.dup_r[i] == "": msg = "ESLint rules have been disabled already."
+          rule_loc(tx, ar.dup_c[i], ar.dup_r[i], &reps, &msgs, msg)
+    elif rule == 1:
+      # no-aggregating-enable
+      for i in 0..ar.rel_c.len:
+        if ar.rel_n[i] >= 2: force(tx, ar.rel_c[i], &reps, &msgs, "This `eslint-enable` comment affects {ar.rel_n[i]} `eslint-disable` comments. An `eslint-enable` comment should be for an `eslint-disable` comment.")
+    elif rule == 6:
+      # no-unused-enable
+      for i in 0..ar.ue_c.len:
+        if ar.ue_null[i]: force(tx, ar.ue_c[i], &reps, &msgs, "ESLint rules are re-enabled but those have not been disabled.")
+        else:
+          var msg = "'{ar.ue_r[i]}' rule is re-enabled but it has not been disabled."
+          if ar.ue_r[i] == "": msg = "ESLint rules are re-enabled but those have not been disabled."
+          rule_loc(tx, ar.ue_c[i], ar.ue_r[i], &reps, &msgs, msg)
+    elif rule == 0:
+      # disable-enable-pair (no allowWholeFile)
+      for a in ar.areas:
+        if a.el != 0: continue
+        if a.null_rule: force(tx, a.c, &reps, &msgs, "Requires 'eslint-enable' directive.")
+        else:
+          var msg = "Requires 'eslint-enable' directive for '{a.rule}'."
+          if a.rule == "": msg = "Requires 'eslint-enable' directive."
+          rule_loc(tx, a.c, a.rule, &reps, &msgs, msg)
+    # (no-restricted-disable without options and no-unused-disable report nothing)
+    var q = 0
+    while q + 3 < reps.len:
+      let sl = reps[q]
+      let sc = reps[q + 1]
+      # (the host's getOffsetFromLineColumn: column -1 on the first line is out of range)
+      if sl == 1 and sc < 0:
+        l.xr_fail = thrown(c, l.xr_id[k])
+        return
+      var s16 = tx.ls[sl - 1] + sc
+      var e16 = tx.ls[reps[q + 2] - 1] + reps[q + 3]
+      let n16 = len16(tx)
+      if s16 > n16: s16 = n16
+      if e16 > n16: e16 = n16
+      if e16 < s16: e16 = s16
+      let s8 = byte_of(tx, s16) + tx.base
+      let e8 = byte_of(tx, e16) + tx.base
+      l.xr_o.push((k << 32) + l.xr_d.len)
+      l.xr_d.push(D(s8, "", msgs[q / 4], "", -1, -1, "", e8, "", false, [], [], 0, "", false, 0))
+      l.xr_k.push(k)
+      l.xr_s.push(0)
+      l.xr_e.push(0)
+      l.xr_t.push(-1)
+      q += 4
+
+# The error the host gives for the rule's report at column -1 on line 1
+fn thrown(c: rules.Cx, id: Int) -> Str:
+  let msg = "RangeError: Line/column pair translates to an out of range offset"
+  if c.xframes.len < 6: return msg
+  let site = c.m.xsite.get(c.m.xname[id], "")
+  var fr: [Str] = []
+  for i in 0..6:
+    if i == 3: fr.push("    at Object.create ({site})")
+    fr.push(c.xframes[i] + "")
+  return msg + "\n" + "\n".join(fr)
+
+# ---- the text and its comments
+
+fn text_of(l: L) -> Tx:
+  let base = rules.js_base(l)
+  let end = rules.js_end(l)
+  let text = l.src[base..end]
+  var ascii = true
+  for i in 0..text.len:
+    if text[i] >= 128:
+      ascii = false
+      break
+  var tab: [Int] = []
+  if not ascii: tab = rules.u16_table(text)
+  var tx = Tx(text, base, tab, [0], [])
+  # lines: \r\n, \r, \n, U+2028, U+2029 (the host's LINE_BREAK_PATTERN)
+  var i = 0
+  var u = 0
+  while i < text.len:
+    let ch = text[i]
+    if ch == '\r':
+      if i + 1 < text.len and text[i + 1] == '\n':
+        i += 2
+        u += 2
+      else:
+        i += 1
+        u += 1
+      tx.ls.push(u)
+      continue
+    if ch == '\n':
+      i += 1
+      u += 1
+      tx.ls.push(u)
+      continue
+    if ch == 0xE2 and i + 2 < text.len and text[i + 1] == 0x80 and (text[i + 2] == 0xA8 or text[i + 2] == 0xA9):
+      i += 3
+      u += 1
+      tx.ls.push(u)
+      continue
+    var n = 1
+    if ch >= 240: n = 4
+    elif ch >= 224: n = 3
+    elif ch >= 192: n = 2
+    i += n
+    if n == 4: u += 2
+    else: u += 1
+  # the comments (rjest.all_comments: outside literals), those in the text
+  let all = rjest.all_comments(l)
+  var q = 0
+  while q + 1 < all.len:
+    if all[q] >= base and all[q + 1] <= end:
+      tx.cs.push(all[q] - base)
+      tx.cs.push(all[q + 1] - base)
+    q += 2
+  return tx
+
+fn len16(tx: Tx) -> Int:
+  if tx.tab.len == 0: return tx.text.len
+  return tx.tab.len - 1
+
+fn byte_of(tx: Tx, o16: Int) -> Int:
+  if tx.tab.len == 0: return o16
+  if o16 >= tx.tab.len: return tx.text.len
+  return tx.tab[o16]
+
+fn u16_of(tx: Tx, b: Int) -> Int:
+  if tx.tab.len == 0: return b
+  # (the first UTF-16 offset at or past byte b)
+  var lo = 0
+  var hi = tx.tab.len - 1
+  while lo < hi:
+    let mid = (lo + hi) / 2
+    if tx.tab[mid] < b: lo = mid + 1
+    else: hi = mid
+  return lo
+
+# 1-based line and UTF-16 column of a byte offset in the text
+fn line_of(tx: Tx, u: Int) -> Int:
+  var lo = 0
+  var hi = tx.ls.len - 1
+  while lo < hi:
+    let mid = (lo + hi + 1) / 2
+    if tx.ls[mid] <= u: lo = mid
+    else: hi = mid - 1
+  return lo + 1
+
+fn is_line(tx: Tx, ci: Int) -> Bool:
+  let s = tx.cs[2 * ci]
+  return s + 1 < tx.text.len and tx.text[s + 1] == '/'
+
+# the comment's value (between its delimiters)
+fn value_of(tx: Tx, ci: Int) -> Str:
+  let s = tx.cs[2 * ci]
+  let e = tx.cs[2 * ci + 1]
+  if is_line(tx, ci): return tx.text[s + 2..e]
+  var ve = e - 2
+  if ve < s + 2: ve = s + 2
+  if not (e - s >= 4 and tx.text[e - 2] == '*' and tx.text[e - 1] == '/'): ve = e
+  return tx.text[s + 2..ve]
+
+fn start_lc(tx: Tx, ci: Int, var line: Int, var col: Int):
+  let u = u16_of(tx, tx.cs[2 * ci])
+  line = line_of(tx, u)
+  col = u - tx.ls[line - 1]
+
+fn end_lc(tx: Tx, ci: Int, var line: Int, var col: Int):
+  let u = u16_of(tx, tx.cs[2 * ci + 1])
+  line = line_of(tx, u)
+  col = u - tx.ls[line - 1]
+
+# ---- JavaScript's \s and trim (WhiteSpace and LineTerminator), on UTF-8
+
+# the length of the whitespace character at i, 0 when there's none
+fn ws_at(s: Str, i: Int) -> Int:
+  if i >= s.len: return 0
+  let c = s[i]
+  if c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 11 or c == 12: return 1
+  if c == 0xC2 and i + 1 < s.len and s[i + 1] == 0xA0: return 2
+  if c == 0xE1 and i + 2 < s.len and s[i + 1] == 0x9A and s[i + 2] == 0x80: return 3
+  if c == 0xE2 and i + 2 < s.len:
+    let c1 = s[i + 1]
+    let c2 = s[i + 2]
+    if c1 == 0x80 and ((c2 >= 0x80 and c2 <= 0x8A) or c2 == 0xA8 or c2 == 0xA9 or c2 == 0xAF): return 3
+    if c1 == 0x81 and c2 == 0x9F: return 3
+  if c == 0xE3 and i + 2 < s.len and s[i + 1] == 0x80 and s[i + 2] == 0x80: return 3
+  if c == 0xEF and i + 2 < s.len and s[i + 1] == 0xBB and s[i + 2] == 0xBF: return 3
+  return 0
+
+# the length of the whitespace character ending at i (exclusive), 0 none
+fn ws_before(s: Str, i: Int) -> Int:
+  if i >= 1 and ws_at(s, i - 1) == 1: return 1
+  if i >= 2 and ws_at(s, i - 2) == 2: return 2
+  if i >= 3 and ws_at(s, i - 3) == 3: return 3
+  return 0
+
+fn js_trim(s: Str) -> Str:
+  var a = 0
+  var b = s.len
+  while a < b:
+    let w = ws_at(s, a)
+    if w == 0: break
+    a += w
+  while b > a:
+    let w = ws_before(s, b)
+    if w == 0: break
+    b -= w
+  return s[a..b]
+
+# /\s-{2,}\s/u from i: the match's start and end (-1 none)
+fn sep_from(s: Str, from: Int, var me: Int) -> Int:
+  var i = from
+  while i < s.len:
+    let w = ws_at(s, i)
+    if w > 0:
+      var j = i + w
+      var n = 0
+      while j + n < s.len and s[j + n] == '-': n += 1
+      if n >= 2:
+        let w2 = ws_at(s, j + n)
+        if w2 > 0:
+          me = j + n + w2
+          return i
+      i += w
+    else: i += 1
+  me = -1
+  return -1
+
+# the first word (up to whitespace) of a trimmed text
+fn first_word(t: Str) -> Str:
+  var i = 0
+  while i < t.len and ws_at(t, i) == 0: i += 1
+  return t[0..i]
+
+# ---- the plugin's own parser (internal/utils.js parseDirectiveComment)
+
+fn own_directives(tx: Tx) -> [Dir]:
+  var out: [Dir] = []
+  let kinds = ["eslint", "eslint-env", "eslint-enable", "eslint-disable", "eslint-disable-line", "eslint-disable-next-line", "exported", "global", "globals"]
+  for ci in 0..tx.cs.len / 2:
+    let v = value_of(tx, ci)
+    # divideDirectiveComment: split on /\s-{2,}\s/u; the text before, the part after (trimmed)
+    var me = 0
+    let ms = sep_from(v, 0, &me)
+    var text = js_trim(v)
+    var desc = false
+    if ms >= 0:
+      text = js_trim(v[0..ms])
+      var me2 = 0
+      var e2 = sep_from(v, me, &me2)
+      if e2 < 0: e2 = v.len
+      desc = js_trim(v[me..e2]) != ""
+    let w = first_word(text)
+    var ok = false
+    for kd in kinds:
+      if kd == w: ok = true
+    if not ok: continue
+    let line_ok = w == "eslint-disable-line" or w == "eslint-disable-next-line"
+    if is_line(tx, ci) and not line_ok: continue
+    if w == "eslint-disable-line":
+      var l1 = 0
+      var c1 = 0
+      var l2 = 0
+      var c2 = 0
+      start_lc(tx, ci, &l1, &c1)
+      end_lc(tx, ci, &l2, &c2)
+      if l1 != l2: continue
+    out.push(Dir(ci, w, js_trim(text[w.len..text.len]), desc))
+  return out
+
+# A report at utils.toForceLocation(comment.loc): from column -1 of its first line to its end
+fn force(tx: Tx, ci: Int, var reps: [Int], var msgs: [Str], msg: Str):
+  var l1 = 0
+  var c1 = 0
+  var l2 = 0
+  var c2 = 0
+  start_lc(tx, ci, &l1, &c1)
+  end_lc(tx, ci, &l2, &c2)
+  reps.push(l1)
+  reps.push(-1)
+  reps.push(l2)
+  reps.push(c2)
+  msgs.push(msg)
+
+fn delim_at(s: Str, i: Int) -> Int:
+  if i < s.len and s[i] == ',': return 1
+  return ws_at(s, i)
+
+# /([\s,]|^)RULE(?:[\s,]|$)/u in s: where RULE starts (bytes), -1 none
+fn rule_in(s: Str, rule: Str) -> Int:
+  var i = 0
+  while i <= s.len:
+    let d = delim_at(s, i)
+    if d > 0 and s[i + d..s.len].startswith(rule):
+      let after = i + d + rule.len
+      if after == s.len or delim_at(s, after) > 0: return i + d
+    if i == 0 and s.startswith(rule):
+      if rule.len == s.len or delim_at(s, rule.len) > 0: return 0
+    if i >= s.len: break
+    i += 1
+  return -1
+
+fn u16len(s: Str) -> Int:
+  var n = 0
+  var i = 0
+  while i < s.len:
+    let ch = s[i]
+    if ch >= 240:
+      n += 2
+      i += 4
+    elif ch >= 224:
+      n += 1
+      i += 3
+    elif ch >= 192:
+      n += 1
+      i += 2
+    else:
+      n += 1
+      i += 1
+  return n
+
+# A report at utils.toRuleIdLocation(context, comment, ruleId) (ruleId not null): the rule's name in
+# the comment, else the whole comment
+fn rule_loc(tx: Tx, ci: Int, rule: Str, var reps: [Int], var msgs: [Str], msg: Str):
+  var l1 = 0
+  var c1 = 0
+  start_lc(tx, ci, &l1, &c1)
+  let v = value_of(tx, ci)
+  # LINE_PATTERN's matches: each line with its terminator
+  var lines: [Str] = []
+  var i = 0
+  var st = 0
+  while i < v.len:
+    let ch = v[i]
+    var n = 0
+    if ch == '\r' and i + 1 < v.len and v[i + 1] == '\n': n = 2
+    elif ch == '\r' or ch == '\n': n = 1
+    elif ch == 0xE2 and i + 2 < v.len and v[i + 1] == 0x80 and (v[i + 2] == 0xA8 or v[i + 2] == 0xA9): n = 3
+    if n > 0:
+      lines.push(v[st..i + n])
+      i += n
+      st = i
+    else: i += 1
+  lines.push(v[st..v.len])
+  let rl = u16len(rule)
+  for li in 0..lines.len:
+    let at = rule_in(lines[li], rule)
+    if at < 0: continue
+    let col = u16len(lines[li][0..at])
+    var c0 = col
+    if li == 0: c0 = 2 + c1 + col
+    reps.push(l1 + li)
+    reps.push(c0)
+    reps.push(l1 + li)
+    reps.push(c0 + rl)
+    msgs.push(msg)
+    return
+  var l2 = 0
+  var c2 = 0
+  end_lc(tx, ci, &l2, &c2)
+  reps.push(l1)
+  reps.push(c1)
+  reps.push(l2)
+  reps.push(c2)
+  msgs.push(msg)
+
+# ---- internal/disabled-area.js (DisabledAreaForLanguagePlugin, on the host's getDisableDirectives)
+
+fn lte(al: Int, ac: Int, bl: Int, bc: Int) -> Bool:
+  return al < bl or (al == bl and ac <= bc)
+
+fn get_area(ar: Areas, rule: Str, null_rule: Bool, line: Int, col: Int) -> Int:
+  var i = ar.areas.len - 1
+  while i >= 0:
+    let a = ar.areas[i]
+    let rmatch = a.null_rule or (not null_rule and a.rule == rule)
+    if rmatch and lte(a.sl, a.sc, line, col) and (a.el == 0 or lte(line, col, a.el, a.ec)): return i
+    i -= 1
+  return -1
+
+fn disable(var ar: Areas, ci: Int, line: Int, col: Int, rules0: [Str], null_rule: Bool, lk: Bool):
+  if not null_rule:
+    for r in rules0:
+      if get_area(ar, r, false, line, col) >= 0:
+        ar.dup_c.push(ci)
+        ar.dup_r.push(r + "")
+        ar.dup_null.push(false)
+      ar.areas.push(Area(ci, r + "", false, lk, line, col, 0, 0))
+  else:
+    if get_area(ar, "", true, line, col) >= 0:
+      ar.dup_c.push(ci)
+      ar.dup_r.push("")
+      ar.dup_null.push(true)
+    ar.areas.push(Area(ci, "", true, lk, line, col, 0, 0))
+
+fn enable(var ar: Areas, ci: Int, line: Int, col: Int, rules0: [Str], null_rule: Bool, lk: Bool):
+  var rel: [Int] = []
+  if not null_rule:
+    for r in rules0:
+      var used = false
+      var i = ar.areas.len - 1
+      while i >= 0:
+        if ar.areas[i].el == 0 and ar.areas[i].line_kind == lk and not ar.areas[i].null_rule and ar.areas[i].rule == r:
+          if not (ar.areas[i].c in rel): rel.push(ar.areas[i].c)
+          ar.areas[i].el = line
+          ar.areas[i].ec = col
+          used = true
+        i -= 1
+      if not used:
+        ar.ue_c.push(ci)
+        ar.ue_r.push(r + "")
+        ar.ue_null.push(false)
+  else:
+    var used = false
+    var i = ar.areas.len - 1
+    while i >= 0:
+      if ar.areas[i].el == 0 and ar.areas[i].line_kind == lk:
+        if not (ar.areas[i].c in rel): rel.push(ar.areas[i].c)
+        ar.areas[i].el = line
+        ar.areas[i].ec = col
+        used = true
+      i -= 1
+    if not used:
+      ar.ue_c.push(ci)
+      ar.ue_r.push("")
+      ar.ue_null.push(true)
+  # (a Map keyed by the comment: set again, its place stays)
+  for j in 0..ar.rel_c.len:
+    if ar.rel_c[j] == ci:
+      ar.rel_n[j] = rel.len
+      return
+  ar.rel_c.push(ci)
+  ar.rel_n.push(rel.len)
+
+# value.split(/[\s,]+/u)
+fn split_rules(v: Str) -> [Str]:
+  var out: [Str] = []
+  var st = 0
+  var i = 0
+  while i < v.len:
+    let d = delim_at(v, i)
+    if d > 0:
+      out.push(v[st..i])
+      var j = i + d
+      while j < v.len:
+        let d2 = delim_at(v, j)
+        if d2 == 0: break
+        j += d2
+      i = j
+      st = j
+    else: i += 1
+  out.push(v[st..v.len])
+  return out
+
+fn areas_of(tx: Tx) -> Areas:
+  var ar = new_areas()
+  for ci in 0..tx.cs.len / 2:
+    let v = value_of(tx, ci)
+    # getDisableDirectives: the part before the first /\s-{2,}\s/u, trimmed, starting with a label
+    var me = 0
+    let ms = sep_from(v, 0, &me)
+    var part = js_trim(v)
+    if ms >= 0: part = js_trim(v[0..ms])
+    let w = first_word(part)
+    var ty = ""
+    for pre in ["eslint-", "oxlint-"]:
+      for t in ["disable", "disable-line", "disable-next-line", "enable"]:
+        if w == pre + t: ty = t + ""
+    if ty == "": continue
+    var l1 = 0
+    var c1 = 0
+    start_lc(tx, ci, &l1, &c1)
+    if ty == "disable-line":
+      var l2 = 0
+      var c2 = 0
+      end_lc(tx, ci, &l2, &c2)
+      if l1 != l2: continue
+    # (the label and the whitespace character after it)
+    let value = js_trim(part[w.len + ws_at(part, w.len)..part.len])
+    var rs: [Str] = []
+    let nr = value == ""
+    if not nr: rs = split_rules(value)
+    if ty == "disable": disable(&ar, ci, l1, c1, rs, nr, false)
+    elif ty == "enable": enable(&ar, ci, l1, c1, rs, nr, false)
+    elif ty == "disable-line":
+      disable(&ar, ci, l1, 0, rs, nr, true)
+      enable(&ar, ci, l1 + 1, -1, rs, nr, true)
+    else:
+      disable(&ar, ci, l1 + 1, 0, rs, nr, true)
+      enable(&ar, ci, l1 + 2, -1, rs, nr, true)
+  return ar

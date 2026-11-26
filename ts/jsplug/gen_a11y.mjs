@@ -1,0 +1,85 @@
+// Writes ts/ra11y_tab.vu: the tables eslint-plugin-jsx-a11y computes from aria-query and
+// axobject-query when its utils load (lib/util/is*.js), in their order, for ra11y_js.vu.
+//
+//     node ts/jsplug/gen_a11y.mjs PATH/TO/node_modules/eslint-plugin-jsx-a11y
+//
+// Each list is built as the plugin's own module builds it (the filters are copied from its
+// lib/util files of 6.10.2), from the aria-query and axobject-query that the plugin resolves.
+import { createRequire } from "node:module";
+import { writeFileSync, readFileSync, realpathSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+if (!process.argv[2]) throw new Error("usage: node gen_a11y.mjs PLUGIN_DIR");
+const dir = realpathSync(process.argv[2]);
+const req = createRequire(join(dir, "package.json"));
+const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+const { roles, elementRoles, dom } = req("aria-query");
+const { AXObjects, elementAXObjects } = req("axobject-query");
+const aqv = JSON.parse(readFileSync(join(dirname(req.resolve("aria-query")), "..", "package.json"), "utf8")).version;
+const axv = JSON.parse(readFileSync(join(dirname(req.resolve("axobject-query")), "..", "package.json"), "utf8")).version;
+
+const roleKeys = roles.keys();
+const widget = (name) => roles.get(name).superClass.some((c) => c.includes("widget"));
+const abs = (name) => roles.get(name).abstract;
+const entries = [...elementRoles];
+const axEntries = [...elementAXObjects];
+
+// isInteractiveElement.js
+const ie_nonint = new Set(roleKeys.filter((n) => !abs(n) && n !== "toolbar" && !widget(n)).concat("progressbar"));
+const ie_int = new Set(roleKeys.filter((n) => !abs(n) && n !== "progressbar" && widget(n)).concat("toolbar"));
+const ie_int_schemas = entries.flatMap(([s, rs]) => ([...rs].some((r) => ie_int.has(r)) ? [s] : []));
+const ie_nonint_schemas = entries.flatMap(([s, rs]) => ([...rs].every((r) => ie_nonint.has(r)) ? [s] : []));
+const ie_ax = new Set(AXObjects.keys().filter((n) => AXObjects.get(n).type === "widget"));
+const ie_ax_schemas = axEntries.flatMap(([s, xs]) => ([...xs].every((r) => ie_ax.has(r)) ? [s] : []));
+// isNonInteractiveElement.js
+const ne_nonint = new Set(roleKeys.filter((n) => !abs(n) && n !== "toolbar" && n !== "generic" && !widget(n)).concat("progressbar"));
+const ne_int = new Set(roleKeys.filter((n) => !abs(n) && n !== "progressbar" && n !== "generic" && widget(n)).concat("toolbar"));
+const ne_int_schemas = entries.flatMap(([s, rs]) => ([...rs].some((r) => ne_int.has(r)) ? [s] : []));
+const ne_nonint_schemas = entries.flatMap(([s, rs]) => ([...rs].every((r) => ne_nonint.has(r)) ? [s] : []));
+const ne_ax = new Set(AXObjects.keys().filter((n) => ["window", "structure"].includes(AXObjects.get(n).type)));
+const ne_ax_schemas = axEntries.flatMap(([s, xs]) => ([...xs].every((r) => ne_ax.has(r)) ? [s] : []));
+// isInteractiveRole.js, isNonInteractiveRole.js, isAbstractRole.js
+const ir = roleKeys.filter((n) => !abs(n) && widget(n));
+ir.push("toolbar");
+const nir = roleKeys.filter((n) => !abs(n) && !widget(n));
+const absr = roleKeys.filter((n) => abs(n));
+
+const q = (s) => JSON.stringify(s).replace(/\{/g, "{{").replace(/\}/g, "}}");
+const strs = (xs) => "[" + xs.map(q).join(", ") + "]";
+// a schema: "name" then, per attribute, "\tname" (no value), "\tname=s:VALUE" or "\tname=n:VALUE"
+function schema(s) {
+  let out = s.name;
+  for (const a of s.attributes || []) {
+    out += "\t" + a.name;
+    if (a.value) {
+      if (typeof a.value === "string") out += "=s:" + a.value;
+      else if (typeof a.value === "number") out += "=n:" + a.value;
+      else throw new Error("attribute value of type " + typeof a.value);
+    }
+  }
+  return out;
+}
+const fns = [
+  ["dom_names", [...dom.keys()], "aria-query's dom (isDOMElement and the rules' dom.has)"],
+  ["role_names", roleKeys, "aria-query's roles, in its order (roles.has, includes(roles, x))"],
+  ["interactive_roles", ir, "isInteractiveRole.js: not abstract, a widget's subclass, and toolbar"],
+  ["noninteractive_roles", nir, "isNonInteractiveRole.js: not abstract, not a widget's subclass"],
+  ["abstract_roles", absr, "isAbstractRole.js"],
+  ["ie_int_schemas", ie_int_schemas.map(schema), "isInteractiveElement.js: elementRoles' schemas with an interactive role"],
+  ["ie_nonint_schemas", ie_nonint_schemas.map(schema), "isInteractiveElement.js: with only non-interactive roles"],
+  ["ie_ax_schemas", ie_ax_schemas.map(schema), "isInteractiveElement.js: elementAXObjects' schemas with only widget AX objects"],
+  ["ne_nonint_schemas", ne_nonint_schemas.map(schema), "isNonInteractiveElement.js: elementRoles' schemas with only non-interactive roles (generic left out)"],
+  ["ne_int_schemas", ne_int_schemas.map(schema), "isNonInteractiveElement.js: with an interactive role"],
+  ["ne_ax_schemas", ne_ax_schemas.map(schema), "isNonInteractiveElement.js: elementAXObjects' schemas with only window and structure AX objects"],
+];
+let out = `# Generated by ts/jsplug/gen_a11y.mjs from eslint-plugin-jsx-a11y ${pkg.version} (aria-query ${aqv},
+# axobject-query ${axv}): the tables its utils compute when they load. Don't edit; regenerate.
+# A schema is "element" then "\\tattribute" (no value), "\\tattribute=s:VALUE" or "=n:VALUE" each.
+
+const A11Y_VERSION = ${q(pkg.version)}
+`;
+for (const [name, xs, what] of fns) out += `\n# ${what}\nfn ${name}() -> [Str]:\n  return ${strs(xs)}\n`;
+const here = dirname(fileURLToPath(import.meta.url));
+writeFileSync(join(here, "..", "ra11y_tab.vu"), out);
+console.log("ra11y_tab.vu", out.length, "bytes;", fns.map(([n, xs]) => `${n} ${xs.length}`).join(", "));
