@@ -273,33 +273,95 @@ static inline double ct_atf(void *h, int64_t i) {
 // append-only regions as above. A row is changed by writing its list again at the pool's end (or, when
 // it already ends the pool, by appending to it), so an entry once written is never moved or overwritten
 // by another row's list.
-typedef struct { int64_t *row; int64_t *pool; } cl_t;
+//
+// A sparse list column (cl_snew, ckl_snew: most rows never get a list) keeps its rows' (offset,
+// length) pairs in a hash instead (sh: CL_SBUCKETS bucket heads, chains of (next, row, offset,
+// length) entries in the append-only region se, linked by a compare-and-swap on the head as ik_*
+// below, so an entry never moves and two tasks making one row make one entry): a row without one
+// reads (0, 0). On macOS a page of an untouched region is made resident by a read as well as by a
+// write, so a dense row region whose rows are read throughout is resident whole, however few hold a
+// list: 3.2 M rows of ht_sigs (52 MB) for 63,000 lists.
+typedef struct { int64_t *row; int64_t *pool; int64_t *sh; int64_t *se; } cl_t;
+#define CL_SBITS 17
+#define CL_SBUCKETS ((int64_t)1 << CL_SBITS)
 static inline void *cl_new(void *st) {
-  cl_t *h = malloc(sizeof *h);
+  cl_t *h = calloc(1, sizeof *h);
   if (!h) vu_panic(0, "cl_new: out of memory", 21);
   h->row = ct_mk();
   h->pool = ct_mk();
   cs_add(st, h, 1);
   return h;
 }
+static inline void *cl_snew(void *st) {
+  cl_t *h = cl_new(st);
+  h->sh = calloc((size_t)CL_SBUCKETS, 8);
+  if (!h->sh) vu_panic(0, "cl_snew: out of memory", 22);
+  h->se = ct_mk();
+  h->se[-1] = 4;  // (entry 0 is "none")
+  return h;
+}
 static inline void cl_free(void *p) {
   cl_t *h = p;
   ct_free(h->row);
   ct_free(h->pool);
+  if (h->sh) {
+    free(h->sh);
+    ct_free(h->se);
+  }
   free(h);
 }
+static inline int64_t cl_shash(int64_t r) { return (int64_t)(((uint64_t)r * 0x9E3779B97F4A7C15ULL) >> (64 - CL_SBITS)); }
+// a sparse column's row r: its (offset, length) pair, NULL when it has none (create: made then)
+static int64_t *cl_srp(cl_t *h, int64_t r, bool create) {
+  int64_t *hd = &h->sh[cl_shash(r)];
+  int64_t e = __atomic_load_n(hd, __ATOMIC_ACQUIRE);
+  for (int64_t x = e; x; x = h->se[x])
+    if (h->se[x + 1] == r) return &h->se[x + 2];
+  if (!create) return NULL;
+  int64_t ne = __atomic_fetch_add(&h->se[-1], 4, __ATOMIC_RELAXED);
+  if (ne + 4 > CT_MAX) vu_panic(0, "cl: a sparse column is full", 27);
+  h->se[ne + 1] = r;
+  h->se[ne + 2] = 0;
+  h->se[ne + 3] = 0;
+  for (;;) {
+    int64_t old = e;
+    h->se[ne] = old;
+    if (__atomic_compare_exchange_n(hd, &e, ne, false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) {
+      ct_cover(h->se, ne + 4);
+      return &h->se[ne + 2];
+    }
+    // (another task linked entries meanwhile: one of them may be this row's; ne is then left unused)
+    for (int64_t x = e; x != old; x = h->se[x])
+      if (h->se[x + 1] == r) return &h->se[x + 2];
+  }
+}
+static const int64_t cl_none[2] = {0, 0};
 static inline int64_t cl_rows(void *p) { return ct_len(((cl_t *)p)->row) >> 1; }
 // row r (from its group: cg_row) made, holding an empty list (the region is zero: (0, 0) already)
 static inline void cl_init(void *p, int64_t r) {
   cl_t *h = p;
   if ((uint64_t)r >= (uint64_t)(CT_MAX / 2)) vu_panic(0, "cl_init: row out of range", 25);
+  if (h->sh) return;
   h->row[2 * r] = 0;
   h->row[2 * r + 1] = 0;
   ct_cover(h->row, 2 * r + 2);
 }
+// row r's pair to read (a sparse column's row without one: (0, 0), never written through)
 static inline int64_t *cl_rp(cl_t *h, int64_t r) {
+  if (__builtin_expect(h->sh != NULL, 0)) {
+    int64_t *rp = cl_srp(h, r, false);
+    return rp ? rp : (int64_t *)cl_none;
+  }
   if (__builtin_expect((uint64_t)r >= (uint64_t)(ct_len0(h->row) >> 1), 0)) vu_panic(0, "cl: row out of range", 20);
   return &h->row[2 * r];
+}
+// row r's pair to write
+static inline int64_t *cl_wp(cl_t *h, int64_t r) {
+  if (__builtin_expect(h->sh != NULL, 0)) {
+    if ((uint64_t)r >= (uint64_t)(CT_MAX / 2)) vu_panic(0, "cl: row out of range", 20);
+    return cl_srp(h, r, true);
+  }
+  return cl_rp(h, r);
 }
 static inline int64_t cl_len(void *p, int64_t r) { return cl_rp(p, r)[1]; }
 // A row's offset may carry CL_CAP: its list was written by cl_add into a reservation of cl_cap(n)
@@ -347,7 +409,7 @@ static inline int64_t cl_res(cl_t *h, int64_t n) {
 // written again in a new reservation with v after it
 static inline void cl_add(void *p, int64_t r, int64_t v) {
   cl_t *h = p;
-  int64_t *rp = cl_rp(h, r);
+  int64_t *rp = cl_wp(h, r);
   int64_t off = cl_off(rp), n = rp[1], end = off + n;
   if ((rp[0] & CL_CAP) && n + 1 <= cl_cap(n)) {
     h->pool[end] = v;
@@ -372,7 +434,8 @@ static inline void cl_pop(void *p, int64_t r) {
 }
 static inline void cl_set(void *p, int64_t r, const int64_t *xs, int64_t n) {
   cl_t *h = p;
-  int64_t *rp = cl_rp(h, r);
+  if (h->sh && n == 0 && !cl_srp(h, r, false)) return;
+  int64_t *rp = cl_wp(h, r);
   int64_t at = cl_res(h, n);
   for (int64_t i = 0; i < n; i++) h->pool[at + i] = xs[i];
   rp[0] = at;
@@ -441,10 +504,27 @@ static inline void *ckl_new(void *st) {
   h->pool[-1] = 1;
   return h;
 }
+static inline void *ckl_snew(void *st) {
+  cl_t *h = cl_snew(st);
+  h->pool[-1] = 1;
+  return h;
+}
+// row k's pair to write (made in a sparse column)
+static inline int64_t *ckl_wp(cl_t *h, int64_t k) {
+  if (h->sh) return cl_srp(h, k, true);
+  ct_cover(h->row, 2 * k + 2);
+  return &h->row[2 * k];
+}
 // row k's (offset, length), NULL when it holds no list
 static inline const int64_t *ckl_rp(const cl_t *h, int64_t k) {
-  if ((uint64_t)k >= (uint64_t)(ct_len0(h->row) >> 1)) return NULL;
-  const int64_t *rp = &h->row[2 * k];
+  const int64_t *rp;
+  if (h->sh) {
+    rp = cl_srp((cl_t *)h, k, false);
+    if (!rp) return NULL;
+  } else {
+    if ((uint64_t)k >= (uint64_t)(ct_len0(h->row) >> 1)) return NULL;
+    rp = &h->row[2 * k];
+  }
   // (0: no list; -1: claimed by a ckl_publish, its list not written yet)
   if (__atomic_load_n(&rp[0], __ATOMIC_ACQUIRE) <= 0) return NULL;
   return rp;
@@ -476,10 +556,9 @@ static inline void ckl_set(void *p, int64_t k, const int64_t *xs, int64_t n) {
   if ((uint64_t)k >= (uint64_t)(CT_MAX / 2)) vu_panic(0, "ckl_set: row out of range", 25);
   int64_t at = cl_res(h, n);
   for (int64_t i = 0; i < n; i++) h->pool[at + i] = xs[i];
-  int64_t *rp = &h->row[2 * k];
+  int64_t *rp = ckl_wp(h, k);
   __atomic_store_n(&rp[1], n, __ATOMIC_RELAXED);
   __atomic_store_n(&rp[0], at, __ATOMIC_RELEASE);
-  ct_cover(h->row, 2 * k + 2);
 }
 // entry i of row k's list set (in place)
 static inline void ckl_put(void *p, int64_t k, int64_t i, int64_t v) {
@@ -501,7 +580,7 @@ static inline void ckl_add(void *p, int64_t k, int64_t v) {
   int64_t at = cl_res(h, n + 1);
   for (int64_t i = 0; i < n; i++) h->pool[at + i] = h->pool[off + i];
   h->pool[at + n] = v;
-  int64_t *w = &h->row[2 * k];
+  int64_t *w = (int64_t *)rp;
   __atomic_store_n(&w[1], n + 1, __ATOMIC_RELAXED);
   __atomic_store_n(&w[0], at, __ATOMIC_RELEASE);
 }
@@ -513,7 +592,7 @@ static inline void ckl_add(void *p, int64_t k, int64_t v) {
 static inline bool ckl_publish(void *p, int64_t k, const int64_t *xs, int64_t n) {
   cl_t *h = p;
   if ((uint64_t)k >= (uint64_t)(CT_MAX / 2)) vu_panic(0, "ckl_publish: row out of range", 29);
-  int64_t *rp = &h->row[2 * k];
+  int64_t *rp = ckl_wp(h, k);
   int64_t old = 0;
   if (!__atomic_compare_exchange_n(&rp[0], &old, -1, false, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE)) {
     while (__atomic_load_n(&rp[0], __ATOMIC_ACQUIRE) < 0) sched_yield();
@@ -522,15 +601,21 @@ static inline bool ckl_publish(void *p, int64_t k, const int64_t *xs, int64_t n)
   int64_t at = cl_res(h, n);
   for (int64_t i = 0; i < n; i++) h->pool[at + i] = xs[i];
   __atomic_store_n(&rp[1], n, __ATOMIC_RELAXED);
-  ct_cover(h->row, 2 * k + 2);
   __atomic_store_n(&rp[0], at, __ATOMIC_RELEASE);
   return true;
 }
 static inline void ckl_del(void *p, int64_t k) {
   cl_t *h = p;
-  if ((uint64_t)k >= (uint64_t)(ct_len0(h->row) >> 1)) return;
-  __atomic_store_n(&h->row[2 * k], 0, __ATOMIC_RELEASE);
-  __atomic_store_n(&h->row[2 * k + 1], 0, __ATOMIC_RELAXED);
+  int64_t *rp;
+  if (h->sh) {
+    rp = cl_srp(h, k, false);
+    if (!rp) return;
+  } else {
+    if ((uint64_t)k >= (uint64_t)(ct_len0(h->row) >> 1)) return;
+    rp = &h->row[2 * k];
+  }
+  __atomic_store_n(&rp[0], 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&rp[1], 0, __ATOMIC_RELAXED);
 }
 
 // Object types' properties by (object, name): the key object << 32 | name (both under 2^31). A fixed
@@ -807,31 +892,89 @@ static inline void cs_free(void *p) {
 }
 // (VTSC_MEM) the store's tables by the memory their entries take, the largest 25 and each kind's sum
 #include <stdio.h>
+#include <unistd.h>
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#endif
+static int ct_res_nz;
+static int64_t ct_res_nzb;
+// the bytes of a column's region in memory (its pages touched)
+static inline int64_t ct_resident(void *h) {
+  int64_t *base = (int64_t *)h - CT_HEAD;
+  size_t len = (size_t)(CT_MAX + CT_HEAD) * 8, pg = (size_t)getpagesize();
+  // (only up to the highest entry reserved or written: the length, or the run counter)
+  int64_t hi = ((int64_t *)h)[-2] > ((int64_t *)h)[-1] ? ((int64_t *)h)[-2] : ((int64_t *)h)[-1];
+  size_t want = (size_t)(hi + CT_HEAD) * 8 + pg;
+  if (want < len) len = want;
+  size_t np = (len + pg - 1) / pg;
+  char *v = malloc(np);
+  if (!v) return 0;
+  int64_t n = 0, nz = 0;
+  if (mincore((void *)base, len, v) == 0)
+    for (size_t i = 0; i < np; i++) {
+      if (!(v[i] & 1)) continue;
+      n += 1;
+      // (VTSC_MEM=2: how many of them hold anything but zeros)
+      if (ct_res_nz) {
+        const int64_t *q = (const int64_t *)((char *)base + i * pg);
+        for (size_t j = 0; j < pg / 8; j++) if (q[j] != 0) { nz += 1; break; }
+      }
+    }
+  free(v);
+  ct_res_nzb += nz * (int64_t)pg;
+  return n * (int64_t)pg;
+}
 static inline void cs_report(void *p) {
   cs_t *s = p;
   int64_t tot[6] = {0};
   int64_t *by = calloc((size_t)s->n + 1, sizeof *by);
+  const char *mv = getenv("VTSC_MEM");
+  ct_res_nz = mv && mv[0] == '2';
+  int64_t *nzb = calloc((size_t)s->n + 1, sizeof *nzb);
   for (int64_t i = 0; i < s->n; i++) {
     int64_t b = 0;
     void *x = s->p[i];
+    ct_res_nzb = 0;
+    // (resident: the pages of each region the process has touched, mincore)
     switch (s->k[i]) {
-      case 0: b = ct_len0((int64_t *)x) * 8; break;
-      case 1: b = ct_len0(((cl_t *)x)->row) * 8 + ((cl_t *)x)->pool[-1] * 8; break;
-      case 2: b = ((ph_t *)x)->pool[-1] * 8 + PH_BUCKETS * 8; break;
-      case 4: b = ((ik_t *)x)->pool[-1] * 8; break;
-      case 5: b = ((ns_t *)x)->pool[-1] * 8; break;
+      case 0: b = ct_resident(x); break;
+      case 1: b = ct_resident(((cl_t *)x)->row) + ct_resident(((cl_t *)x)->pool) + (((cl_t *)x)->sh ? ct_resident(((cl_t *)x)->se) + CL_SBUCKETS * 8 : 0); break;
+      case 2: b = ct_resident(((ph_t *)x)->pool) + ct_resident(((ph_t *)x)->bloom) + PH_BUCKETS * 8; break;
+      case 4: b = ct_resident(((ik_t *)x)->pool) + IK_BUCKETS * 8; break;
+      case 5: b = ct_resident(((ns_t *)x)->pool) + ct_resident(((ns_t *)x)->ids) + IK_BUCKETS * 8; break;
       default: b = 0;
     }
     by[i] = b;
+    nzb[i] = ct_res_nzb;
     if (s->k[i] < 6) tot[s->k[i]] += b;
   }
+#ifdef __APPLE__
+  {
+    malloc_statistics_t ms;
+    malloc_zone_statistics(NULL, &ms);
+    fprintf(stderr, "MEMT malloc in use %lld MB (allocated %lld MB)\n", (long long)(ms.size_in_use >> 20), (long long)(ms.size_allocated >> 20));
+  }
+#endif
   fprintf(stderr, "MEMT kinds MB: columns %lld lists %lld props %lld interned %lld names %lld\n", (long long)(tot[0] >> 20), (long long)(tot[1] >> 20), (long long)(tot[2] >> 20), (long long)(tot[4] >> 20), (long long)(tot[5] >> 20));
-  for (int r = 0; r < 25; r++) {
+  for (int r = 0; r < 40; r++) {
     int64_t bi = -1;
     for (int64_t i = 0; i < s->n; i++) if (by[i] > 0 && (bi < 0 || by[i] > by[bi])) bi = i;
     if (bi < 0) break;
-    fprintf(stderr, "MEMT #%lld kind %d %lld MB\n", (long long)bi, s->k[bi], (long long)(by[bi] >> 20));
+    fprintf(stderr, "MEMT #%lld kind %d %lld MB (%lld MB not all zeros)", (long long)bi, s->k[bi], (long long)(by[bi] >> 20), (long long)(nzb[bi] >> 20));
+    if (s->k[bi] == 1) {
+      // (a list column: its rows, the entries their lists hold, and the pool's entries reserved)
+      cl_t *h = s->p[bi];
+      int64_t nr = ct_len0(h->row) >> 1, live = 0, ne = 0;
+      for (int64_t r = 0; r < nr; r++) { live += h->row[2 * r + 1]; ne += h->row[2 * r + 1] > 0; }
+      if (h->sh) {
+        nr = (h->se[-1] - 4) / 4;
+        for (int64_t x = 4; x < h->se[-1]; x += 4) { live += h->se[x + 3]; ne += h->se[x + 3] > 0; }
+      }
+      fprintf(stderr, " rows %lld (%lld not empty) entries %lld pool %lld", (long long)nr, (long long)ne, (long long)live, (long long)h->pool[-1]);
+    }
+    fprintf(stderr, "\n");
     by[bi] = 0;
   }
   free(by);
+  free(nzb);
 }
