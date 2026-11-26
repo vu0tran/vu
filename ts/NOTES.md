@@ -1753,6 +1753,18 @@ other work, so every number is high; the earlier 61 / 79 s were at a load of 14-
 | after (eaac7364) | 71.1, 63.6 | 428, 428 | 10.1, 10.0 GB | 10.3, 10.3 GB |
 Every vlint output identical to j_base in all four runs.
 
+Again on 27c7f129 (threads in place of forked shards, the memory work), the three alternated
+twice, load 15-22:
+| build | wall | cpu-s | peak RSS | peak phys_footprint |
+|---|---|---|---|---|
+| 27c7f129 | 99.1, 64.6 | 405, 399 | 5.8, 5.8 GB | 5.5, 5.5 GB |
+| oxlint 1.79 | 108.4, 98.3 | 532, 521 | 8.9, 9.7 GB | 11.7, 11.6 GB |
+| these on 27c7f129 (5431a9e4) | 62.6, 68.9 | 393, 391 | 5.5, 5.7 GB | 5.3, 5.5 GB |
+These builds' outputs identical to j_base in both runs (and the gate's); 27c7f129's second run
+differed on idx 75 (190 files left untyped) and idx 12's stderr (2 untyped where 1): idx 75 alone
+left about 190 files untyped in 2 of 6 runs of ef8334ea and 1 of 10 of these changes on it, so it
+comes from the threaded check, not from these.
+
 What's left before the check: the JS host's first answer (node's start, the host, the local plugin;
 about 0.1 s) is what the smallest 25 or so invocations wait for, their type-aware part done in
 0.07; the walk of the 14,449-file package (0.24 s, gitignore matching per entry) and its tsconfig's
