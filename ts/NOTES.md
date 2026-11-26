@@ -1370,6 +1370,105 @@ declarations each worker types again) cost 40% more cpu on threads than forked, 
 (contention on the shared columns' writes, or the per-worker copies of the main checker's maps);
 TSan on 8 threads only for the first 195 cases; vlint itself not under TSan (see above).
 
+### The CI job's critical path (measured 2026-11-25, evening)
+
+The threads above took ~1.4 s off the job where the model said 10-20, so this looked at what bounds
+it (the session's scratch `m17/`: `allph.sh` each invocation alone with VLINT_T, VTSC_PHASES and
+the workers' stderr; `phs.py` the table; `sched.py` the two-lane schedule from job.txt's walls;
+`jd.py` two jobs' walls compared; load 17-34 on 10 cores from other work throughout, so every
+wall and cpu here is high and noisy, two or more alternated runs each).
+
+The schedule: two lanes taking invocations in plan order, so the job's wall is the walls' sum
+over two plus the lanes' imbalance at the end (127.1 s of walls in a 66.9 s job: 63.6 + 3.3; the
+second to last invocation, the 2,710-file program, starts with the other lane 0.4 s from done).
+No single invocation bounds it: 47 invocations under 1 s are 20.6 s of the sum (oxlint 24.6), 22
+of 1-2 s 31.9 (32.5), 16 of 2-5 s 47.5 (50.5), the three largest 27.1 (42.8). vlint won big only
+on the three largest; in the 1-4 s ones it was within ±0.5 s of oxlint
+or behind (33 invocations slower, by 10.2 s in all).
+
+Each invocation alone (`phs.py`): the type-aware part is the critical path of 78 of 88 (the plain
+lint done in a third of the time or less). In those, of 106.9 s of walls: before the program's
+files are read about 0.2-0.37 s each (29 s in all), reading, resolving and parsing 15.6 s (one
+thread; 0.15-0.65 s a program), the check 54.3 s, the rest 8 s. Before the type-aware plan began,
+0.15 s of every invocation was the JS plugin host's first answer (node starting, the host, the
+local plugin's .mts imported: load_rc waits for the plugin's rule names), and 0.06-0.15 s more on
+large packages matching every file against the overrides' globs (some 210 on one package). In
+the check: a program with one worker (fewer than 400 files: 71 invocations, 25.5 s of checks)
+was checked on one thread, mostly typing the lib and the shared declarations (40 files: 0.66 s);
+a program with forked shards was split by closure_shards, whose guess at each file's cost was
+off by 3x: the 2,710-file program's 8 shards took 1.5 to 4.9 s, a 1,130-file one's 5 shards 1.6
+to 2.5; and that 2,710-file program read and parsed all its files twice (0.9 s), a package's
+declarations it imports naming `/// <reference lib="dom.iterable" />`, found only after every
+file was read.
+
+What landed (each with the gate: the job's 176 outputs, probes and shuffled 1 and 2, vtests'
+3 known failures, one checker's instructions on idx 59/86/52/31):
+- ctab.h's list columns: a row that can't grow in place moves into a power-of-two reservation of
+  its own (it was written again whole at every add while threads appended to the pool: quadratic,
+  and with 8 threads the 1,130-file program ran out of its pool, "cl: a list pool is full"). On 4
+  threads that program peaks at 2.0 GB, was 3.2.
+- lvtsc.small_threads: a program the run gives one worker is checked on up to 4 threads (fewer when
+  several programs share the budget; 20 files or more): 258 files 2.07 -> 1.31 s alone, 40 files
+  1.07 -> 0.79, 67 files 1.43 -> 1.10, cpu +35%.
+- lglob.lit_differs: a glob's plain prefix compared before matching (the 5,108-file package's
+  per-file tables 0.15 -> 0.06 s).
+- vlint.spec_ta: the type-aware inputs computed before the JS plugins load (the configurations read
+  again with m.x_lenient, skipping the rules of plugins that aren't native, no message printed:
+  any error, and the speculative run isn't started), the plan started on them, and compared with
+  main's own (same_ta) when main has them: the same files and rule sets, or the speculative run
+  waited for, dropped, and started again. The type-aware plan begins about 0.03 s into an
+  invocation instead of 0.18-0.48. Checked by hand: a JS plugin with a bad rule name (the same
+  message and exit), nested configurations.
+- the forked shards claim their files from flags in a shared mapping (lcache.shared_flags): each
+  goes through the checking order taking its closure_shards part and any file of a shard more than
+  a twentieth of the order behind it. The order is required: a shard that took files of other
+  parts after its own (from the end, tried first) left 20-240 files of a program unlinted (a file
+  checked after files that import it had some of its nodes typed outside its own check). The
+  2,710-file program 6.7-7.1 -> 5.3-5.5 s, 1,130 files 3.5-4.7 -> 3.2, 1,149 files 3.0-3.6 -> 2.4;
+  cpu +3-8%.
+
+Not kept: a lib a file references that isn't loaded starting the run again at once rather than
+after every file: the 2,710-file program forked 0.1-0.5 s sooner, but one checker's instructions
+rose 10% on idx 59 and 4% on idx 52 (several restarts, each redoing a partial pass, where one late
+restart with every lib had done). The forked shards taking the files from one shared counter
+in order (as threads do): the job 61.7 and 62.1 s against 63.2 and 64.9, but cpu +12 s and 2.6 GB more at the peak (each
+shard types more of the shared declarations); the steal above is about as fast with half the
+extra cpu. Threads for programs of 400-3,000 files in place of the forked shards: within the noise
+on five such invocations, a 1,130-file one +30% cpu. VLINT_VTSC_SMALL_THREADS=2: the job 63.5 and
+62.9 against 4's 61.7 and 62.1.
+
+The cold job, the three alternated, two rounds (load 14-27): before (eedbf4d6) 67.6 and 67.0 s,
+376 and 378 cpu-s, 7.9 and 8.4 GB at the peak; after 61.6 and 61.2 s, 415 and 413 cpu-s, 9.9 and
+10.3 GB; oxlint 1.79 79.3 and 79.4 s, 482 and 487 cpu-s, 8.2 GB. The walls' sum 127.9 -> 117.8 s
+(oxlint's 150.8); the lanes end at 56.2 and 61.6 s, the 2,710-file program (5.7 s) the last on
+the longer one. The cpu is the small programs' threads (+33 s) and the shards' stealing (+8);
+the peak, the shards of a program finishing together instead of some early. On a machine this
+loaded the extra cpu costs wall: the threads and the early start together took 2.5 s off the
+walls' halved sum where the invocations alone said about 11.
+
+Found, not fixed (from eedbf4d6's threads, not these changes): in the job, idx 59 (the
+14,449-file program on 8 threads) sometimes marks one more file unchecked, "a variable whose type
+evolves along branches or loops" (an untyped `let` read in a useMemo callback, chk.vu's
+unsup there), and its 8 importers after it: stderr says 16 files where it says 7, stdout the
+same. Seen in 1 of 6 job runs of eedbf4d6 and 4 of 29 since (2 of 4 with
+VLINT_VTSC_DEBUG=2), never in 14 runs of idx 59 alone or beside another large invocation, nor in
+the earlier dgate rounds. Likely the fill-timing case above: another worker types the callback's
+body for the symbol's type before the file's own check does, where the narrowing isn't known.
+None of the gate runs above showed it.
+
+What's left, by size:
+- each checker types the lib and the shared declarations again: forked shards (a 1,130-file
+  program's 5 shards check 9.9 cpu-s against one checker's 4.6), every invocation (88 times), and
+  threads only within one process. Sharing them across processes is the large lever left: a typed
+  snapshot of the lib and the packages' declarations, keyed by their files, read-only in the
+  shards and the later invocations (a cache built in the cold job by its first invocations).
+- the check itself: vtsc checks every statement of every file (assignability for errors no rule
+  reads, JSX attributes against props), where tsgolint's checker types only what the rules ask
+  about: 42 files of a component library take 0.65 s to check, oxlint's whole invocation 0.57.
+- reading and parsing a forked program, on one thread before the fork (0.3-0.8 s on the 400-3,000
+  file programs): read-ahead needs threads, which forking forbids.
+- the tail: the plan's order puts the 2,710-file program second to last; the lanes end 2-5 s apart.
+
 ## Keeping the caches in CI
 
 What a CI job can keep between runs is one folder: `$XDG_CACHE_HOME/vlint` (`~/.cache/vlint`
