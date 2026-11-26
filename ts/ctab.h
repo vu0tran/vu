@@ -7,6 +7,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sched.h>
+#include <time.h>
 #define CT_MAX ((int64_t)1 << 28)  // entries a column can hold (2 GB of address space, reserved only)
 
 // The tables a checker uses are made through one store (types.Store, the owner: the task that made
@@ -51,11 +52,15 @@ static inline void *cg_view(int64_t a) { return ct_view(a); }
 // a signature's, a symbol's). A row is taken once (cg_row, a fetch-add), its entries written
 // (ct_put, cl_init), and the row's index handed to other tasks only after that.
 static inline void *cg_new(void *st) {
-  int64_t *g = calloc(1, 64);
+  // (a cache line of its own: every new row of the group is a fetch-add on it)
+  int64_t *g = NULL;
+  if (posix_memalign((void **)&g, 128, 128) != 0) g = NULL;
   if (!g) vu_panic(0, "cg_new: out of memory", 21);
+  memset(g, 0, 128);
   cs_add(st, g, 3);
   return g;
 }
+static int64_t ct_slack_n;
 static inline int64_t cg_row(void *g) {
   int64_t r = __atomic_fetch_add((int64_t *)g, 1, __ATOMIC_RELAXED);
   if (r >= CT_MAX / 2) vu_panic(0, "cg_row: a table group is full", 29);
@@ -68,15 +73,17 @@ static inline int64_t cg_rows(void *g, int64_t n) {
   return r;
 }
 static inline int64_t cg_len(void *g) { return __atomic_load_n((const int64_t *)g, __ATOMIC_ACQUIRE); }
+// (the length and the run counter, p[-2] and p[-1], in a cache line before the entries': read by
+// every bounds check, it is written only as the column grows)
+#define CT_HEAD 16
 static inline void *ct_mk(void) {
-  int64_t *r = mmap(NULL, (size_t)(CT_MAX + 2) * 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+  int64_t *r = mmap(NULL, (size_t)(CT_MAX + CT_HEAD) * 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
   if (r == MAP_FAILED) {
     vu_panic(0, "ct_new: no address space for a column", 37);
   }
-  r[0] = 0;
-  return r + 2;
+  return r + CT_HEAD;
 }
-static inline void ct_free(void *h) { munmap((int64_t *)h - 2, (size_t)(CT_MAX + 2) * 8); }
+static inline void ct_free(void *h) { munmap((int64_t *)h - CT_HEAD, (size_t)(CT_MAX + CT_HEAD) * 8); }
 static inline void *ct_new(void *st) {
   void *t = ct_mk();
   cs_add(st, t, 0);
@@ -84,10 +91,19 @@ static inline void *ct_new(void *st) {
 }
 // a column's length, as a bounds check reads it (relaxed: no order needed, see ct_at)
 static inline int64_t ct_len0(const int64_t *p) { return __atomic_load_n(&p[-2], __ATOMIC_RELAXED); }
+// How far past what's written a column's length is raised (ct_cover): 0, the exact length, but
+// while several threads write the tables (types.worker_checker), 63: the length (a cache line every
+// reader's bounds check reads) then changes once in 64 rows, not at every row each thread makes. An
+// entry past the end then reads 0, as one never written does.
+static inline void ct_slack(int64_t n) { ct_slack_n = n; }
 // the column's length raised to at least n (a row of its group written: ct_put, cl_init)
 static inline void ct_cover(int64_t *p, int64_t n) {
   int64_t l = __atomic_load_n(&p[-2], __ATOMIC_RELAXED);
-  while (l < n && !__atomic_compare_exchange_n(&p[-2], &l, n, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
+  if (__builtin_expect(l >= n, 1)) return;
+  int64_t m = (n + ct_slack_n) & ~ct_slack_n;
+  if (m > CT_MAX) m = CT_MAX;
+  if (m < n) m = n;
+  while (l < n && !__atomic_compare_exchange_n(&p[-2], &l, m, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED)) {
   }
 }
 // entry r of a row its group gave (cg_row) written
@@ -139,9 +155,87 @@ static inline int64_t ct_acq(void *h, int64_t i) {
 static inline int64_t ct_orow(void *res, void *mine, int64_t o) {
   int64_t r = __atomic_load_n(&((const int64_t *)res)[o], __ATOMIC_ACQUIRE);
   if (__builtin_expect(r == 1, 1)) return o;
-  if (r >= 2) return r - 2;
+  // (this worker's own row while it fills o, even once another worker's fill is published: the
+  // members are written into the row being filled, never into a published one others read)
   int64_t m = ct_get0(mine, o);
-  return m != 0 ? m - 1 : o;
+  if (m != 0) return m - 1;
+  return r >= 2 ? r - 2 : o;
+}
+// An object's lazy fill claimed (VTSC_OFILL=1 with threads, bind.ensure_resolved): ho_resolved from 0
+// to -(k + 1), k the filling worker's number, so one worker fills it and the others wait for its
+// row rather than fill rows of their own (whose member symbols and signatures would be other ones).
+// A worker's column of the objects it fills (ho_mine) keeps, in its header, its number (p[-3]) and
+// the object it waits for + 1 (p[-4]); ct_wk finds the column by the number, to follow a chain of
+// waits: one that comes back to the waiting worker (each waits for an object another one is filling)
+// is a cycle, which serial checking meets as a fill reading its own rows so far.
+#define CT_NW 128
+static int64_t *ct_wk[CT_NW];
+static inline void ct_worker(void *mine, int64_t k) {
+  int64_t *p = mine;
+  if ((uint64_t)k >= CT_NW) vu_panic(0, "ct_worker: too many workers", 27);
+  p[-3] = k;
+  p[-4] = 0;
+  __atomic_store_n(&ct_wk[k], p, __ATOMIC_SEQ_CST);
+}
+static inline void ct_workers_done(void) {
+  for (int i = 0; i < CT_NW; i++) __atomic_store_n(&ct_wk[i], NULL, __ATOMIC_SEQ_CST);
+}
+static inline int64_t ct_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+// 1: o claimed by this call (fill it, then ct_filled); 0: filled, maybe by another worker this call
+// waited for; 2: claimed by another worker that waits, through others maybe, for an object this one
+// is filling (or for more than 10 s: a worker that can't run): fill it too, into a row of its own
+static inline int64_t ct_claim(void *res, void *mine, int64_t o) {
+  int64_t *R = res, *M = mine;
+  int64_t k = M[-3];
+  if ((uint64_t)o >= (uint64_t)ct_len0(R)) vu_panic(0, "ct_claim: index out of range", 28);
+  int64_t spins = 0, t0 = 0;
+  for (;;) {
+    int64_t r = __atomic_load_n(&R[o], __ATOMIC_ACQUIRE);
+    int64_t got = -1;
+    if (r > 0) got = 0;
+    else if (r == 0) {
+      int64_t z = 0;
+      if (__atomic_compare_exchange_n(&R[o], &z, -(k + 1), false, __ATOMIC_SEQ_CST, __ATOMIC_ACQUIRE)) got = 1;
+      else continue;
+    } else if (-r - 1 == k) got = 2;
+    else {
+      __atomic_store_n(&M[-4], o + 1, __ATOMIC_SEQ_CST);
+      int64_t x = -r - 1;
+      for (int step = 0; step < CT_NW && got < 0; step++) {
+        int64_t *X = __atomic_load_n(&ct_wk[x], __ATOMIC_SEQ_CST);
+        if (!X) break;
+        int64_t wo = __atomic_load_n(&X[-4], __ATOMIC_SEQ_CST);
+        if (wo <= 0 || (uint64_t)(wo - 1) >= (uint64_t)ct_len0(R)) break;
+        int64_t r2 = __atomic_load_n(&R[wo - 1], __ATOMIC_SEQ_CST);
+        if (r2 >= 0) break;
+        x = -r2 - 1;
+        if (x == k) got = 2;
+      }
+      if (got < 0) {
+        spins += 1;
+        if (spins > 64) sched_yield();
+        if ((spins & 1023) == 0) {
+          int64_t t = ct_now_ms();
+          if (t0 == 0) t0 = t;
+          else if (t - t0 > 10000) got = 2;
+        }
+      }
+    }
+    if (got >= 0) {
+      __atomic_store_n(&M[-4], 0, __ATOMIC_SEQ_CST);
+      return got;
+    }
+  }
+}
+// o's fill published: its row + 2, by the worker that claimed it
+static inline void ct_filled(void *res, int64_t o, int64_t v) {
+  int64_t *R = res;
+  if ((uint64_t)o >= (uint64_t)ct_len0(R)) vu_panic(0, "ct_filled: index out of range", 29);
+  __atomic_store_n(&R[o], v, __ATOMIC_RELEASE);
 }
 // entry i from old to v with a compare-and-swap (release): whether this call set it
 static inline bool ct_cas(void *h, int64_t i, int64_t old, int64_t v) {
@@ -158,13 +252,18 @@ static inline int64_t ct_get0(void *h, int64_t i) {
   return __atomic_load_n(&p[i], __ATOMIC_RELAXED);
 }
 // a Float kept in an Int column (its bits)
+// (relaxed atomics: two threads making one numeric literal both write its value, the same bits)
 static inline void ct_putf(void *h, int64_t r, double v) {
-  int64_t b;
+  int64_t b, *p = h;
   memcpy(&b, &v, 8);
-  ct_put(h, r, b);
+  if ((uint64_t)r >= (uint64_t)CT_MAX) vu_panic(0, "ct_put: index out of range", 26);
+  __atomic_store_n(&p[r], b, __ATOMIC_RELAXED);
+  ct_cover(p, r + 1);
 }
 static inline double ct_atf(void *h, int64_t i) {
-  int64_t b = ct_at(h, i);
+  const int64_t *p = h;
+  if (__builtin_expect((uint64_t)i >= (uint64_t)ct_len0(p), 0)) vu_panic(0, "ct_at: index out of range", 25);
+  int64_t b = __atomic_load_n(&p[i], __ATOMIC_RELAXED);
   double v;
   memcpy(&v, &b, 8);
   return v;
