@@ -1841,6 +1841,91 @@ referring to one worker's copy) and for this one (a shared value read twice):
   index lookup, chk's ref_key); declared_type's two reads of `dty` and prop_type_for's of
   hy_thistp only go from unmade to made, and take the same path either way.
 
+### The type-aware rules and the checker's maps on the CI job's pattern (measured 2026-11-26, later)
+
+How it was measured (the session's scratch `m23/`): `sall.sh` samples the 88 invocations serially
+(`samp.py`, folded by `fold.py`, split by `incl.py`/`callers.py`), `insm.sh`/`ins_ta.sh` serial
+instructions and cycles, `thr.sh` one invocation on N threads as the job runs it. Before (27c7f129),
+in the 88 serial samples: the rules 23% of the type-aware work, no-unsafe-enum-assignment 8.6% of
+it (its receiver search `rt_enum` 7.4%, 71% of that typing properties), no-misused-promises 2.9%,
+no-deprecated 2.1%; the per-node hash maps' inserts (`vu_mset_M3_IntInt`) 5.1%, of which the
+checker's ntype 40% and the rules' parents 12%.
+
+What landed (each: probes 135/135 and shuffled 1 and 2, vtests the 3 known failures, the job's
+176 outputs as j_base, `dgate.sh` idx 31/52/86/59 at 1/2/4/8 threads 16 of 16):
+- union_plain1's removeStringLiteralsMatchedByTemplateLiterals: the templates listed once, a
+  literal's text read once, the first template that matches ends the search, and a plain
+  template's first and last texts tested before tmpl_matches builds its parts. lib.dom's AutoFill (a
+  template over unions: thousands of literals and templates) 41 -> 3 ms, React's two 16 and 14 ms;
+  predeclare_shells on idx 25 (2,220 aliases) 92 -> 33 ms, on idx 64 346 -> 60 ms.
+- types.NodeMap: a map from nodes to Ints in pages of 256 nodes in one list (a page made when a
+  node in it is first set; keys outside a window, or negative, in a map of their own) for the
+  checker's ntype, nctx and call_sig and the rules' Run.parents (a window over the file's nodes).
+  ntype on idx 86: 1.19 M entries in 11,554 pages (24 MB, against about 38 MB as a map). Cycles
+  -4 to -8% on idx 52 and 86, instructions -1 to -2%.
+- memos for the checker: no-misused-promises' mp_thenable_fn and mp_void_fn by type, no-deprecated's
+  sym_deprecation by symbol; types.sty one map lookup, type_of_sym reading it once; the rule names
+  listed once per file.
+
+Serial instructions of idx 59 / 86 / 52 / 31: 149.4 / 87.5 / 54.8 / 48.1 -> 143.5 / 85.3 / 51.3 /
+45.9 G. Small invocations as the job runs them (4 threads): idx 25 10.05 -> 8.22 G, 16 24.3 -> 23.8,
+64 17.9 -> 16.1, 80 14.9 -> 13.5.
+
+Not kept, or not possible exactly:
+- no-unsafe-enum-assignment. Of 315,843 receiver searches in the 88 invocations, 10,230 find an
+  enum literal; the rest type every property 5 levels down for nothing. The rule's whole cost (the
+  rule cut off at enum_mismatch's start, outputs aside): idx 64 11% of its instructions serial and
+  15% on 4 threads, idx 80 14 and 16%, idx 31 2 and 3%. Three shortcuts were tried:
+  - by the files' import closure (no enum declared in what a file reaches, the files that declare
+    globals or augment modules counted for every file): no file of idx 25, 16 or 52 qualified, as
+    packages' `declare global` and `declare module` blocks (astro's, vite's) reach enums (vite's
+    reach rolldown's), and `typeof globalThis` and lib.dom's Window reach those globals: a proof
+    over the whole reachable graph can't clear the DOM's types or globalThis, only the 5-level
+    search does.
+  - an upper bound for a per-declaration proof (unsound, measured only: skip every property
+    declared in a declaration file): idx 52 -0.5%, 16 -0.7%, 64 -10%, 80 -7%. Much of the typing
+    the search does would be done later anyway (idx 52: rt_enum's samples 470 -> 92, instructions
+    only -0.5%); Zod's types (idx 64, 80) are where it is waste.
+  - deep_mismatch(s, s) is false, so enum_mismatch(s, s) needs no search: idx 64 and 80 -5%, 52
+    -0.8%, but idx 29's stderr lists one file fewer as not fully typed (the stdout the same): the
+    search had typed a package's property that isn't modeled (@types/markdown-it's
+    parser_inline.d.mts, "this kind of type name"), and any unmodeled type reached while a file's
+    rules run drops that file's rules (trules.run: unsup_seq). So the search's typing shows in the
+    output, and any shortcut that types less changes which files are dropped. Taking it needs that
+    rule to change: a type reached only by enum_mismatch's search (or any rule's pre-filter) not
+    counting against the file. Not done: it changes outputs.
+  - sharing enum_rt and enum_mm between threads (SharedMaps; both are pure functions of their
+    types): the same instructions on 4 threads (idx 64 16.44 G both): the threads' extra work is
+    elsewhere.
+- no-misused-promises: testing first whether any argument returns a thenable (returns_thenable on
+  every argument, the signatures read only then): 11 more files of idx 76 dropped (type_at of an
+  argument never checked is unsupported; before, only arguments given to void callbacks were read).
+- prop_cache shared between threads (a SharedMap of the member symbols get_prop makes for OK_REF
+  and OK_INST types): idx 31 on 4 threads 49.8 -> 50.7 G, 64 14.9 -> 16.0: the SharedMap's lookups
+  cost more than the members made again.
+- predeclare_shells lazily: an alias whose body can't reach itself (literals, keywords, tuples and
+  arrays of them) could be declared by any worker when first read, but which alias names an
+  interned union first (alias_pub, alias_tag) would then depend on the threads' timing. Not done;
+  the template fix above took most of its time on the small programs (idx 16's 2,853 aliases still
+  130 ms: not looked into).
+- the runtime: _tlv_get_addr 2.8% of the serial samples (one thread-local access per list or
+  string buffer taken or given back, already one per call) and SharedMap lookups of the shared
+  instantiation caches 1.9% (cache misses in tables of millions of entries): no change found whose
+  gain was clear.
+
+What's left, by size: get_prop's chain walk 5% (self, after the bloom word: rt_enum1 a fifth of
+it), the instantiation caches' lookups 1.9%, new_mapper 2.3% (tyops.extend, compose1, get_prop's
+mapper for an OK_REF made again at each member), the threads' duplicated work (idx 31 +11%
+instructions on 4 threads: member symbols and instantiations made again per worker, new_sym 6x).
+
+The cold job, two rounds, each the new build, oxlint 1.79 and the old (27c7f129) in turn (load
+13-34 from other work): new 54.6 and 51.3 s, 361 and 362 cpu-s, 5.8 and 5.6 GB at the peak; old
+58.1 and 56.8 s, 376 and 376 cpu-s, 5.2 and 5.7 GB; oxlint 79.4 and 79.1 s, 482 and 480 cpu-s,
+9.1 and 8.6 GB. Every vlint run's 176 outputs as j_base. The 40 s asked for isn't reached: the
+remaining type-aware work is the checker's own (statements 60% of the serial samples), and the
+largest rule cost left, no-unsafe-enum-assignment's search, can't be cut without changing which
+files are reported as not fully typed (above).
+
 ## Keeping the caches in CI
 
 What a CI job can keep between runs is one folder: `$XDG_CACHE_HOME/vlint` (`~/.cache/vlint`
