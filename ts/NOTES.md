@@ -1475,9 +1475,108 @@ What's left, by size:
 - the check itself: vtsc checks every statement of every file (assignability for errors no rule
   reads, JSX attributes against props), where tsgolint's checker types only what the rules ask
   about: 42 files of a component library take 0.65 s to check, oxlint's whole invocation 0.57.
+  (Measured since, below: on this rule set the rules ask about every function and most nodes; the
+  checks made only for errors are skipped now, `Prog.lint_only`.)
 - reading and parsing a forked program, on one thread before the fork (0.3-0.8 s on the 400-3,000
   file programs): read-ahead needs threads, which forking forbids.
 - the tail: the plan's order puts the 2,710-file program second to last; the lanes end 2-5 s apart.
+
+### What the type-aware rules read, and checking only for them (measured 2026-11-25, night)
+
+The question: tsgolint types only what its rules ask about, vtsc checks every statement; how much of
+vtsc's check could a cold run skip without changing any output (the session's scratch `m19/`:
+`samp.py` one serial type-aware invocation under /usr/bin/sample, `fold.py`/`cats.py`/`incl.py`
+the call graph folded and split, `sall.sh` all 88; `insm.sh` serial instructions and cycles).
+
+What vlint's output depends on: on the job's pattern (`--type-aware`, no `--type-check`) no TS
+diagnostic is printed; the output is the rules' diagnostics, the "couldn't fully type" line and,
+with VLINT_VTSC_DEBUG=2, the NOLINT lines. Both lists come from `c.unsupported` (anything the
+checker or a rule reaches that isn't modeled) and from `trules.type_at`, which reads the type the
+file's check left on the node (`c.ntype`): a node no check typed is "a rule's type of an expression
+not checked", and the file's rules are dropped.
+
+What the rules ask (VTSC_QSTAT=1, per file: the expression nodes checked, those a rule asked the
+type of, and the checked nodes in function bodies no rule asked anything in), on the job's rule set
+(no-unsafe-*, no-floating-promises, no-misused-promises, await-thenable, no-deprecated, require-await,
+restrict-template-expressions, unbound-method and others, everywhere):
+
+| idx | files | nodes checked | asked by a rule | in bodies nothing asked about |
+|---|---|---|---|---|
+| 25 (a component library) | 40 | 8,292 | 37% | 0 |
+| 16 | 211 | 22,163 | 60% | 0 |
+| 76 | 1,127 | 133,483 | 67% | 0 |
+| 14 | 725 | 500,386 | 89% | 0 |
+| 40 | 610 | 382,334 | 87% | 0 |
+
+Every function is asked about (promise-function-async and require-await ask for the function's own
+type, no-unsafe-* for each call, member access and assignment in it), and the nodes not asked are
+mostly the parts of asked ones (callees, operands). So skipping bodies, or lazily typing them,
+saves nothing here. Typing an expression on demand isn't open to vtsc anyway: its narrowing is the
+statement walk's state (`c.narrow`), not a flow graph read backwards as tsc's getFlowTypeOfReference
+is, so an expression can only be typed in the walk's order.
+
+Where the serial type-aware time went (samples of vlint's process, the 88 invocations, 106.3 k):
+the user files' statements 55%, the rules 20% (no-unsafe-enum-assignment alone 6.6%, the dispatch
+4%: `trules.visit` trying every rule on every node), reading and parsing 8%, resolving 8% (stat
+2.7%), the rest 6%. Within the statements, the hottest leaf was `bind.get_prop`'s hash chain walk
+(8.3% of all): a property looked up and not there (a JSX element's few attributes against
+HTMLAttributes' 300 optional properties, three lookups each) costs a cache miss on the bucket and
+one on the entry, with chains of about one entry (244 k properties in 2^20 buckets).
+
+What landed (each: the job's 176 outputs as j_base, probes 135/135 and shuffled 1 and 2, vtests the
+3 known failures; serial instructions of idx 59 / 86 / 52 / 31 178.8 / 97.6 / 62.5 / 52.5 G before):
+- ctab.h's property table: a word per object with a bit for each of its names' hashes, set before an
+  entry is linked; `ph_get` returns -1 when the name's bit is clear. Cycles -10% on idx 76 and 31
+  (instructions the same: it's the misses it saves).
+- trules: each node tried only by the rules for its kind (`rule_kinds`, per kind lists in
+  `Run.byk`, the rules' order kept), and the rules' options parsed once per text (`optb`, memoized
+  on the checker) instead of at every file or node. idx 52 62.1 -> 56.7 G.
+- `Prog.lint_only` (vlint without --type-check; `Job.errs`, `plan_lint`'s `errs`, the speculative
+  run started with the arguments' --type-check and dropped when a configuration's differs): the
+  checks made only for type errors are skipped: type arguments against their constraints
+  (`targ_constraints`), an intrinsic element's attributes and the chosen signature's arguments
+  against what they're given to (`check_args` with `c.args_quiet`, except where a failed call's
+  type depends on it, `hs_failret`), initializers, assignments, `satisfies` and return values
+  against declared types, duplicate declarations (`check_declarations`). idx 76 43.2 -> 36.9 G,
+  idx 16 22.2 -> 19.7. The file cache's key has the flag (`to_json` of the Prog), so a --type-check
+  run never reads a lint-only result. Plain vtsc and --type-check check as before (idx 25 and 16
+  with --type-check: the same output, 41 and 3 TS errors).
+- After all three: idx 59 / 86 / 52 / 31 150.7 / 87.4 / 54.9 / 48.4 G; the 88 invocations' serial
+  samples 106.3 k -> 89.1 k (the statements 58.5 -> 46.6 k, the rules 21.7 -> 18.0 k).
+
+Not kept: what vtsc's import resolution asks the file system answered from folders' listings
+(`rv.lk`, lcache.listed_kind, as the module graph's workers do): idx 16 22.3 -> 24.0 G, read+parse
+371 -> 435 ms (listing node_modules' folders costs more than the stats it saves, in a process that
+lists nothing else). In no-unsafe-enum-assignment, typing a receiver's property only where the
+sender has it too (deep_mismatch): the same instructions; and without the receiver pre-search
+(`rt_enum`): idx 52 +13%. Skipping `check_type_alias`'s name checks: it also checks computed names'
+expressions in type literals, which rules read (two files unlinted, idx 76 and 14).
+
+The cold job, alternated with oxlint 1.79 (load 16-24 on 10 cores): before (b4d9cb10) 63.2 and
+62.8 s, 418 and 414 cpu-s, 10.7 and 10.4 GB at the peak; with the property bloom, the rules' dispatch
+and lint_only (2a86051b) 58.0 and 60.0 s, 382 and 382 cpu-s, 10.3 and 10.0 GB; oxlint 79.1 and 79.5 s,
+483 and 486 cpu-s, 8.1 and 8.4 GB. A later round with 159075e1, the machine busier (load 23-40):
+74.3 and 78.5 s, 421 and 425 cpu-s, 9.0 and 9.6 GB, against oxlint's 103.3 and 103.7 s, 535 and 540
+cpu-s, 6.9 and 7.0 GB. Determinism (`dgate.sh` idx 31, 52, 86, 59 at 1, 2, 4, 8 threads, 3 rounds):
+48 of 48 the same. The walls' sum 120.8 -> 113.4 s (oxlint's 150.5); of the 50 invocations
+oxlint does in under a second, vlint is slower in 9 (idx 25, a 42-file component library: 0.64 s
+against 0.57, of which reading and parsing 0.20 s, EAGERBIND 0.02, PREDECL 0.09, the threaded check
+0.23).
+
+What's left, by size:
+- no-unsafe-enum-assignment, 8% of the type-aware work after the above: `rt_enum` searches each
+  new receiver five levels deep, typing every property (`typeof globalThis` 6,760 steps once a
+  program; HTMLInputElement, Zod's object types). An exact shortcut needs a proof that no enum
+  literal is reachable: by the files' import closure (no enum declared in any file a declaration's
+  file can reach, the global and augmenting files included), or by searching a generic target once
+  and only its arguments per instantiation (with conditional, indexed and mapped types inside the
+  target answering "maybe").
+- `predeclare_shells` before the threads of a program: 88-95 ms on the small programs (2,220
+  aliases on idx 25), of which 3-5% of the invocation's instructions are aliases never used.
+  Lazy would need the shells (bind.declared_type1) safe to fill while other workers read them.
+- reading, parsing and resolving on one thread before the check (0.15-0.65 s a program), stat 3.7%.
+- per-node maps (`c.ntype`, `trules.Run.parents`): `vu_mset_M3_IntInt` 4.9%; the runtime's
+  thread-local free lists, `_tlv_get_addr` 3.9% (a call on macOS for every access).
 
 ## Keeping the caches in CI
 
