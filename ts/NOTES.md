@@ -1578,6 +1578,30 @@ What's left, by size:
 - per-node maps (`c.ntype`, `trules.Run.parents`): `vu_mset_M3_IntInt` 4.9%; the runtime's
   thread-local free lists, `_tlv_get_addr` 3.9% (a call on macOS for every access).
 
+### Peak memory on the CI job's pattern (measured 2026-11-26)
+
+Each invocation alone (scratch `m19/peak.py`: the process tree's RSS every 0.05 s), before: idx 86
+(2,710 files, 8 forked shards, 13 processes) 10.3 GB, idx 31 (1,439 files, shards) 7.0, idx 59
+(14,449 files, threads) 5.1, idx 76 (1,130, shards) 4.2. The forked shards are what grew it: each
+types the lib and the shared declarations again (about 1.1 GB a shard on idx 86). On threads
+(VTSC_THREADS_MIN_FILES=0, now the default): idx 86 5.5 GB, 31 3.3, 76 2.1, 37 4.0 -> 1.8, 29 3.6 ->
+1.7, walls within the noise. The job's peak 10.0-10.1 GB -> 8.0-8.4 GB (cpu 386-400 -> 388-395 s,
+walls 57-72 s both, the machine at load 19-43); oxlint 1.79 measured 8.1-8.4 GB and, in the same
+round, 12.4. small_threads isn't the cause: VLINT_VTSC_SMALL_THREADS=1 on idx 16/21/40/14 3.07/3.20/
+1.93/1.95 GB against 3.19/3.31/2.09/1.82 (and idx 40 2.60 s against 1.85). lint_only types less but
+allocates about the same: idx 76 4.66 -> 4.05 GB, 16 3.38 -> 2.77, 59/86/31 within the noise.
+
+Where one checker's memory goes (VTSC_MEM=1: the checker's containers over 10,000 entries and the
+store's tables, `cs_report`; PHASES' "peak MB after read+parse, bind, check"), idx 86 serial, 3.64
+GB: read and parse 0.83 GB (4.1 M nodes, 80 bytes each in `ast.nd`), binding +0.21, the check +2.6:
+the C tables 1.44 GB (columns 711 MB, mostly the object columns, a 1.48 M-row group touched whole by
+every column; list columns 520 MB; interned lists 168 MB; the property table 37 MB) and the Vu maps
+(prop_cache 1.6 M entries, ntype 1.2 M, rel_cache 1.1 M, ckr_memo 0.7 M, ck_memo 0.5 M, nctx,
+narrow_cache, lookup_cache, si_memo, enum_rt_no 0.3-0.4 M each: about 40-60 bytes an entry).
+A thread adds about 0.15 GB (idx 86 on 2 threads 4.8 GB, 8 threads 5.7). On the small invocations
+the JS plugin hosts are about half: idx 16 vlint 1.26 GB, its three node processes 0.86, 0.50 and
+0.23.
+
 ## Keeping the caches in CI
 
 What a CI job can keep between runs is one folder: `$XDG_CACHE_HOME/vlint` (`~/.cache/vlint`
