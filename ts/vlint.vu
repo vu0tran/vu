@@ -1690,6 +1690,7 @@ fn run(fs: Fs, os: Os, ffi: Ffi, av: [Str], var sk: Sink) -> Int throws:
   # on the CI job's pattern, two packages at a time with --threads=4, on 10 cores: 76.8 s against
   # 74.2; on a CI node with more cores the large programs would lose their workers)
   var jx = Jx(os, ffi, ljs.new_js(), threads)
+  if sk.bat: jx.js = ljs.batch_js(sk.rq)
   # the paths: explicit files that an ignore pattern matches are dropped
   var w = Walker([], lglob.gi_new(cwd), not a.no_ignore, a.ignore_path)
   for p in a.ignore_patterns: lglob.gi_add(&w.over, p)
@@ -1866,16 +1867,17 @@ fn run(fs: Fs, os: Os, ffi: Ffi, av: [Str], var sk: Sink) -> Int throws:
   if jx.js.on:
     for cc in cf.confs:
       for i in 0..cc.xr.b.len:
-        if cc.xr.b[i] != -9 and ljs.xhost_of(m, i) >= 0: ljs.options_id(&jx.js, i, cc.xr.o[i])
+        if cc.xr.b[i] != -9 and ljs.xhost_of(m, i) >= 0: ljs.options_idm(&jx.js, m, i, cc.xr.o[i])
       for k in 0..cc.overrides.len:
         let ox = lconf.override_xr(m, cc, k)
         for i in ox.ord:
-          if ljs.xhost_of(m, i) >= 0: ljs.options_id(&jx.js, i, ox.o[i])
+          if ljs.xhost_of(m, i) >= 0: ljs.options_idm(&jx.js, m, i, ox.o[i])
     let se = ljs.setup(ffi, &jx.js, cwd, m)
     if se != "":
       so(&sk, "Failed to setup JS plugin options:\n{se}\n")
       return 1
-    ljs.expect(ffi, kept.len)
+    if sk.bat: ljs.expect_add(ffi, kept.len)
+    else: ljs.expect(ffi, kept.len)
   if os.env("VLINT_T") != "": eprint("vlint T@ js setup {os.clock()}")
   if kept.len == 0:
     if not a.no_error_unmatched: so(&sk, "No files found to lint. Please check your paths and ignore patterns.\n")
@@ -1949,7 +1951,7 @@ fn run(fs: Fs, os: Os, ffi: Ffi, av: [Str], var sk: Sink) -> Int throws:
       var q = 0
       while q + 1 < xs.len:
         if ljs.runs_native(m, xs[q], xo[q / 2]): nparts.push("{ljs.xnat_of(m, xs[q])} {xs[q]} {xs[q + 1]} {q / 2}")
-        else: xparts.push("{xs[q]} {ljs.options_id(&jx.js, xs[q], xo[q / 2])} {xs[q + 1]}")
+        else: xparts.push("{xs[q]} {ljs.options_idm(&jx.js, m, xs[q], xo[q / 2])} {xs[q + 1]}")
         q += 2
       ob.push(" ".join(xparts))
       if xparts.len > 0: ob.push(globals_json(cc, rel))
@@ -2106,7 +2108,7 @@ fn run(fs: Fs, os: Os, ffi: Ffi, av: [Str], var sk: Sink) -> Int throws:
     # (while the type-aware part runs: the JS plugins' hosts let go, and the plain lint's freed
     # memory given back; VLINT_KEEP=1 keeps both)
     if os.env("VLINT_KEEP") != "1":
-      if jx.js.on: ljs.release(ffi)
+      if jx.js.on and not sk.bat: ljs.release(ffi)
       lcache.release_memory(ffi)
     let e = type_aware_run(fs, os, ffi, cwd, o, work_ta, type_check, pch, &results, &shown2, &sk)
     if e != "":
@@ -2174,6 +2176,9 @@ type Sink:
   direct: Bool
   out: [Str]
   err: [Str]
+  # (a batch's run: its JS plugins through the batch's registry, ljs.reg_serve)
+  bat: Bool
+  rq: Chan[ljs.RegReq]
 
 fn so(var sk: Sink, t: Str):
   if sk.direct: write(t)
@@ -2197,6 +2202,98 @@ fn main(fs: Fs, os: Os, ffi: Ffi) throws:
   let av = args()
   # (a vtsc program check in a child process: lvtsc.run_program)
   if av.len == 4 and av[1] == "--vtsc-worker": exit(lvtsc.worker(fs, os, ffi, av[2], av[3]))
-  var sk = Sink(true, [], [])
+  if av.len >= 2 and av[1] == "--batch": exit(batch(fs, os, ffi, av))
+  var sk = Sink(true, [], [], false, chan(1))
   let code = run_main(fs, os, ffi, av, &sk)
   if code != 0: exit(code)
+
+# ---- vlint --batch PLAN.json: many runs in one process
+
+# PLAN is a JSON array of runs, each {"args": [...]} (what would follow `vlint`) with "out", "err" and
+# "exit" optional: files that get its standard output, its standard error and its exit code (a line).
+# A run without them prints to the batch's own, in the plan's order, each run's whole. Its exit code
+# is the largest of the runs'. Every run is in the folder vlint runs in. The runs share one set of
+# JS plugin processes (warm: a plugin's code compiled once, not in each run), the build id, and the
+# machine: VLINT_BATCH_JOBS of them at a time (default 2 for each 5 CPUs, at least 1).
+type BRes:
+  i: Int
+  code: Int
+  out: Str
+  err: Str
+
+fn bjob(fs: Fs, os: Os, ffi: Ffi, own i: Int, own av: [Str], own rq: Chan[ljs.RegReq], own gate: Chan[Int], own done: Chan[BRes]):
+  let _t = gate.recv() else 0
+  var sk = Sink(direct: false, out: [], err: [], bat: true, rq: rq.share())
+  let code = run_main(fs, os, ffi, av, &sk)
+  gate.send(1)
+  done.send(BRes(i, code, "".join(sk.out), "".join(sk.err)))
+
+fn batch_err(msg: Str) -> Int:
+  eprint("vlint --batch: " + msg)
+  return 2
+
+fn batch(fs: Fs, os: Os, ffi: Ffi, av: [Str]) -> Int:
+  if av.len != 3: return batch_err("usage: vlint --batch PLAN.json")
+  let text = fs.read(av[2]) else return batch_err("can't read {av[2]}")
+  let pj = lconf.parse_json(text)
+  if pj.err != "" or pj.v.len == 0 or pj.v[0].k != lconf.J_ARR: return batch_err("{av[2]}: not a JSON array of runs")
+  var argvs: [[Str]] = []
+  var outs: [Str] = []
+  var errs: [Str] = []
+  var exits: [Str] = []
+  for r in pj.v[0].kids:
+    if pj.v[r].k != lconf.J_OBJ: return batch_err("{av[2]}: run {argvs.len} isn't an object")
+    let ai = lconf.get(pj, r, "args")
+    if ai < 0 or pj.v[ai].k != lconf.J_ARR: return batch_err("{av[2]}: run {argvs.len} has no \"args\" array")
+    var argv = [av[0] + ""]
+    for x in pj.v[ai].kids:
+      if pj.v[x].k != lconf.J_STR: return batch_err("{av[2]}: run {argvs.len}: an argument isn't a string")
+      argv.push(pj.v[x].s + "")
+    argvs.push(argv)
+    var f3: [Str] = []
+    for key in ["out", "err", "exit"]:
+      let k = lconf.get(pj, r, key)
+      if k >= 0 and pj.v[k].k == lconf.J_STR: f3.push(pj.v[k].s + "")
+      else: f3.push("")
+    outs.push(f3[0] + "")
+    errs.push(f3[1] + "")
+    exits.push(f3[2] + "")
+  let n = argvs.len
+  if os.env("VLINT_BUILD_ID") == "": lcache.setenv(ffi, "VLINT_BUILD_ID", lcache.exe_hash(fs, ffi))
+  let ncpu = cpu_count(os, ffi)
+  var k = int(os.env("VLINT_BATCH_JOBS")) else 0
+  if k <= 0: k = ncpu * 2 / 5
+  if k < 1: k = 1
+  let rq: Chan[ljs.RegReq] = chan(64)
+  spawn ljs.reg_serve(fs, os, ffi, rq.share(), ncpu)
+  let gate: Chan[Int] = chan(k + 1)
+  for _g in 0..k: gate.send(1)
+  let done: Chan[BRes] = chan(n + 1)
+  for i in 0..n:
+    var argv: [Str] = []
+    swap(&argv, &argvs[i])
+    spawn bjob(fs, os, ffi, i, argv, rq.share(), gate.share(), done.share())
+  # (each run's output once it and the runs before it are done)
+  var got: [BRes] = []
+  var have = [false] * n
+  for _j in 0..n: got.push(BRes(0, 0, "", ""))
+  var next = 0
+  var worst = 0
+  for _j in 0..n:
+    var r = done.recv() else break
+    let ri = r.i
+    if r.code > worst: worst = r.code
+    swap(&got[ri], &r)
+    have[ri] = true
+    while next < n and have[next]:
+      let g = got[next].out + ""
+      if outs[next] != "": fs.write(outs[next], g) else worst = 2
+      elif g != "": write(g)
+      let e = got[next].err + ""
+      if errs[next] != "": fs.write(errs[next], e) else worst = 2
+      elif e != "": eprint(e[0..e.len - 1])
+      if exits[next] != "": fs.write(exits[next], "{got[next].code}\n") else worst = 2
+      got[next] = BRes(0, 0, "", "")
+      next += 1
+  rq.close()
+  return worst

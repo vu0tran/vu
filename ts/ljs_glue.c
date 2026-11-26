@@ -56,6 +56,8 @@ typedef struct {
        so far, and the time it was busy on those past its first VL_WARM (an answer's time less its
        request's sending or the previous answer's, whichever is later) and how many those are */
     double *sent_at; long scap; double last_ans; long nlint, wserved; double wbusy;
+    /* (a batch: how much of the prelude it has been sent, vl_catch_up) */
+    size_t psent;
 } vl_worker;
 static vl_worker vlw[VL_MAXW];
 static pthread_mutex_t vl_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -65,6 +67,12 @@ static int vl_nargs = 0;
 static char **vl_env = NULL;      /* the processes' environment: vlint's, with NODE_COMPILE_CACHE */
 static char *vl_prelude = NULL;   /* lines */
 static size_t vl_prelude_len = 0;
+/* A batch (vlint --batch, vl_node_batch): the runs in it share the processes, and the prelude only
+   grows (vl_node_pcall appends a plugin's load or the options' setup as one run needs it); a running
+   process is sent the lines it hasn't had before its next request (vl_catch_up), each once.
+   vl_pmu guards the prelude (taken last: with a process's mu held, never the other way). */
+static int vl_batch = 0;
+static pthread_mutex_t vl_pmu = PTHREAD_MUTEX_INITIALIZER;
 static int vl_slots = 1, vl_next_slot = 0, vl_inited = 0;
 /* With the number of lint requests known (vl_node_expect), the calls go to the first vl_inuse
    processes, each to the one with the fewest requests waiting, and another process is started only
@@ -159,6 +167,7 @@ static void vl_init_once(void) {
         vlw[i].ans = NULL; vlw[i].alen = NULL; vlw[i].nans = vlw[i].acap = 0; vlw[i].has_reader = 0;
         vlw[i].died_gen = -1; vlw[i].died_t = -1; vlw[i].died_to = 0;
         vlw[i].sent_at = NULL; vlw[i].scap = 0; vlw[i].last_ans = 0; vlw[i].nlint = vlw[i].wserved = 0; vlw[i].wbusy = 0;
+        vlw[i].psent = 0;
     }
     atexit(vl_atexit);
     const char *t = getenv("VLINT_JS_TIMEOUT");
@@ -516,16 +525,23 @@ static bool vl_start(vl_worker *w) {
     w->pid = pid; w->in = wp; w->out = rp;
     fcntl(wp, F_SETFL, fcntl(wp, F_GETFL) | O_NONBLOCK);
     VL_DBG("process %d started", (int)pid);
-    /* the prelude: each line answered, the answers dropped */
-    const char *p = vl_prelude, *e = vl_prelude ? vl_prelude + vl_prelude_len : NULL;
+    /* the prelude: each line answered, the answers dropped (a copy: a batch's grows meanwhile) */
+    pthread_mutex_lock(&vl_pmu);
+    size_t plen = vl_prelude_len;
+    char *pcopy = plen ? malloc(plen) : NULL;
+    if (plen) memcpy(pcopy, vl_prelude, plen);
+    pthread_mutex_unlock(&vl_pmu);
+    w->psent = plen;
+    const char *p = pcopy, *e = pcopy ? pcopy + plen : NULL;
     while (p && p < e) {
         const char *nl = memchr(p, '\n', (size_t)(e - p));
         if (!nl) nl = e;
         if (nl > p) {
-            if (!vl_write_req(w, p, (size_t)(nl - p)) || !vl_write(w, w->in, "\n", 1) || !vl_recv(w, true)) { vl_stop(w); return false; }
+            if (!vl_write_req(w, p, (size_t)(nl - p)) || !vl_write(w, w->in, "\n", 1) || !vl_recv(w, true)) { free(pcopy); vl_stop(w); return false; }
         }
         p = nl + 1;
     }
+    free(pcopy);
     /* (what the prelude's answers left in buf is the reader's now) */
     vl_rarg *ra = malloc(sizeof *ra);
     ra->w = w;
@@ -597,12 +613,12 @@ void vl_node_setup(const vu_str *script, const vu_str *args, int64_t slots) {
 
 /* What every new process is sent first (lines). */
 void vl_node_prelude(const vu_str *lines) {
-    pthread_mutex_lock(&vl_mu);
+    pthread_mutex_lock(&vl_pmu);
     free(vl_prelude);
     vl_prelude = malloc((size_t)lines->len + 1);
     memcpy(vl_prelude, lines->data, (size_t)lines->len);
     vl_prelude_len = (size_t)lines->len;
-    pthread_mutex_unlock(&vl_mu);
+    pthread_mutex_unlock(&vl_pmu);
 }
 
 /* the request's file, for the trace: the "path" of a lint request (escapes left as they are) */
@@ -623,7 +639,55 @@ static void vl_req_path(const vu_str *req, char *out, size_t cap) {
 
 /* Sends a request and takes a ticket for its answer: the ticket and the process's generation, or
    false when node can't be started. A dead process is stopped and started again first. */
-static bool vl_send(vl_worker *w, const vu_str *req, long *t, int *g) {
+/* (a batch: the prelude's lines this running process hasn't had, written as requests whose answers
+   nobody takes; they wait in ans until the process stops. w->mu held, and rmu not.) */
+static bool vl_take_ticket(vl_worker *w, bool lint) {
+    pthread_mutex_lock(&w->rmu);
+    bool ok = !w->broken;
+    if (ok) {
+        if (w->tickets >= w->scap) {
+            w->scap = w->scap ? w->scap * 2 : 1024;
+            w->sent_at = realloc(w->sent_at, (size_t)w->scap * sizeof *w->sent_at);
+        }
+        w->sent_at[w->tickets] = lint ? vl_now() : -vl_now();
+        w->tickets++;
+    }
+    pthread_mutex_unlock(&w->rmu);
+    return ok;
+}
+static bool vl_catch_up(vl_worker *w, const vu_str *append) {
+    pthread_mutex_lock(&vl_pmu);
+    if (append) {
+        size_t n = vl_prelude_len + (size_t)append->len + 1;
+        vl_prelude = realloc(vl_prelude, n + 1);
+        if (vl_prelude_len) vl_prelude[vl_prelude_len++] = '\n';
+        memcpy(vl_prelude + vl_prelude_len, append->data, (size_t)append->len);
+        vl_prelude_len += (size_t)append->len;
+    }
+    size_t from = w->psent, to = append ? vl_prelude_len - (size_t)append->len : vl_prelude_len;
+    char *part = to > from ? malloc(to - from) : NULL;
+    if (part) memcpy(part, vl_prelude + from, to - from);
+    pthread_mutex_unlock(&vl_pmu);
+    bool ok = true;
+    const char *p = part, *e = part ? part + (to - from) : NULL;
+    while (ok && p && p < e) {
+        const char *nl = memchr(p, '\n', (size_t)(e - p));
+        if (!nl) nl = e;
+        if (nl > p) {
+            VL_DBG("process %d: catching up, %lld bytes of the prelude", (int)w->pid, (long long)(nl - p));
+            ok = vl_write_req(w, p, (size_t)(nl - p)) && vl_write(w, w->in, "\n", 1) && vl_take_ticket(w, false);
+        }
+        p = nl + 1;
+    }
+    free(part);
+    /* (the appended line is the request itself, sent next) */
+    if (ok) w->psent = append ? vl_prelude_len : to;
+    return ok;
+}
+
+static bool vl_send_x(vl_worker *w, const vu_str *req, long *t, int *g, const vu_str *append);
+static bool vl_send(vl_worker *w, const vu_str *req, long *t, int *g) { return vl_send_x(w, req, t, g, NULL); }
+static bool vl_send_x(vl_worker *w, const vu_str *req, long *t, int *g, const vu_str *append) {
     pthread_mutex_lock(&w->mu);
     if (w->broken || w->pid < 0) {
         if (w->pid >= 0) vl_stop(w);
@@ -632,6 +696,15 @@ static bool vl_send(vl_worker *w, const vu_str *req, long *t, int *g) {
         pthread_cond_broadcast(&w->cv);
         pthread_mutex_unlock(&w->rmu);
         if (!vl_start(w)) { vl_stop(w); w->broken = 1; pthread_mutex_unlock(&w->mu); return false; }
+    }
+    if (vl_batch && !vl_catch_up(w, append)) {
+        pthread_mutex_lock(&w->rmu);
+        w->broken = 1; w->gen++;
+        *g = -1;
+        pthread_cond_broadcast(&w->cv);
+        pthread_mutex_unlock(&w->rmu);
+        pthread_mutex_unlock(&w->mu);
+        return true;
     }
     if (vl_debug) {
         char path[512];
@@ -708,7 +781,31 @@ static int vl_pick(void) {
     return best;
 }
 
-vu_str vl_node_call(const vu_str *req) {
+static vu_str vl_call_x(const vu_str *req, const vu_str *append);
+vu_str vl_node_call(const vu_str *req) { return vl_call_x(req, NULL); }
+
+/* A batch's prelude line (a plugin's load, the options' setup): appended to the prelude and sent to
+   one process, whose answer it returns; the other processes get it before their next request. Not
+   sent again when the process dies meanwhile ("!": the run reports that the host failed). */
+vu_str vl_node_pcall(const vu_str *req) { return vl_call_x(req, req); }
+
+/* Starts a batch (before any process). */
+void vl_node_batch(void) {
+    pthread_mutex_lock(&vl_mu);
+    vl_init_once();
+    vl_batch = 1;
+    pthread_mutex_unlock(&vl_mu);
+}
+
+/* A batch's runs each add their lint requests to the count (vl_node_expect's) */
+void vl_node_expect_add(int64_t n) {
+    pthread_mutex_lock(&vl_mu);
+    if (vl_expect < 0) vl_expect = 0;
+    vl_expect += n < 0 ? 0 : (long)n;
+    pthread_mutex_unlock(&vl_mu);
+}
+
+static vu_str vl_call_x(const vu_str *req, const vu_str *append) {
     pthread_mutex_lock(&vl_mu);
     vl_init_once();
     int slot = vl_pick();
@@ -717,7 +814,8 @@ vu_str vl_node_call(const vu_str *req) {
     for (int attempt = 0; attempt <= 3; attempt++) {
         long t = 0;
         int g = 0;
-        if (!vl_send(w, req, &t, &g)) return vu_str_from("!", 1);
+        if (append && attempt > 0) return vu_str_from("!", 1);
+        if (!vl_send_x(w, req, &t, &g, append)) return vu_str_from("!", 1);
         if (g < 0) continue;
         pthread_mutex_lock(&w->rmu);
         /* (no answer to the oldest request for VLINT_JS_TIMEOUT seconds: the process is stuck and is

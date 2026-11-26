@@ -24,6 +24,9 @@ extern "ljs_glue.c":
   fn vl_snap_node(ffi: Ffi, host: Str) -> Str
   fn vl_snap_write(ffi: Ffi, path: Str) -> Int
   fn vl_node_snapshot(ffi: Ffi, path: Str)
+  fn vl_node_pcall(ffi: Ffi, req: Str) -> Str
+  fn vl_node_batch(ffi: Ffi)
+  fn vl_node_expect_add(ffi: Ffi, n: Int)
 
 # The run's JS plugins: the requests each node process is sent first (plugin loads, the options),
 # and the plugin files registered.
@@ -36,9 +39,123 @@ type Js:
   oid: {Str: Int}     # "rule\toptions" -> id
   nhost: Int = 0      # the rules the host has registered (a rule's host id: lmeta.Meta.xhost)
   deferred: [Str] = []  # plugins whose rules run natively, not loaded in node (yet): "path\tload request\tfirst rule id\tkind" (try_defer)
+  # (a batch's run: the plugin loads, the options' ids and the setup go to the batch's registry,
+  # reg_serve, which the runs share with their node processes; oid then memoizes its ids)
+  bat: Bool
+  rq: Chan[RegReq]
 
 fn new_js() -> Js:
-  return Js(false, [], {}, ["[]"], [0], {})
+  return Js(on: false, prelude: [], paths: {}, opts: ["[]"], orule: [0], oid: {}, bat: false, rq: chan(1))
+
+# ---- a batch (vlint --batch): one registry of the JS plugins and options for all its runs
+
+# A request to the registry: 1 a plugin's load (key: the load request; the answer "BASE\tNAME\tANSWER":
+# the plugin's first host id, the name the run gives it when the host knows it by another (""
+# otherwise), and the host's answer), 2 an options id (key: "HOSTID\tOPTIONS"; the id),
+# 3 the setup (key: the folder; the host's answer)
+type RegReq:
+  kind: Int
+  key: Str
+  reply: Chan[Str]
+
+fn batch_js(rq: Chan[RegReq]) -> Js:
+  var js = new_js()
+  js.bat = true
+  js.rq = rq.share()
+  return js
+
+fn reg_ask(js: Js, kind: Int, key: Str) -> Str:
+  let reply: Chan[Str] = chan(1)
+  js.rq.send(RegReq(kind, key + "", reply.share()))
+  return reply.recv() else "!"
+
+# The registry: the host started once (slots: the linting threads' count), each load sent once
+# (vl_node_pcall: every process gets it), the options' ids the batch's, the setup sent again when
+# there are new options. Ends when rq closes.
+fn reg_serve(fs: Fs, os: Os, ffi: Ffi, own rq: Chan[RegReq], slots: Int):
+  vl_node_batch(ffi)
+  var js = new_js()
+  var loaded: {Str: Str} = {}
+  var nset = -1
+  var lastset = ""
+  var renames = 0
+  while true:
+    let r = rq.recv() else return
+    if r.kind == 1:
+      if r.key in loaded:
+        r.reply.send(loaded[r.key] + "")
+        continue
+      var res = start(fs, os, ffi, &js, slots)
+      if res != "":
+        r.reply.send("-1\t\t!")
+        continue
+      var ans = vl_node_pcall(ffi, r.key)
+      # (another file under the same name, which another run loaded (two copies of a plugin in a
+      # monorepo): loaded under a name of its own, the run still calling it by its own)
+      var own = ""
+      let taken = taken_name(ans)
+      if taken != "":
+        let rq0 = lconf.parse_json(r.key)
+        let ui = lconf.get(rq0, 0, "url")
+        if ui >= 0:
+          renames += 1
+          let alt = "{taken}~{renames}"
+          let req2 = "{{\"op\":\"load\",\"url\":\"" + lout.json_esc(rq0.v[ui].s) + "\",\"name\":\"" + lout.json_esc(alt) + "\",\"alias\":true}}"
+          ans = vl_node_pcall(ffi, req2)
+          own = taken + ""
+      let base = js.nhost
+      let n = load_rule_count(ans)
+      if n >= 0: js.nhost += n
+      let v = "{base}\t{own}\t{ans}"
+      if n >= 0: loaded[r.key] = v + ""
+      r.reply.send(v)
+    elif r.kind == 2:
+      let tab = r.key.find("\t")
+      let host = int(r.key[0..tab]) else 0
+      let opts = r.key[tab + 1..r.key.len]
+      r.reply.send("{options_id(&js, host, opts)}")
+    elif r.kind == 3:
+      # (the options' table as setup sends it, the host ids as they are)
+      if nset == js.opts.len:
+        r.reply.send(lastset + "")
+        continue
+      var ids: [Str] = []
+      for k in 0..js.orule.len: ids.push("{js.orule[k]}")
+      let body = "{{\"cwd\":\"" + lout.json_esc(r.key) + "\",\"workspaceUri\":null,\"ruleIds\":[" + ",".join(ids) + "],\"options\":[" + ",".join(js.opts) + "]}}"
+      let req = "{{\"op\":\"setup\",\"json\":\"" + lout.json_esc(body) + "\"}}"
+      let ans = vl_node_pcall(ffi, req)
+      if ans != "!" and ans != "":
+        nset = js.opts.len
+        lastset = ans + ""
+      r.reply.send(ans)
+
+# The name a load's answer says another plugin has ("" for any other answer)
+fn taken_name(ans: Str) -> Str:
+  var outer = lconf.parse_json(ans)
+  if outer.err != "" or outer.v.len == 0 or outer.v[0].k != lconf.J_STR: return ""
+  let res = lconf.parse_json(outer.v[0].s)
+  let f = lconf.get(res, 0, "Failure")
+  if f < 0 or res.v[f].k != lconf.J_STR: return ""
+  let msg = res.v[f].s
+  let pre = "Plugin name '"
+  let at = msg.find(pre)
+  if at < 0 or msg.find("' is already registered") < 0: return ""
+  let rest = msg[at + pre.len..msg.len]
+  let q = rest.find("'")
+  if q <= 0: return ""
+  return rest[0..q]
+
+# How many rules a load's answer registers (-1: it failed)
+fn load_rule_count(ans: Str) -> Int:
+  if ans == "!" or ans == "": return -1
+  var outer = lconf.parse_json(ans)
+  if outer.err != "" or outer.v.len == 0 or outer.v[0].k != lconf.J_STR: return -1
+  let res = lconf.parse_json(outer.v[0].s)
+  let ok = lconf.get(res, 0, "Success")
+  if ok < 0: return -1
+  let rn = lconf.get(res, ok, "ruleNames")
+  if rn < 0: return -1
+  return res.v[rn].kids.len
 
 # Where the host script is: written once to the user's cache folder (or the temporary one).
 fn host_path(fs: Fs, os: Os) -> Str:
@@ -79,6 +196,9 @@ fn prepare(fs: Fs, os: Os, ffi: Ffi):
 # Starts the plugin host (nothing runs until the first request).
 fn start(fs: Fs, os: Os, ffi: Ffi, var js: Js, slots: Int) -> Str:
   if js.on: return ""
+  if js.bat:
+    js.on = true
+    return ""
   let p = host_path(fs, os)
   if p == "": return "Failed to write the JS plugin host"
   prepare(fs, os, ffi)
@@ -271,7 +391,20 @@ fn load_plugin(fs: Fs, ffi: Ffi, var js: Js, var m: lmeta.Meta, dir: Str, spec: 
   req += ",\"alias\":"
   if alias != "": req += "true}}"
   else: req += "false}}"
-  let ans = vl_node_call(ffi, req)
+  var ans = ""
+  var host = js.nhost
+  var own = ""
+  if js.bat:
+    let ra = reg_ask(js, 1, req)
+    let t1 = ra.find("\t")
+    if t1 < 0: return "vlint: the JS plugin host (node) could not be started or stopped"
+    host = int(ra[0..t1]) else -1
+    let rest = ra[t1 + 1..ra.len]
+    let t2 = rest.find("\t")
+    if t2 < 0: return "vlint: the JS plugin host (node) could not be started or stopped"
+    own = rest[0..t2]
+    ans = rest[t2 + 1..rest.len]
+  else: ans = vl_node_call(ffi, req)
   if ans == "!" or ans == "": return "vlint: the JS plugin host (node) could not be started or stopped"
   # the answer is a JSON string holding oxlint's {"Success": ...} or {"Failure": message}
   var outer = lconf.parse_json(ans)
@@ -282,7 +415,8 @@ fn load_plugin(fs: Fs, ffi: Ffi, var js: Js, var m: lmeta.Meta, dir: Str, spec: 
   let ok = lconf.get(res, 0, "Success")
   if ok < 0: return "vlint: bad answer from the JS plugin host"
   let nm = lconf.get(res, ok, "name")
-  let pname = res.v[nm].s + ""
+  var pname = res.v[nm].s + ""
+  if own != "": pname = own
   if lconf.plugin_flag(pname) >= 0: return "!reserved:" + pname
   let rn = lconf.get(res, ok, "ruleNames")
   for r in res.v[rn].kids:
@@ -291,11 +425,13 @@ fn load_plugin(fs: Fs, ffi: Ffi, var js: Js, var m: lmeta.Meta, dir: Str, spec: 
     m.xname.push(full)
     var cat = -1
     if kd >= 0: cat = np_cat(kd, res.v[r].s)
-    set_x(&m, m.xname.len - 1, js.nhost, cat)
+    set_x(&m, m.xname.len - 1, host, cat)
     if kd == 2: m.xsite[full] = report_site(fs, path, res.v[r].s)
-    js.nhost += 1
+    host += 1
   m.xplug[pname] = true
   js.paths[path] = true
+  if js.bat: return ""
+  js.nhost = host
   js.prelude.push(req)
   vl_node_prelude(ffi, "\n".join(js.prelude))
   return ""
@@ -472,7 +608,18 @@ fn load_deferred(ffi: Ffi, var js: Js, var m: lmeta.Meta, need: [Bool], var plug
     let first = int(f[2]) else 0
     let kd = int(f[3]) else 0
     plugin = np_package(kd)
-    let ans = vl_node_call(ffi, req)
+    var ans = ""
+    var host = js.nhost
+    if js.bat:
+      let ra = reg_ask(js, 1, req)
+      let t1 = ra.find("\t")
+      if t1 < 0: return "vlint: the JS plugin host (node) could not be started or stopped"
+      host = int(ra[0..t1]) else -1
+      let rest = ra[t1 + 1..ra.len]
+      let t2 = rest.find("\t")
+      if t2 < 0: return "vlint: the JS plugin host (node) could not be started or stopped"
+      ans = rest[t2 + 1..rest.len]
+    else: ans = vl_node_call(ffi, req)
     if ans == "!" or ans == "": return "vlint: the JS plugin host (node) could not be started or stopped"
     var outer = lconf.parse_json(ans)
     if outer.err != "" or outer.v.len == 0 or outer.v[0].k != lconf.J_STR: return "vlint: bad answer from the JS plugin host"
@@ -487,11 +634,13 @@ fn load_deferred(ffi: Ffi, var js: Js, var m: lmeta.Meta, need: [Bool], var plug
     if rn < 0 or res.v[rn].kids.len != want.len: return bad
     for k in 0..want.len:
       if res.v[res.v[rn].kids[k]].s != want[k]: return bad
-      m.xhost[first + k] = js.nhost
-      js.nhost += 1
-    js.prelude.push(req)
+      m.xhost[first + k] = host
+      host += 1
+    if not js.bat:
+      js.nhost = host
+      js.prelude.push(req)
   js.deferred = left
-  vl_node_prelude(ffi, "\n".join(js.prelude))
+  if not js.bat: vl_node_prelude(ffi, "\n".join(js.prelude))
   return ""
 
 # Where an eslint-comments rule's create calls context.report, as a stack trace names it
@@ -635,8 +784,26 @@ fn options_id(var js: Js, rule: Int, opts: Str) -> Int:
   js.orule.push(rule)
   return id
 
+# options_id for a rule of m (a batch's: the registry's id, by the rule's host id)
+fn options_idm(var js: Js, m: lmeta.Meta, rule: Int, opts: Str) -> Int:
+  if not js.bat: return options_id(&js, rule, opts)
+  if opts == "": return 0
+  let key = "{rule}\t{opts}"
+  let k = js.oid.get(key, -1)
+  if k >= 0: return k
+  let id = int(reg_ask(js, 2, "{xhost_of(m, rule)}\t{opts}")) else 0
+  js.oid[key] = id
+  return id
+
 # Sends the rules' options (every configuration's) to the host: "" or the error to print
 fn setup(ffi: Ffi, var js: Js, cwd: Str, m: lmeta.Meta) -> Str:
+  if js.bat:
+    let a = reg_ask(js, 3, cwd)
+    if a == "!" or a == "": return "vlint: the JS plugin host (node) could not be started"
+    if a == "null": return ""
+    let v = lconf.parse_json(a)
+    if v.err == "" and v.v.len > 0 and v.v[0].k == lconf.J_STR: return v.v[0].s + ""
+    return a
   var ids: [Str] = []
   # (entry 0, no options, isn't a rule's)
   for k in 0..js.orule.len:
@@ -791,6 +958,9 @@ fn call(ffi: Ffi, req: Str) -> Str:
 # how many lint requests the run sends at most (the processes are added as the work shows it pays)
 fn expect(ffi: Ffi, n: Int):
   vl_node_expect(ffi, n)
+
+fn expect_add(ffi: Ffi, n: Int):
+  vl_node_expect_add(ffi, n)
 
 fn stop(ffi: Ffi):
   vl_node_stop(ffi)
