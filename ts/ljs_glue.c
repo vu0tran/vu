@@ -51,10 +51,11 @@ typedef struct {
     pthread_t reader; int has_reader;
     /* the request being answered when the process died (it gets "!", "!t" when it was stuck) */
     int died_gen, died_to; long died_t;
-    /* what its answers took: each request's sending time (by ticket), the time it was busy on the
-       requests answered (an answer's time less its request's sending or the previous answer's,
-       whichever is later), how many, and the last answer's time */
-    double *sent_at; long scap; double busy, last_ans; long served;
+    /* what its answers took: each request's sending time (by ticket; negative for a request that
+       isn't a file's lint: a plugin's load, the setup), the last answer's time, the lint answers
+       so far, and the time it was busy on those past its first VL_WARM (an answer's time less its
+       request's sending or the previous answer's, whichever is later) and how many those are */
+    double *sent_at; long scap; double last_ans; long nlint, wserved; double wbusy;
 } vl_worker;
 static vl_worker vlw[VL_MAXW];
 static pthread_mutex_t vl_mu = PTHREAD_MUTEX_INITIALIZER;
@@ -66,15 +67,21 @@ static char *vl_prelude = NULL;   /* lines */
 static size_t vl_prelude_len = 0;
 static int vl_slots = 1, vl_next_slot = 0, vl_inited = 0;
 /* With the number of lint requests known (vl_node_expect), the calls go to the first vl_inuse
-   processes, each to the one with the fewest requests waiting, and another process is started
-   only when the work left (the requests not sent yet, at the time the answers so far took each)
-   is more than VL_SPAWN_SECS for each process in use: a process costs about 0.2 s of CPU to start
-   (node, the host, the plugins), so a package of a few dozen files used to start four of them for
-   a fraction of a second of work. Unknown (-1): every thread keeps to one of vl_slots processes. */
+   processes, each to the one with the fewest requests waiting, and another process is started only
+   when it pays in wall time: when the work left would end more than vl_gain seconds sooner,
+   L / k - L / (k + 1) for k processes, L the requests not sent yet at the time a warm process
+   takes for one (the answers past each process's first VL_WARM, its plugins' code compiled by
+   then; the plugins' loads not counted, which include node's start: they made 16 answers look
+   like 9 s of work in a package that had 0.7 s). An extra process costs its start and its own
+   warming up (the React Compiler plugin: 3-4 cpu-s each; 1,430 files with 1, 2, 3 and 4 processes:
+   13.5, 8.3, 7.0, 6.5 s, 34, 38, 41, 43 cpu-s), and on the CI job's pattern the 34 packages that
+   used to start a second or third process for a few seconds of work took as long with one, 19 cpu-s
+   less. VLINT_JS_SPAWN_GAIN sets vl_gain (for measuring). Unknown (-1): every thread keeps to one
+   of vl_slots processes. */
 static long vl_expect = -1, vl_nsent = 0;
 static int vl_inuse = 1;
-static double vl_spawned_at = 0;
-#define VL_SPAWN_SECS 1.0
+static double vl_spawned_at = 0, vl_gain = 3.0;
+#define VL_WARM 16
 static char vl_pool[32] = "";     /* --v8-pool-size=N for the processes, or "" */
 static __thread int vl_slot = -1;
 
@@ -133,13 +140,15 @@ static void vl_init_once(void) {
         vlw[i].tickets = vlw[i].serving = 0; vlw[i].gen = 0; vlw[i].broken = 0; vlw[i].timed_out = 0;
         vlw[i].ans = NULL; vlw[i].alen = NULL; vlw[i].nans = vlw[i].acap = 0; vlw[i].has_reader = 0;
         vlw[i].died_gen = -1; vlw[i].died_t = -1; vlw[i].died_to = 0;
-        vlw[i].sent_at = NULL; vlw[i].scap = 0; vlw[i].busy = vlw[i].last_ans = 0; vlw[i].served = 0;
+        vlw[i].sent_at = NULL; vlw[i].scap = 0; vlw[i].last_ans = 0; vlw[i].nlint = vlw[i].wserved = 0; vlw[i].wbusy = 0;
     }
     atexit(vl_atexit);
     const char *t = getenv("VLINT_JS_TIMEOUT");
     if (t && *t) { long v = atol(t); vl_timeout_ms = v > 0 ? (int)(v > 86400 ? 86400000 : v * 1000) : -1; }
     const char *d = getenv("VLINT_JS_DEBUG");
     vl_debug = d && *d && strcmp(d, "0") != 0;
+    const char *sg = getenv("VLINT_JS_SPAWN_GAIN");
+    if (sg && *sg && atof(sg) >= 0) vl_gain = atof(sg);
 }
 
 /* waits until fd is ready (POLLIN or POLLOUT); false after vl_timeout_ms (with no limit, waits) */
@@ -286,10 +295,14 @@ static void *vl_reader(void *arg) {
         memcpy(a, w->buf, w->len);
         if (w->nans < w->scap) {
             double now = vl_now(), from = w->sent_at[w->nans];
+            bool lint = from > 0;
+            if (!lint) from = -from;
             if (w->last_ans > from) from = w->last_ans;
-            if (now > from) w->busy += now - from;
+            if (lint && ++w->nlint > VL_WARM) {
+                if (now > from) w->wbusy += now - from;
+                w->wserved++;
+            }
             w->last_ans = now;
-            w->served++;
         }
         w->ans[w->nans] = a;
         w->alen[w->nans] = w->len;
@@ -484,7 +497,7 @@ static bool vl_send(vl_worker *w, const vu_str *req, long *t, int *g) {
             w->scap = w->scap ? w->scap * 2 : 1024;
             w->sent_at = realloc(w->sent_at, (size_t)w->scap * sizeof *w->sent_at);
         }
-        w->sent_at[w->tickets] = vl_now();
+        w->sent_at[w->tickets] = nl || (req->len > 12 && memcmp(rd, "{\"op\":\"lint\"", 12) == 0) ? vl_now() : -vl_now();
         *t = w->tickets++; *g = w->gen;
     }
     else if (ok) *g = -1;  /* (it died meanwhile, found by a reader: no answer will come) */
@@ -523,15 +536,15 @@ static int vl_pick(void) {
         vl_worker *w = &vlw[i];
         pthread_mutex_lock(&w->rmu);
         long q = w->tickets - w->nans;
-        busy += w->busy;
-        served += w->served;
+        busy += w->wbusy;
+        served += w->wserved;
         pthread_mutex_unlock(&w->rmu);
         if (bestq < 0 || q < bestq) { bestq = q; best = i; }
     }
     if (vl_inuse < vl_slots && served >= 16 && bestq > 0) {
         double now = vl_now();
-        double left = (double)(vl_expect - vl_nsent) * busy / (double)served;
-        if (now - vl_spawned_at > 0.05 && left / vl_inuse > VL_SPAWN_SECS) {
+        double left = (double)(vl_expect - vl_nsent) * busy / (double)served, k = vl_inuse;
+        if (now - vl_spawned_at > 0.25 && left / (k * (k + 1)) > vl_gain) {
             vl_spawned_at = now;
             VL_DBG("%ld of %ld requests sent, %.2f s of work left: process %d added", vl_nsent, vl_expect, left, vl_inuse);
             best = vl_inuse++;
