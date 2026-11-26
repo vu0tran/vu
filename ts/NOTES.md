@@ -1602,6 +1602,82 @@ A thread adds about 0.15 GB (idx 86 on 2 threads 4.8 GB, 8 threads 5.7). On the 
 the JS plugin hosts are about half: idx 16 vlint 1.26 GB, its three node processes 0.86, 0.50 and
 0.23.
 
+### Peak memory on the CI job's pattern: what was cut (measured 2026-11-26)
+
+How it was found (the session's scratch `m21/`): VTSC_MEM=1 now counts the store's tables by their
+resident pages (mincore; on macOS a read of a page never written makes it resident, as a write does,
+so a column's length says little), prints malloc's bytes in use (MEMT malloc), each SharedMap over
+10,000 entries (MEMS) and each thread's checker's containers when it's done (MEMC worker);
+VTSC_MEM=2 also says how many of a table's pages hold anything but zeros, and a list column's rows,
+rows holding a list, entries and pool. Where the malloc'd bytes are: `heap -s` of the process (with
+`MallocStackLogging=lite` it names the allocating function), `malloc_history PID -callTree -invert
+-ignoreThreads` of a serial run (its call graph came out empty for a process with threads), and
+`heap --addresses='non-object[SIZE]'` then lldb's `memory read` of sampled blocks (end lldb's
+commands with `process detach`, or it kills the process). `/usr/bin/time -l`'s "peak memory
+footprint" is steadier than its maximum RSS on this loaded machine (compression), and the tree's RSS
+sampled every 0.05 s (`peak.py`) varies by ±0.3-0.5 GB between runs of one build.
+
+What was found, and the change (each measured alone, the serial single checker of idx 86 unless
+said; the same outputs):
+- the 2,710-file program reads every file again with a lib a file references (`/// <reference
+  lib>`), and run_libs called itself with the first reading's tree, sources and lists still held:
+  now freed first. Peak 3.90 -> 3.33 GB (read+parse 1.00 -> 0.60).
+- list columns written for few rows (ht_sigs: 3.2 M rows, 63,000 lists; hy_more, ht_aargs,
+  hy_licomb, ht_origin, the other ckl_ ones but hy_linst, and ho_calls, ho_ctors, ho_tparams,
+  ho_eflags) were resident whole: a dense row region read throughout. Now sparse (cl_snew,
+  ckl_snew): the rows' pairs in a hash of 2^17 buckets, entries (next, row, offset, length) in an
+  append-only region linked by a compare-and-swap, a row without one reading (0, 0). The list
+  columns 466 -> 272 MB, the peak -185 MB; instructions +0.3%.
+- tvar_arr and closed_t, two flags a type each worker kept as an Int list over every type id: bytes
+  (8 threads on idx 59: 17.8 M entries, 285 -> 36 MB). (Kept per worker: could_contain_tvars's
+  answer depends on where its cycle was entered, so a shared column would make the results depend on
+  timing.)
+- each file's type-aware rule list (a 3 KB JSON string, the same for most files) was copied per file
+  into every map that passed it on: lvtsc's maps and jobs, check_conf's Prog, and each thread's copy
+  of the Prog (idx 59: 176,000 strings of 3 KB, 540 MB). Now tsprog.Rules (a file -> an index into a
+  few lists) through the jobs, Prog.lint_files by index, and each thread a list by file index
+  (lint_fi, no paths). Idx 59's tree 7.1 -> 6.2 GB with the Prog part alone.
+- the Vu runtime's maps (CHANGELOG, 2026-11-26): no hash kept for Int keys, 32-bit indexes,
+  SharedMap slots of 24 bytes filled to 3/4. Malloc in use 2,157 -> 1,549 MB, peak 3.43 -> 2.81 GB;
+  idx 59's tree 6.5 -> 5.3 GB.
+- 25 columns of ids, kinds and flags under 2^31 (the symbols' 7, the objects' 13, htk htf hta htb,
+  nsym) as 32-bit columns (ct4_*, cx4_*: the same header, a value past 32 bits stops the program):
+  columns 506 -> 320 MB, peak footprint 2.93 -> 2.75 GB, instructions -0.3%.
+
+Measured and not kept: 4 threads in place of 8 for the largest programs: idx 59 5.43 GB against 5.76
+(one sample each, within the noise) and slower. Not tried: sharing the threads' per-node and
+per-type caches (prop_cache, lookup_cache, ntype): their entries summed over the 8 threads are
+about one checker's (each checks its own files), so a SharedMap (some 90 bytes an entry) wouldn't
+take less than the copies (reasoned from the MEMC counts, not measured).
+The single checker (serial, in vlint's process; peak RSS and footprint from `time -l`, the same
+outputs), before (ef8334ea) and after: idx 59 5.26 -> 3.89 GB, 86 4.11 -> 2.49, 52 1.81 -> 1.39, 31
+1.33 -> 1.15; instructions 151.5 / 87.9 / 55.7 / 48.3 -> 150.0 / 87.6 / 55.0 / 48.1 G. Each
+invocation as the job runs it (the tree's RSS, one sample each): idx 59 7.9 -> 5.0-5.4 GB, 86 5.6 ->
+3.7-3.8, 31 4.1 -> 3.4, 52 2.8 -> 2.5. The gate at each commit: probes 135/135 and shuffled 1 and 2,
+vtests identical to ef8334ea's (its 3 failures: esm-default-import-cjs, packages,
+this-function-expression; the list in m12 is older), the job's 176 outputs, `dgate.sh` idx 31, 52,
+86, 59 at 1, 2, 4, 8 threads (16 of 16 the same).
+
+The cold job, two rounds alternated with oxlint 1.79 (load 20-40 from other work): vlint 73.9 and
+72.5 s, 392 and 390 cpu-s, 5.5 and 5.7 GB at the peak; oxlint 107.4 and 143.3 s, 522 and 530
+cpu-s, 9.6 and 11.0 GB. (Before, on a machine at load 19-43: vlint 57-72 s, 8.0-8.4 GB.) The job's
+peak is idx 59 alone (5.2 GB of it, the other lane's invocation 0.3-0.7): its vtsc worker process
+about 4.0-4.8 GB, vlint's own process 0.55, the node hosts 0.1-0.5. The walls here say little: the
+machine was at load 20-40 throughout, and oxlint's walls moved by 36 s between its two runs.
+
+What's left in that worker (VTSC_MEM=1 at the end of idx 59's check on 8 threads): malloc 2.3 GB in
+use (the tree's 9.7 M nodes 0.78 GB at 80 bytes each, the per-node parent list 0.08, the sources
+0.15, paths and other strings 0.2, the threads' maps, SharedMaps 0.15) and 0.45 more that malloc
+holds unused; the store's tables about 1.2 GB (columns 0.6 after ct4, lists 0.3, interned lists
+0.1, props 0.08). The largest single lever left is the node: 10 Ints, where every field fits in 32
+bits (pos and end are offsets, the children and names ids, the flags under 2^22): 40 bytes would
+save 0.39 GB on idx 59. That needs the compiler to store a struct's Int fields in 32 bits (a write
+range-checked, a read widened, a `var` argument of such a field refused), since the 15,000 accesses
+of `nd[x].k` and friends can't all be rewritten; ast.vu's Node would be the only change in ts/
+(the other worktree's parser work touches the parser, not the type). After that: the 64-bit
+columns left (htl, the signature columns, ho_resolved), and the threads' ntype and rel_cache maps
+(3.8 M and 2.8 M entries over 8 threads on idx 59).
+
 ## Keeping the caches in CI
 
 What a CI job can keep between runs is one folder: `$XDG_CACHE_HOME/vlint` (`~/.cache/vlint`
