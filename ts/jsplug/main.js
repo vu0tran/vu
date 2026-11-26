@@ -10,14 +10,15 @@ const { writeSync: __vlWriteSync } = await __vlBuiltin("node:fs");
 const { Socket: __vlSocket } = await __vlBuiltin("node:net");
 const { isUtf8: __vlIsUtf8 } = await __vlBuiltin("node:buffer");
 
-// (standard output and error are vlint's: Node makes pipes non-blocking, which would make vlint's
-// own writes fail half-way; back to blocking, as oxlint's cli.js does)
-process.stdout._handle?.setBlocking?.(true);
-process.stderr._handle?.setBlocking?.(true);
 const __vlAnswer = (v) => __vlWriteSync(4, JSON.stringify(v) + "\n");
+// (in the startup snapshot, gen_host.py --snapshot, the host's code is named vlint-js-host-HASH.js:
+// its frames in answers get the host script's URL, as without the snapshot)
+let __vlHostName = null, __vlHostUrl = null;
+const __vlRename = (s) => __vlHostName === null || typeof s !== "string" ? s : s.split(__vlHostName).join(__vlHostUrl);
 // (stack traces end where oxlint's do: at its wrapper, called from Rust)
 const __vlCut = (s, name) => {
   if (typeof s !== "string") return s;
+  s = __vlRename(s);
   s = s.replace(/\\n    at process\.processTicksAndRejections \(node:internal\/process\/task_queues:\d+:\d+\)/g, "");
   s = s.replace(/\n    at process\.processTicksAndRejections \(node:internal\/process\/task_queues:\d+:\d+\)/g, "");
   return s.replace(new RegExp("(\\\\n    at " + name + " [^\\\\]*?\\))(\\\\n    at [^\\\\]*?)*(?=\\\\n|\")", "g"), "$1");
@@ -58,9 +59,16 @@ function __vlHandle(line, __vlAnswer) {
   __vlAnswer(null);
 }
 let __vlChain = Promise.resolve();
+// What runs when the host starts: everything above only defines (and in the startup snapshot,
+// gen_host.py --snapshot, it ran when the snapshot was built; this runs in each process).
+function __vlMain() {
+// (standard output and error are vlint's: Node makes pipes non-blocking, which would make vlint's
+// own writes fail half-way; back to blocking, as oxlint's cli.js does)
+process.stdout._handle?.setBlocking?.(true);
+process.stderr._handle?.setBlocking?.(true);
 // (fd 3 read as a pipe, from the event loop: a file stream would leave a blocking read in libuv's
 // thread pool, and process.exit() in a plugin would wait for it forever)
-const __vlIn = new __vlSocket({ fd: 3, readable: true, writable: false });
+__vlIn = new __vlSocket({ fd: 3, readable: true, writable: false });
 // (when fd 3 ends, every request has come: the host ends once they're answered, even if a plugin
 // keeps the event loop alive; if reading it fails, the host ends at once, so vlint sees its pipes
 // close rather than a process that no longer reads: issue #7)
@@ -85,7 +93,6 @@ function __vlFrame(head, buf) {
   return head;
 }
 // fd 3's bytes split into requests: lines, a frame's bytes after its line
-let __vlPend = null, __vlBody = null, __vlFill = 0, __vlHead = null;
 __vlIn.on("data", (chunk) => {
   let c = chunk;
   for (;;) {
@@ -122,6 +129,8 @@ __vlIn.on("data", (chunk) => {
     __vlRequest(line);
   }
 });
+}
+let __vlIn = null, __vlPend = null, __vlBody = null, __vlFill = 0, __vlHead = null;
 function __vlRequest(line) {
   // (every request is answered exactly once: if handling it throws, the error is the answer, and
   // the chain goes on to the next request rather than stopping for good; issue #7)
@@ -130,7 +139,7 @@ function __vlRequest(line) {
     const fail = (err) => {
       if (answered) return;
       answered = true;
-      try { __vlAnswer(JSON.stringify({ Failure: { message: "vlint: the plugin host failed: " + String(err && err.stack || err) } })); } catch {}
+      try { __vlAnswer(JSON.stringify({ Failure: { message: "vlint: the plugin host failed: " + __vlRename(String(err && err.stack || err)) } })); } catch {}
     };
     let r;
     try {
@@ -142,3 +151,4 @@ function __vlRequest(line) {
     if (r && typeof r.then === "function") return r.then(undefined, fail);
   });
 }
+__vlMain();

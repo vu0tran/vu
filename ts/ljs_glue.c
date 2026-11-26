@@ -83,6 +83,24 @@ static int vl_inuse = 1;
 static double vl_spawned_at = 0, vl_gain = 3.0;
 #define VL_WARM 16
 static char vl_pool[32] = "";     /* --v8-pool-size=N for the processes, or "" */
+
+/* The host's startup snapshot (gen_host.py --snapshot, embedded when jsplug/host_blob.h was there at
+   build time): written beside the host script (vl_snap_write), and given to node (--snapshot-blob)
+   only when `node --version` is the version that built it, asked once per run as soon as vlint knows
+   a configuration has JS plugins (vl_node_snapshot, so it runs while vlint plans; 20 ms of CPU)
+   and read when the first process starts. A node of another version would refuse the blob with a
+   message on vlint's stderr. Not with NODE_OPTIONS other than heap sizes (vl_snap_opts_ok), nor with
+   DEBUG or VLINT_JS_CHECK set (the host reads them as it starts: in the snapshot, at build time). */
+#if defined(__has_include)
+#if __has_include("jsplug/host_blob.h")
+#include "jsplug/host_blob.h"
+#endif
+#endif
+static pthread_mutex_t vl_snap_mu = PTHREAD_MUTEX_INITIALIZER;
+static char *vl_snap = NULL;      /* the blob's path, or NULL */
+static int vl_snap_state = 0;     /* 0: not decided, 1: used, -1: not */
+static pid_t vl_probe_pid = -1;
+static int vl_probe_fd = -1;
 static __thread int vl_slot = -1;
 
 /* (rmu not held: the reader may be waiting for it) */
@@ -320,9 +338,144 @@ static int vl_pipe(int f[2]) {
     return 0;
 }
 
+/* `node --version`, started (vl_snap_mu held) */
+static void vl_probe_start(void) {
+    if (vl_probe_pid >= 0 || vl_snap_state != 0) return;
+    int p[2];
+    /* (vl_start's lock: no process inherits another's pipe ends) */
+    pthread_mutex_lock(&vl_spawn_mu);
+    if (vl_pipe(p) != 0) { pthread_mutex_unlock(&vl_spawn_mu); vl_snap_state = -1; return; }
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addopen(&fa, 0, "/dev/null", O_RDONLY, 0);
+    posix_spawn_file_actions_adddup2(&fa, p[1], 1);
+    posix_spawn_file_actions_addopen(&fa, 2, "/dev/null", O_WRONLY, 0);
+    char *argv[] = {"node", "--version", NULL};
+    pid_t pid;
+    int rc = posix_spawnp(&pid, "node", &fa, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    close(p[1]);
+    pthread_mutex_unlock(&vl_spawn_mu);
+    if (rc != 0) { close(p[0]); vl_snap_state = -1; return; }
+    vl_probe_pid = pid; vl_probe_fd = p[0];
+}
+
+/* NODE_OPTIONS that leave the snapshot as it is: none, or only heap sizes and warnings (a preload,
+   --require or --import, would run before the snapshot's main or not at all) */
+static bool vl_snap_opts_ok(const char *no) {
+    if (!no) return true;
+    const char *p = no;
+    for (;;) {
+        while (*p == ' ' || *p == '\t') p++;
+        if (!*p) return true;
+        const char *e = p;
+        while (*e && *e != ' ' && *e != '\t') e++;
+        size_t n = (size_t)(e - p);
+        static const char *ok[] = {"--max-old-space-size=", "--max-semi-space-size=", "--max_old_space_size=", "--max_semi_space_size="};
+        bool good = (n == 13 && memcmp(p, "--no-warnings", 13) == 0) || (n == 16 && memcmp(p, "--no-deprecation", 16) == 0);
+        for (size_t i = 0; i < sizeof ok / sizeof *ok && !good; i++) {
+            size_t k = strlen(ok[i]);
+            if (n > k && memcmp(p, ok[i], k) == 0) {
+                good = true;
+                for (const char *d = p + k; d < e; d++) if (*d < '0' || *d > '9') good = false;
+            }
+        }
+        if (!good) return false;
+        p = e;
+    }
+}
+
+/* whether the processes start from the snapshot (decided once, when the first starts) */
+static bool vl_snap_use(void) {
+    pthread_mutex_lock(&vl_snap_mu);
+    if (vl_snap_state == 0) {
+#ifdef VL_SNAP_NODE
+        const char *no = getenv("NODE_OPTIONS"), *dbg = getenv("DEBUG"), *chk = getenv("VLINT_JS_CHECK");
+        if (!vl_snap || !vl_snap_opts_ok(no) || (dbg && *dbg) || (chk && *chk)) vl_snap_state = -1;
+        else {
+            vl_probe_start();
+            char out[64];
+            size_t n = 0;
+            if (vl_probe_fd >= 0) {
+                /* (bounded: the version is one short line, and node ends after printing it) */
+                double until = vl_now() + 5.0;
+                while (n < sizeof out - 1) {
+                    struct pollfd pf = {vl_probe_fd, POLLIN, 0};
+                    int r = poll(&pf, 1, 100);
+                    if (r < 0 && errno == EINTR) continue;
+                    if (r == 0) { if (vl_now() > until) break; continue; }
+                    ssize_t k = read(vl_probe_fd, out + n, sizeof out - 1 - n);
+                    if (k < 0 && errno == EINTR) continue;
+                    if (k <= 0) break;
+                    n += (size_t)k;
+                }
+                close(vl_probe_fd);
+                vl_probe_fd = -1;
+            }
+            if (vl_probe_pid >= 0) {
+                int st;
+                if (n == 0) kill(vl_probe_pid, SIGKILL);
+                while (waitpid(vl_probe_pid, &st, 0) < 0 && errno == EINTR) {}
+                vl_probe_pid = -1;
+            }
+            out[n] = 0;
+            while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r')) out[--n] = 0;
+            vl_snap_state = strcmp(out, VL_SNAP_NODE) == 0 ? 1 : -1;
+            VL_DBG("node %s, the snapshot's %s: %s", out, VL_SNAP_NODE, vl_snap_state > 0 ? "used" : "not used");
+        }
+#else
+        vl_snap_state = -1;
+#endif
+    }
+    bool use = vl_snap_state > 0;
+    pthread_mutex_unlock(&vl_snap_mu);
+    return use;
+}
+
+/* The snapshot vlint carries, for the host whose hash is given: its node version ("" none). */
+vu_str vl_snap_node(const vu_str *host) {
+#ifdef VL_SNAP_NODE
+    if ((size_t)host->len == strlen(VL_SNAP_HOST) && memcmp(host->data, VL_SNAP_HOST, (size_t)host->len) == 0)
+        return vu_str_from(VL_SNAP_NODE, (int64_t)strlen(VL_SNAP_NODE));
+#else
+    (void)host;
+#endif
+    return vu_str_from("", 0);
+}
+
+/* Writes the snapshot to path (by a temporary file, renamed): 1 when it's there. */
+int64_t vl_snap_write(const vu_str *path) {
+#ifdef VL_SNAP_NODE
+    char *p = vu_cstr(path);
+    char *part = malloc(strlen(p) + 32);
+    sprintf(part, "%s.part%d", p, (int)getpid());
+    FILE *f = fopen(part, "wb");
+    bool ok = f && fwrite(vl_snap_blob, 1, sizeof vl_snap_blob, f) == sizeof vl_snap_blob;
+    if (f && fclose(f) != 0) ok = false;
+    if (ok) ok = rename(part, p) == 0;
+    if (!ok) unlink(part);
+    free(part);
+    free(p);
+    return ok ? 1 : 0;
+#else
+    (void)path;
+    return 0;
+#endif
+}
+
+/* The snapshot's path for the processes (the first one given), and `node --version` asked now. */
+void vl_node_snapshot(const vu_str *path) {
+    pthread_mutex_lock(&vl_snap_mu);
+    /* (set once: a process being started may be reading it) */
+    if (!vl_snap) vl_snap = vu_cstr(path);
+    vl_probe_start();
+    pthread_mutex_unlock(&vl_snap_mu);
+}
+
 static bool vl_start(vl_worker *w) {
     int a[2], b[2];
     if (!vl_script) return false;
+    bool snap = vl_snap_use();
     /* (one start at a time: another thread's spawn can't catch these pipes before they're
        close-on-exec) */
     pthread_mutex_lock(&vl_spawn_mu);
@@ -344,10 +497,12 @@ static bool vl_start(vl_worker *w) {
     posix_spawn_file_actions_addinherit_np(&fa, 2);
     posix_spawnattr_setflags(&sa, POSIX_SPAWN_CLOEXEC_DEFAULT);
 #endif
-    char **argv = calloc((size_t)vl_nargs + 5, sizeof *argv);
+    char **argv = calloc((size_t)vl_nargs + 7, sizeof *argv);
     int a0 = 0;
     argv[a0++] = "node"; argv[a0++] = "--no-warnings";
     if (vl_pool[0]) argv[a0++] = vl_pool;
+    /* (the host script stays the first argument, process.argv[1], as without the snapshot) */
+    if (snap) { argv[a0++] = "--snapshot-blob"; argv[a0++] = vl_snap; }
     argv[a0++] = vl_script;
     for (int i = 0; i < vl_nargs; i++) argv[a0 + i] = vl_args[i];
     pid_t pid;
