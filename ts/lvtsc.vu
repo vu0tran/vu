@@ -414,7 +414,7 @@ fn copy_job(j: Job) -> Job:
   for f in j.files: fl.push(f + "")
   var tl: {Str: Str} = {}
   for k, v in j.lint: tl[k + ""] = v + ""
-  return Job(j.kind + "", j.at + "", fl, j.lib + "", tl)
+  return Job(j.kind + "", j.at + "", fl, j.lib + "", tl, j.sthr)
 
 # Programs checked one after another, each with one worker.
 fn jobs_seq_bg(fs: Fs, os: Os, ffi: Ffi, own is: [Int], own js: [Job], own ch: Chan[JobOut]):
@@ -422,39 +422,39 @@ fn jobs_seq_bg(fs: Fs, os: Os, ffi: Ffi, own is: [Int], own js: [Job], own ch: C
     if not isolate(os):
       let fm: Memo[Str, tsprog.FSrc] = memo()
       let km: Memo[Str, Int] = memo()
-      ch.send(JobOut(is[k], "", work_n(fs, os, ffi, js[k], 1, fm, km), true))
-    else: ch.send(JobOut(is[k], run_program_js_n(fs, os, ffi, js[k].kind, js[k].at, js[k].files, js[k].lib, js[k].lint, 1)))
+      ch.send(JobOut(is[k], "", work_n(fs, os, ffi, js[k], 1, fm, km, 0), true))
+    else: ch.send(JobOut(is[k], run_program_js_n(fs, os, ffi, js[k].kind, js[k].at, js[k].files, js[k].lib, js[k].lint, 1, 0)))
 
 # (VLINT_VTSC_SCHED=1: each program's start and end on stderr, seconds of the monotonic clock)
 # (sub: in a worker process even when the others aren't isolated, so that its own workers can be
 # processes forked after it's parsed and bound, tsprog.run_all; VLINT_VTSC_SUB=0 keeps it here)
 # (tok, lk: the run's CPU budget, a token a CPU, and the lock under which a program takes its nj
 # tokens all at once, so that two can't each hold part of what they need)
-fn job_bg(fs: Fs, os: Os, ffi: Ffi, own i: Int, own j: Job, own ch: Chan[JobOut], nj: Int, own fm: Memo[Str, tsprog.FSrc], own km: Memo[Str, Int], sub: Bool, own tok: Chan[Int], own lk: Chan[Int], need: Int):
+fn job_bg(fs: Fs, os: Os, ffi: Ffi, own i: Int, own j: Job, own ch: Chan[JobOut], nj: Int, own fm: Memo[Str, tsprog.FSrc], own km: Memo[Str, Int], sub: Bool, own tok: Chan[Int], own lk: Chan[Int], need: Int, sthr: Int):
   let _l = lk.recv() else 0
   for _k in 0..need: let _t = tok.recv() else 0
   lk.send(0)
-  let r = job_run(fs, os, ffi, i, j, nj, fm, km, sub)
+  let r = job_run(fs, os, ffi, i, j, nj, fm, km, sub, sthr)
   for _k in 0..need: tok.send(0)
   ch.send(r)
 
-fn job_run(fs: Fs, os: Os, ffi: Ffi, i: Int, j: Job, nj: Int, fm: Memo[Str, tsprog.FSrc], km: Memo[Str, Int], sub: Bool) -> JobOut:
+fn job_run(fs: Fs, os: Os, ffi: Ffi, i: Int, j: Job, nj: Int, fm: Memo[Str, tsprog.FSrc], km: Memo[Str, Int], sub: Bool, sthr: Int) -> JobOut:
   let sch = os.env("VLINT_VTSC_SCHED") == "1"
   let t0 = os.clock()
-  if sch: eprint("SCHED start {i} files {j.files.len} lint {j.lint.len} workers {nj} sub {sub} at {t0} {j.at}")
+  if sch: eprint("SCHED start {i} files {j.files.len} lint {j.lint.len} workers {nj} threads {sthr} sub {sub} at {t0} {j.at}")
   var out = JobOut(i, "")
   if not isolate(os) and not (sub and os.env("VLINT_VTSC_SUB") != "0" and os.env("VLINT_VTSC_INPROC") != "1"):
-    out = JobOut(i, "", work_n(fs, os, ffi, j, nj, fm, km), true)
+    out = JobOut(i, "", work_n(fs, os, ffi, j, nj, fm, km, sthr), true)
   else:
     # (a program the file cache answers whole: here, as a worker process would; else its process.
     # VLINT_VTSC_TRYCACHE=0: always the process)
     var done = false
     if os.env("VLINT_VTSC_TRYCACHE") != "0":
-      let r0 = work_n(fs, os, ffi, j, -1, fm, km)
+      let r0 = work_n(fs, os, ffi, j, -1, fm, km, 0)
       if r0.err != tsprog.cache_miss():
         out = JobOut(i, "", r0, true)
         done = true
-    if not done: out = JobOut(i, run_program_js_n(fs, os, ffi, j.kind, j.at, j.files, j.lib, j.lint, nj))
+    if not done: out = JobOut(i, run_program_js_n(fs, os, ffi, j.kind, j.at, j.files, j.lib, j.lint, nj, sthr))
   if sch: eprint("SCHED end {i} took {os.clock() - t0} at {os.clock()}")
   return out
 
@@ -473,6 +473,21 @@ fn shards_for(os: Os, nfiles: Int, budget: Int) -> Int:
   if n < 1: n = 1
   return n
 
+# The threads that check a program the run gives one worker (tsprog.run_all, Prog's sthr):
+# VLINT_VTSC_SMALL_THREADS (4) or the budget shared by the run's programs, whichever is fewer (below
+# 2: none). One worker types the lib and the shared declarations once whatever its threads, where
+# each forked shard would type them again, so a small program's check, mostly that, is shorter on
+# threads: a 258-file program's 1.6 s on one thread, 0.8 on 4.
+fn small_threads(os: Os, budget: Int, nprogs: Int) -> Int:
+  # (VTSC_JOBS=N: N workers a program, as the serial measurements use it; none on threads)
+  if os.env("VTSC_JOBS") != "": return 0
+  var t = int(os.env("VLINT_VTSC_SMALL_THREADS")) else 4
+  var share = budget
+  if nprogs > 1: share = budget / nprogs
+  if share < t: t = share
+  if t < 2: return 0
+  return t
+
 # The programs' checks, at most the CPU budget's worth at once (tsprog.cpu_count: --threads, else
 # the CPUs this process may use). A program with one worker is checked in this process when it's
 # alone; one with more is checked in a worker process, whose workers are forked after it's parsed
@@ -490,11 +505,16 @@ fn run_jobs(fs: Fs, os: Os, ffi: Ffi, jobs: [Job]) -> [JobOut]:
     if jobs[i].lint.len > n: n = jobs[i].lint.len
     costs.push(100 + 8 * n)
     nj.push(shards_for(os, n, budget))
+  # (a program with one worker on threads instead: small_threads)
+  var sthr: [Int] = []
+  for i in 0..jobs.len:
+    if nj[i] == 1: sthr.push(small_threads(os, budget, jobs.len))
+    else: sthr.push(0)
   if jobs.len == 1 or os.env("VLINT_VTSC_SERIAL") == "1":
     for i in 0..jobs.len:
       let fm: Memo[Str, tsprog.FSrc] = memo()
       let km: Memo[Str, Int] = memo()
-      out[i] = job_run(fs, os, ffi, i, jobs[i], nj[i], fm, km, nj[i] > 1)
+      out[i] = job_run(fs, os, ffi, i, jobs[i], nj[i], fm, km, nj[i] > 1, sthr[i])
     return out
   let ch: Chan[JobOut] = chan(jobs.len + 1)
   let tok: Chan[Int] = chan(budget + 1)
@@ -514,7 +534,7 @@ fn run_jobs(fs: Fs, os: Os, ffi: Ffi, jobs: [Job]) -> [JobOut]:
     # (10.5 GB at the peak on a monorepo, against 3.2))
     var need = nj[i]
     if need > budget: need = budget
-    spawn job_bg(fs, os, ffi, i, copy_job(jobs[i]), ch, nj[i], fm.share(), km.share(), true, tok.share(), lk.share(), need)
+    spawn job_bg(fs, os, ffi, i, copy_job(jobs[i]), ch, nj[i], fm.share(), km.share(), true, tok.share(), lk.share(), need, sthr[i])
   for _ in 0..jobs.len:
     let r = ch.recv() else JobOut(-1, "")
     if r.i >= 0 and r.i < out.len:
@@ -541,6 +561,7 @@ type Job:
   files: [Str]
   lib: Str
   lint: {Str: Str}
+  sthr: Int = 0      # threads for a program with one worker (tsprog.Prog's sthr), 0 none
 
 # A program's check, in a child process (vlint --vtsc-worker JOB OUT): a crash, a stack overflow,
 # running out of memory or of its CPU time ($VLINT_VTSC_CPU seconds, 600) leaves the program's
@@ -553,15 +574,16 @@ fn run_program(fs: Fs, os: Os, ffi: Ffi, kind: Str, at: Str, files: [Str], lib: 
 
 # run_program's check as the worker's JSON.
 fn run_program_js(fs: Fs, os: Os, ffi: Ffi, kind: Str, at: Str, files: [Str], lib: Str, tl: {Str: Str}) -> Str:
-  return run_program_js_n(fs, os, ffi, kind, at, files, lib, tl, 0)
+  return run_program_js_n(fs, os, ffi, kind, at, files, lib, tl, 0, 0)
 
 # (nj: the workers it may use, 0 one per core)
-fn run_program_js_n(fs: Fs, os: Os, ffi: Ffi, kind: Str, at: Str, files: [Str], lib: Str, tl: {Str: Str}, nj: Int) -> Str:
+# (sthr: the threads for a program with one worker, Job's sthr)
+fn run_program_js_n(fs: Fs, os: Os, ffi: Ffi, kind: Str, at: Str, files: [Str], lib: Str, tl: {Str: Str}, nj: Int, sthr: Int) -> Str:
   var fl: [Str] = []
   for f in files: fl.push(f + "")
   var tl2: {Str: Str} = {}
   for k, v in tl: tl2[k + ""] = v + ""
-  if os.env("VLINT_VTSC_INPROC") == "1": return to_json(work(fs, os, ffi, Job(kind + "", at + "", fl, lib + "", tl2)))
+  if os.env("VLINT_VTSC_INPROC") == "1": return to_json(work(fs, os, ffi, Job(kind + "", at + "", fl, lib + "", tl2, sthr)))
   var failed = tsprog.Proj(false, "", [], {}, {}, {})
   let exe = lcache.self_exe(ffi)
   if exe == "":
@@ -571,7 +593,7 @@ fn run_program_js_n(fs: Fs, os: Os, ffi: Ffi, kind: Str, at: Str, files: [Str], 
   let pj = dir + "/job.json"
   let po = dir + "/out.json"
   let pe = dir + "/err.txt"
-  fs.write(pj, to_json(Job(kind + "", at + "", fl, lib + "", tl2))) else 0
+  fs.write(pj, to_json(Job(kind + "", at + "", fl, lib + "", tl2, sthr))) else 0
   var cpu = os.env("VLINT_VTSC_CPU")
   if cpu == "": cpu = "600"
   let rc = os.run(["sh", "-c", "ulimit -t \"$4\" 2>/dev/null; VTSC_JOBS=\"$6\" VTSC_CACHE_DIR=\"$5\" exec \"$0\" --vtsc-worker \"$1\" \"$2\" 2> \"$3\"", exe, pj, po, pe, cpu, cache_dir(os), "{nj}"]) else -1
@@ -614,14 +636,14 @@ fn work(fs: Fs, os: Os, ffi: Ffi, j: Job) -> tsprog.Proj:
   let nj = int(os.env("VTSC_JOBS")) else 0
   let fm: Memo[Str, tsprog.FSrc] = memo()
   let km: Memo[Str, Int] = memo()
-  return work_n(fs, os, ffi, j, nj, fm, km)
+  return work_n(fs, os, ffi, j, nj, fm, km, j.sthr)
 
-fn work_n(fs: Fs, os: Os, ffi: Ffi, j: Job, nj: Int, fm: Memo[Str, tsprog.FSrc], km: Memo[Str, Int]) -> tsprog.Proj:
+fn work_n(fs: Fs, os: Os, ffi: Ffi, j: Job, nj: Int, fm: Memo[Str, tsprog.FSrc], km: Memo[Str, Int], sthr: Int) -> tsprog.Proj:
   # (a worker process is given the cache's folder; here, it's vlint's own)
   var cdir = os.env("VTSC_CACHE_DIR")
   if cdir == "" and os.env("VLINT_VTSC_ISOLATE") != "1": cdir = cache_dir(os)
-  if j.kind == "inferred": return tsprog.check_inferred_lint(fs, os, ffi, j.at, j.files, j.lib, nj, j.lint, cdir, fm, km)
-  return tsprog.check_project_lint(fs, os, ffi, j.at, j.lib, nj, j.lint, cdir, fm, km)
+  if j.kind == "inferred": return tsprog.check_inferred_lint(fs, os, ffi, j.at, j.files, j.lib, nj, j.lint, cdir, fm, km, sthr)
+  return tsprog.check_project_lint(fs, os, ffi, j.at, j.lib, nj, j.lint, cdir, fm, km, sthr)
 
 # vlint --vtsc-worker JOB OUT: the program's check, as JSON in OUT.
 fn worker(fs: Fs, os: Os, ffi: Ffi, jp: Str, op: Str) -> Int:
