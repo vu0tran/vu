@@ -225,6 +225,7 @@ vu_str vl_readdir(const vu_str *path) {
 // bound, so each shares that copy-on-write instead of making its own. Only where this process has
 // one thread: another's locks (malloc's among them) would stay held in the child.
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -263,6 +264,26 @@ int64_t vl_fork(void) {
 }
 
 bool vl_is_child(void) { return vl_child_flag != 0; }
+
+// n flags (zero) that processes forked after they're made share (an anonymous shared mapping):
+// forked workers claiming work items. 0 when they can't be made.
+int64_t vl_shared_flags(int64_t n) {
+  if (n < 1) n = 1;
+  void *p = mmap(NULL, (size_t)n * 8, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+  if (p == MAP_FAILED) return 0;
+  return (int64_t)(intptr_t)p;
+}
+// flag i set by this call (a compare-and-swap from 0): whether it was this call that set it
+bool vl_flag_claim(int64_t at, int64_t i) {
+  int64_t old = 0;
+  return __atomic_compare_exchange_n((int64_t *)(intptr_t)at + i, &old, 1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+int64_t vl_flag_get(int64_t at, int64_t i) { return __atomic_load_n((int64_t *)(intptr_t)at + i, __ATOMIC_RELAXED); }
+void vl_flag_set(int64_t at, int64_t i, int64_t v) { __atomic_store_n((int64_t *)(intptr_t)at + i, v, __ATOMIC_RELAXED); }
+void vl_flags_free(int64_t at, int64_t n) {
+  if (n < 1) n = 1;
+  if (at != 0) munmap((void *)(intptr_t)at, (size_t)n * 8);
+}
 
 // A child's exit status (128 + the signal that stopped it; -1 when it can't be waited for).
 int64_t vl_wait(int64_t pid) {
