@@ -1763,7 +1763,8 @@ twice, load 15-22:
 These builds' outputs identical to j_base in both runs (and the gate's); 27c7f129's second run
 differed on idx 75 (190 files left untyped) and idx 12's stderr (2 untyped where 1): idx 75 alone
 left about 190 files untyped in 2 of 6 runs of ef8334ea and 1 of 10 of these changes on it, so it
-comes from the threaded check, not from these.
+comes from the threaded check, not from these (found and fixed: "A lazy member's type published
+between two reads", below).
 
 What's left before the check: the JS host's first answer (node's start, the host, the local plugin;
 about 0.1 s) is what the smallest 25 or so invocations wait for, their type-aware part done in
@@ -1779,6 +1780,66 @@ share with their parent too (10.5 GB against 10.4 of RSS). Fewer shards trade th
 (VTSC_THREADS_MIN_FILES=2000) 5.8 GB, 6.2-6.4 s, cpu +30%. Next, idx 59 alone: 9 GB, the checker's
 state growing from 2 GB after its parse to 8 GB at its end. Both are the checker's to shrink (each
 shard types the lib and the shared declarations again).
+
+### A lazy member's type published between two reads (fixed 2026-11-26)
+
+The idx 75 case above (966 files on 4 threads in one worker; about 190 files left untyped in 2 of 77
+runs when three runs of it went at once, and in about 1 of 50 with four; not in 40 runs alone; twice
+965 of 966 files linted instead, a relation to another generic mapped type over the same package's
+types, likely the same cause but not traced). How it was found (the session's scratch `m24/`:
+`loop.sh` an invocation again and again with VLINT_VTSC_DEBUG=2 or 3, four at once, a run that
+differs kept; builds with eprints only on the paths that fail, so the good runs stay as they were):
+the files' reason was one relation, a primitive or undefined to a generic mapped type: the keys of a
+package's model creation type, `{ [P in Keys<PC>]: PC[P] }` with PC concrete, stayed a conditional
+type because a property's type in PC held a type parameter of the package's base interface, `Base<C,
+S, T>` with `readonly made: C`, raw: the member of `Simple<T> extends Base<T, T, T>` (and of a
+`Maybe<X, C> extends Base<X["made"] | C, ...>`) typed as its declaration's C. The worker's own
+st_tmp held that raw C for the inherited member while the shared column already held the right type,
+and the symbol had reached type_of_sym's general path (compute_sym_type, the declaration's
+annotation) though it has a hy_linst record.
+
+The cause: type_of_sym read the symbol's type again at each branch. A worker found it unmade
+(-1) at the top; another worker published it a few instructions later; the linst branch's own
+`sty(c, s) == -1` then failed, and the symbol fell through to the declaration's type, which for
+a member of an instantiated type is its generic declaration's, uninstantiated. Outside an alias
+that was harmless (sty_put's first published wins); while an alias is made (or under
+speculation) sty_put keeps a type unequal to the published one as the worker's own, so that
+worker typed the member as C for the rest of its run, and every type made from it (the model's
+creation type, the files that import its stores) went generic. With a counting build, the fall
+through happened 2-24 times in every run of idx 75 and of the synthetic case; only the ones
+inside an alias did harm.
+
+The fix: type_of_sym reads the type once (`st0`) and decides every branch on it; tyops's
+concreteness check of a mapped type's properties the same (a property seen unmade then made
+counted as not concrete). `vtests/lazy-member-published-meanwhile` shows it: 200 interfaces
+inheriting `made: C` from `Base<C, S>`, four files reading `o.made` plainly (published at once)
+and four reading it in `typeof v` aliases (kept unpublished); with VTSC_THREADS=4 or 8 and
+VTSC_THREADS_MIN_FILES=1 the old build reported `Type 'number' is not assignable to type 'C'` in
+23 of 25 and 22 of 25 runs (20 of 20 later); the fix 0 of 50 on each of 2, 4 and 8 threads.
+
+Checked: idx 75 four at once 160 of 160 runs with all 966 files linted (the condition that failed
+about 1 in 50); idx 75 and idx 12 alone 32 runs each, stdout and stderr identical to j_base; the
+gate (176 job outputs identical, probes 135/135 and shuffled 1 and 2, vtests the 3 known
+failures, the same as the old build in the same folder but the new case); `dgate.sh` idx 31, 52,
+86, 59 at 1, 2, 4, 8 threads: 16 of 16 the same; one checker's instructions on idx 59 / 86 / 52 /
+31 134.2 / 82.5 / 51.2 / 47.3 G against 135.2 / 83.6 / 51.7 / 48.0 (serial runs don't reach
+the change; noise).
+
+Other values made lazily by each worker, looked at for the auto[] hazard (a published type
+referring to one worker's copy) and for this one (a shared value read twice):
+- `global_this_t` (typeof globalThis, a new object and symbol per worker): published node types
+  may name another worker's; nothing compares it by id, so left as is.
+- `inst_unsup` (the "too many type instantiations" unsupported type, per worker): only its kind is
+  read, and expect_unsup is per worker.
+- `object_iface` (rel's Object): the declared type, canonical (dty publishes first wins).
+- `has_enum` (trules2): a fact of the program, the same in every worker.
+- unique symbols (tl_cache), this types (hy_thistp, cx_publish), type parameters (nsym_publish),
+  mapped templates (mtmpl): shared and first-wins, canonical.
+- `closed_t`, `gen_cache`, `prop_cache`: per worker caches of facts that don't change once
+  published; `cond_shell` per worker, its result not cached while a shell is open.
+- Double reads of a published word: the other `sty(..) == -1` tests read it once (tyops's mapped
+  index lookup, chk's ref_key); declared_type's two reads of `dty` and prop_type_for's of
+  hy_thistp only go from unmade to made, and take the same path either way.
 
 ## Keeping the caches in CI
 
