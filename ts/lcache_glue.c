@@ -234,6 +234,22 @@ vu_str vl_build_uuid(void) {
   return vu_str_from(hex, (int64_t)strlen(hex));
 }
 
+// The allocator's free memory given back to the system (macOS: malloc_zone_pressure_relief; glibc:
+// malloc_trim): vlint's process kept 0.3-0.7 GB of the plain lint's freed memory resident while
+// the type-aware part ran.
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
+void vl_release_memory(void) {
+#ifdef __APPLE__
+  malloc_zone_pressure_relief(NULL, 0);
+#elif defined(__GLIBC__)
+  malloc_trim(0);
+#endif
+}
+
 // Whether a path is a symbolic link (lstat).
 bool vl_is_link(const vu_str *path) {
   char *p = vu_cstr(path);

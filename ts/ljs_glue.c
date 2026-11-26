@@ -598,6 +598,20 @@ vu_str vl_node_call(const vu_str *req) {
     return vu_str_from("!", 1);
 }
 
+/* Lets the processes end (their fd 3 closed: each ends once it has answered what it was sent),
+   without waiting for them: they're waited for at exit. For once every file is linted: the
+   type-aware part that follows doesn't need them, and they held 60-150 MB each meanwhile. */
+void vl_node_release(void) {
+    pthread_mutex_lock(&vl_mu);
+    vl_init_once();
+    for (int i = 0; i < VL_MAXW; i++) {
+        pthread_mutex_lock(&vlw[i].mu);
+        if (vlw[i].pid >= 0 && vlw[i].in >= 0) { close(vlw[i].in); vlw[i].in = -1; }
+        pthread_mutex_unlock(&vlw[i].mu);
+    }
+    pthread_mutex_unlock(&vl_mu);
+}
+
 /* Ends the processes (they finish the work they have). */
 void vl_node_stop(void) {
     pthread_mutex_lock(&vl_mu);

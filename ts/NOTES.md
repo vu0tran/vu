@@ -1713,6 +1713,31 @@ What it was, and what landed (each with the gate: the job's 176 outputs, probes 
 The cold job after these (one run, load about 22): 58.6 s, 419 cpu-s, 10.7 GB at the peak (idx
 86's 8 forked shards: 13 processes whose shared pages each counts), 176 outputs identical.
 
+Then (the same gate):
+- A program's tsconfig was matched against the file tree three times: by the plan (lvtsc.cfg_load),
+  by job_run asking the file cache (which, off, can't answer: VLINT_VTSC_CACHE=0, the job's
+  setting), and by the worker process; its references (tsconf.read_refs) up to three times by the
+  plan and once more by the worker. Now the plan reads each once (lvtsc.tc_refs), job_run doesn't
+  ask a cache that's off, and the worker is given both (Job's cfg and refs, as JSON). The
+  14,449-file package's program started checking about 0.5 s sooner (its worker 1.0 -> 0.45 s
+  into the invocation).
+- A worker's job file had each linted file's rule list (2.8 KB) once per file: 40 MB of JSON for
+  the 14,449-file package, 0.15 s to write and read. Now each list once (Job's lsets, lset_of):
+  3.4 MB.
+- Once every file is linted, the JS plugins' hosts are let go (their fd 3 closed, ljs.release;
+  waited for at exit) and the allocator's free memory is given back (lcache.release_memory):
+  three hosts of 60-150 MB each no longer stay through the type-aware part (idx 86: 10.4 -> 10.0-10.3
+  GB at its peak; main itself stayed at 0.28 GB). VLINT_KEEP=1: neither.
+
+The peak: `jobp.py` (job.py with the tree's RSS and phys_footprint per sample, mem.txt) puts it at
+idx 86, the last invocation, alone: its worker (1.09 GB parsed and bound when it forks) and 8 shards
+of 0.4 GB right after the fork growing to 1.1 GB each. phys_footprint counts the pages the shards
+share with their parent too (10.5 GB against 10.4 of RSS). Fewer shards trade the wall for it: 8 /
+6 / 5 shards 5.0 / 5.55 / 6.15 s, 9.8 / 8.4 / 7.7 GB (two runs each); threads instead of the shards
+(VTSC_THREADS_MIN_FILES=2000) 5.8 GB, 6.2-6.4 s, cpu +30%. Next, idx 59 alone: 9 GB, the checker's
+state growing from 2 GB after its parse to 8 GB at its end. Both are the checker's to shrink (each
+shard types the lib and the shared declarations again).
+
 ## Keeping the caches in CI
 
 What a CI job can keep between runs is one folder: `$XDG_CACHE_HOME/vlint` (`~/.cache/vlint`
