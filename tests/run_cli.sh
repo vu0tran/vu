@@ -57,6 +57,13 @@ printf 'type Cfg:\n  Missing(key: Str)\n\nfn need(k: Str) -> Int throws Cfg:\n  
 out=$($VU run "$work/typed.vu" 2>&1); rc=$?
 [ $rc -eq 1 ] && [ "$out" = "error: Missing(port)" ]; check "main fails with an enum value: its message, exit 1" $? "rc=$rc out=[$out]"
 
+# Int32 fields: stored in 4 bytes, so ten of them make a 40-byte struct (sizeof checked by the C compiler)
+printf 'type Node:\n  k, pos, end, a, b, c, d, f, s, file: Int32\n\ntype Mix:\n  k: Int32\n  z: Byte\n  n: Int\n\nfn main():\n  var xs = [Node(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)]\n  xs[0].file += Mix(1, 2, 3).k\n  print("{xs[0].file}")\n' > "$work/i32.vu"
+$VU build "$work/i32.vu" -o "$work/i32" --emit-c "$work/i32.c" >/dev/null 2>&1
+printf '_Static_assert(sizeof(T_Node) == 40, "Node"); _Static_assert(sizeof(T_Mix) == 16, "Mix");\n' >> "$work/i32.c"
+out=$("$work/i32" 2>&1); $real_cc -std=gnu11 -c "$work/i32.c" -o "$work/i32.o" 2>"$work/i32.err"; rc=$?
+[ $rc -eq 0 ] && [ "$out" = "11" ]; check "Int32 fields: 4 bytes each in the struct (sizeof 40 for ten)" $? "rc=$rc out=[$out] $(grep -m2 error "$work/i32.err")"
+
 # vu new web NAME: the files, a starter that checks, and refusals that write nothing
 out=$(cd "$work" && $VU new web demo-app 2>&1); rc=$?
 [ $rc -eq 0 ] && for f in main.vu public/style.css Dockerfile .dockerignore .gitignore fly.toml railway.json README.md; do [ -s "$work/demo-app/$f" ] || exit 1; done \

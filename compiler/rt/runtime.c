@@ -359,6 +359,11 @@ static inline uint8_t vu_byte(int64_t v, int line) {
     if (__builtin_expect((uint64_t)v > 255, 0)) vu_fail(line, "%lld does not fit in a Byte (0..255)", (long long)v);
     return (uint8_t)v;
 }
+/* An Int stored into an Int32 struct field (what: "Type.field"). */
+static inline int32_t vu_i32(int64_t v, int line, const char *what) {
+    if (__builtin_expect(v != (int64_t)(int32_t)v, 0)) vu_fail(line, "%lld does not fit in %s, an Int32 (-2147483648..2147483647)", (long long)v, what);
+    return (int32_t)v;
+}
 static inline uint8_t vu_badd(uint8_t a, uint8_t b, int line) { return vu_byte((int64_t)a + b, line); }
 static inline uint8_t vu_bsub(uint8_t a, uint8_t b, int line) { return vu_byte((int64_t)a - b, line); }
 static inline uint8_t vu_bmul(uint8_t a, uint8_t b, int line) { return vu_byte((int64_t)a * b, line); }

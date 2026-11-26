@@ -3368,3 +3368,44 @@ three runs of 809 and one of 788) found nothing. The full gate can't pass on mac
 leak checks, static linking, /proc and Python's Unicode version are Linux's); there, the suites that
 don't need those passed (targeted 802 of 802, the fixed point), and the selfhost case that failed
 (a 20,000-term expression) crashes Apple's clang with the old compiler too. Not run on Linux.
+
+**Int32 struct fields (2026-11-26).** A struct field declared `Int32` keeps an Int from
+-2147483648 to 2147483647 in 4 bytes (`int32_t` in C) instead of 8. It's for structs kept by the
+million: vtsc's syntax tree is one list of a 10-field `Node`, 4.1 M of them on the largest program
+vlint checks in CI, 80 bytes each. To the checker the field is an Int: a read is an `int64_t` value
+(never a place, so nothing can point at its 4 bytes as an Int's 8), and every store into it is
+checked: a construction (and a default), `=`, `+=` and the other compound assignments (computed as an
+Int, then checked), `.unique` writes into a Shared value, and `from_json`, which fails with "expected
+a number from -2147483648 to 2147483647" instead of truncating. A value that doesn't fit stops the
+program ("2147483648 does not fit in Node.pos, an Int32 (-2147483648..2147483647)") in release builds
+too: Vu's release builds keep every check (Int overflow, a Byte's range), and a silent truncation
+would corrupt an index that's only read much later; the check is one comparison per store, and reads
+cost nothing. An out-of-range literal is a compile error. `&n.k` (a `var` parameter, a method whose
+receiver is `var`, `swap`) is refused with a message saying to copy it into a variable and store it
+back; `Int32` anywhere but a struct field (a variable, parameter, list element, optional, enum
+variant, generic type argument) is refused too. `vu check --checks` lists the store's check in a loop,
+and `vu check --index` shows the field as `Int32`.
+Attack round 1 (targeted 810 to 823: both ends of the range by `=`, `+=` and construction, computed
+so only the runtime check sees them; `&` and `swap` refused; out-of-range literals and defaults;
+Int32 where it isn't allowed; lists of such structs with sort, `for var`, `copy_within`, moves and
+copies; a Shared value written through `.unique` and read by tasks; JSON at both ends and past them;
+generic structs; and a module's struct, `tests/modules/49_int32_fields`) found only mistakes in the
+tests (expected values worked out by hand, now computed in Python; messages starting with `-` read as
+grep options). Round 2 (`?` and `else` on the right of a store, `+%=` and `>>>=`, loop accumulators
+into a field, map values, `par` loops, function values and methods with a `var` receiver) found one
+thing: `vu check --checks` didn't list the store's range check among a loop's per-pass checks (now
+it does). Round 3 (the C each test makes under gcc-14 and clang with the gate's warning flags, and
+the struct sizes: `run_cli.sh` checks that ten Int32 fields make a 40-byte struct) found nothing.
+ASan and UBSan runs of every test were clean. Not run: the full gate (it needs Linux: leak checks,
+static linking, /proc), ThreadSanitizer and the arm64 suite. On macOS: targeted 818 of 818, modules
+54 of 54 and json 97 of 97 (both with leak checks off), fmt, tests, debug and cli (but `--static`) passed; selfhost passed
+but the 20,000-term expression that crashes Apple's clang with the old compiler too.
+
+**vtsc's syntax tree in Int32 fields (2026-11-26).** All ten of `ts/ast.vu`'s `Node` fields are
+`Int32` now (its kind, offsets within a file, node and list indexes, interned names, flags up to
+2^21, the file's index): 40 bytes a node, was 80; no field access had to change. On the CI job's
+pattern (176 outputs, 2 at a time) the outputs are identical and the job's peak tree RSS went 5.8 ->
+5.1 GB. Its largest invocation alone, as the job runs it: peak 5.57 -> 4.51 GB; checked serially in
+vlint's process: max RSS 3.78 -> 3.25 GB, instructions 150.75 -> 150.95 G (the stores' checks). The
+next largest: 3.66 -> 3.15 GB, 2.77 -> 2.29 GB, 87.50 -> 88.02 G. vtsc's probes and vtests are
+unchanged (one measurement each, on a loaded machine).
