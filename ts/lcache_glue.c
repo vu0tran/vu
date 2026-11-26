@@ -1,4 +1,7 @@
 // vlint's result cache: a file's size, modification and change times (ns) and inode, and the clock.
+#if !defined(__APPLE__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* (dl_iterate_phdr) */
+#endif
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -171,6 +174,64 @@ vu_str vl_self_exe(void) {
   if (!realpath("/proc/self/exe", buf)) return vu_str_from("", 0);
 #endif
   return vu_str_from(buf, (int64_t)strlen(buf));
+}
+
+// The linker's identifier of this executable, as hex ("" none): its Mach-O LC_UUID or its ELF GNU
+// build-id note, read from the image in memory. Both are hashes of the linked output, so a build of
+// other code has another; the caches' build key without reading the 16 MB executable (exe_hash).
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#else
+#include <link.h>
+#include <elf.h>
+static int vl_note_cb(struct dl_phdr_info *info, size_t size, void *data) {
+  (void)size;
+  char *out = (char *)data;
+  // (the first object is the executable itself)
+  for (int i = 0; i < info->dlpi_phnum; i++) {
+    const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+    if (ph->p_type != PT_NOTE) continue;
+    const unsigned char *p = (const unsigned char *)(info->dlpi_addr + ph->p_vaddr);
+    size_t off = 0;
+    while (off + 12 <= ph->p_memsz) {
+      uint32_t nsz, dsz, typ;
+      memcpy(&nsz, p + off, 4); memcpy(&dsz, p + off + 4, 4); memcpy(&typ, p + off + 8, 4);
+      size_t name_at = off + 12, desc_at = name_at + ((nsz + 3) & ~3u);
+      size_t next = desc_at + ((dsz + 3) & ~3u);
+      if (next > ph->p_memsz) break;
+      if (typ == 3 && nsz == 4 && memcmp(p + name_at, "GNU", 4) == 0 && dsz >= 8 && dsz <= 64) {
+        for (uint32_t k = 0; k < dsz; k++) sprintf(out + 2 * k, "%02x", p[desc_at + k]);
+        return 1;
+      }
+      off = next;
+    }
+  }
+  return 1;
+}
+#endif
+vu_str vl_build_uuid(void) {
+  char hex[160] = "";
+#ifdef __APPLE__
+  const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(0);
+  if (h && h->magic == MH_MAGIC_64) {
+    const unsigned char *lc = (const unsigned char *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+      const struct load_command *c = (const struct load_command *)lc;
+      if (c->cmd == LC_UUID) {
+        const struct uuid_command *u = (const struct uuid_command *)lc;
+        int zero = 1;
+        for (int k = 0; k < 16; k++) { sprintf(hex + 2 * k, "%02x", u->uuid[k]); if (u->uuid[k]) zero = 0; }
+        if (zero) hex[0] = 0;
+        break;
+      }
+      lc += c->cmdsize;
+    }
+  }
+#else
+  dl_iterate_phdr(vl_note_cb, hex);
+#endif
+  return vu_str_from(hex, (int64_t)strlen(hex));
 }
 
 // Whether a path is a symbolic link (lstat).

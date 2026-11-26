@@ -1678,6 +1678,41 @@ of `nd[x].k` and friends can't all be rewritten; ast.vu's Node would be the only
 columns left (htl, the signature columns, ho_resolved), and the threads' ntype and rel_cache maps
 (3.8 M and 2.8 M entries over 8 threads on idx 59).
 
+### Before the check on the CI job's pattern (measured 2026-11-25, night)
+
+How it was measured (the session's scratch `m20/`): `allph.sh` each of the 88 invocations alone,
+cold, with VLINT_T, VTSC_PHASES and VTSC_DEBUG_LIBS (`ana.py`, `ana2.py` the tables); `ins_ta.sh`
+one checker's instructions; load 20-27 on 10 cores, so walls are noisy and one run each.
+
+What it was, and what landed (each with the gate: the job's 176 outputs, probes and shuffled 1 and
+2, vtests' 3 known failures, `dgate.sh` idx 31/52/86/59 at 1, 4 and 8 threads, 2 rounds):
+- The early type-aware plan (spec_ta) often didn't start early. The runtime gives new tasks to
+  the threads in turn and wakes an idle thread for a task queued on a busy one only once two wait
+  there; when the plan's turn was main's own thread, it waited for main to block, after the
+  configurations and the JS host's first answer. `plan: jobs made` came 0.1-0.66 s into 60 of the
+  88 invocations (8.7-12.1 s of walls in all); now 0.02-0.05 s but on the 14,449-file package
+  (0.5: its walk and tsconfigs), 1.8-2.3 s in all. The fix: a task that does nothing spawned after
+  the plan's (vlint.ta_nop).
+- Late libs: 43 programs (in 36 invocations) found a lib a package's declarations reference only
+  after every file was read (@types/node's esnext.disposable and es2025.float16, reached through
+  `/// <reference types="node" />` in other packages' types; dom.iterable; webworker), and read,
+  resolved and parsed every file again: that second pass was 14.0 s of the job's walls. Now the
+  pass's files are kept (ast.graft): the new pass takes over the old one's names, parses the lib
+  files, and adds the old nodes, list items and per-file tables behind them, shifted; the files'
+  resolution is kept as it was (run_libs' Graft). The final read+parse over the job 26.5 -> 15.3 s
+  of walls. `VTSC_GRAFT=check` grafts and also reads everything again, and compares every node
+  (names by text), list item, side table and per-file value: 43 of 43 programs identical.
+  VTSC_GRAFT=0: the old way. One checker's instructions, idx 59 / 86 / 52 / 31: 178.6 / 97.5 /
+  62.1 / 52.05 G -> 168.9 / 93.9 / 59.3 / 52.3.
+- The JS hosts stopped one after another at exit (each waited for before the next one's fd 3 was
+  closed): four React Compiler hosts with node's compile cache cold took 0.3-0.5 s between the
+  output and the exit; now every fd 3 is closed first (ljs_glue.c vl_stop_all), 0.15-0.25.
+- VLINT_BUILD_ID from the linker's UUID instead of hashing the 16 MB executable: 7-11 ms of every
+  invocation, before the plan could start.
+
+The cold job after these (one run, load about 22): 58.6 s, 419 cpu-s, 10.7 GB at the peak (idx
+86's 8 forked shards: 13 processes whose shared pages each counts), 176 outputs identical.
+
 ## Keeping the caches in CI
 
 What a CI job can keep between runs is one folder: `$XDG_CACHE_HOME/vlint` (`~/.cache/vlint`
@@ -1690,8 +1725,9 @@ without XDG_CACHE_HOME). In it:
 - `tslib-HASH/`, `host-HASH.mjs`, `node-compile-cache/`: the TypeScript lib vlint carries, its
   JavaScript plugin host and node's compiled copy of it (all keyed by their content)
 
-BUILD, and the build part of the other keys, is VLINT_BUILD_ID: a hash of vlint's executable bytes,
-set by vlint for itself and its worker processes. A job that installs vlint afresh each run gets a
+BUILD, and the build part of the other keys, is VLINT_BUILD_ID: the linker's identifier of vlint's
+executable (Mach-O LC_UUID, ELF GNU build-id: hashes of the linked output, read from the image in
+memory), else a hash of its bytes, set by vlint for itself and its worker processes. A job that installs vlint afresh each run gets a
 new file (new times and inode) with the same bytes, and its caches still apply; another vlint
 gets new keys, its old entries unused. (Before, the keys were the executable's times and inode:
 a reinstall missed every entry.) So a CI cache key needs no vlint version for correctness;

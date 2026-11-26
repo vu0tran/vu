@@ -81,7 +81,8 @@ static __thread int vl_slot = -1;
 /* (rmu not held: the reader may be waiting for it) */
 static void vl_stop(vl_worker *w) {
     if (w->pid < 0) return;
-    close(w->in);
+    if (w->in >= 0) close(w->in);
+    w->in = -1;
     if (!w->has_reader) close(w->out);
     int st;
     /* (it ends when its fd 3 closes; one that doesn't within 2 s, or that was found stuck, is killed) */
@@ -111,7 +112,14 @@ static void vl_stop(vl_worker *w) {
     w->have = w->next = 0;
 }
 
-static void vl_atexit(void) { for (int i = 0; i < VL_MAXW; i++) vl_stop(&vlw[i]); }
+/* (every process's fd 3 closed first, then each waited for: they end at once, not one after another;
+   four React Compiler hosts took 0.3-0.5 s to end in turn) */
+static void vl_stop_all(void) {
+    for (int i = 0; i < VL_MAXW; i++)
+        if (vlw[i].pid >= 0 && vlw[i].in >= 0) { close(vlw[i].in); vlw[i].in = -1; }
+    for (int i = 0; i < VL_MAXW; i++) vl_stop(&vlw[i]);
+}
+static void vl_atexit(void) { vl_stop_all(); }
 
 static void vl_init_once(void) {
     if (vl_inited) return;
@@ -594,7 +602,9 @@ vu_str vl_node_call(const vu_str *req) {
 void vl_node_stop(void) {
     pthread_mutex_lock(&vl_mu);
     vl_init_once();
-    for (int i = 0; i < VL_MAXW; i++) { pthread_mutex_lock(&vlw[i].mu); vl_stop(&vlw[i]); pthread_mutex_unlock(&vlw[i].mu); }
+    for (int i = 0; i < VL_MAXW; i++) pthread_mutex_lock(&vlw[i].mu);
+    vl_stop_all();
+    for (int i = 0; i < VL_MAXW; i++) pthread_mutex_unlock(&vlw[i].mu);
     pthread_mutex_unlock(&vl_mu);
 }
 
