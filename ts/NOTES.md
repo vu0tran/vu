@@ -346,7 +346,8 @@ ajv's meta schema, 13 ms, mostly uri-js's IPv6 regex), 14.6 s over 133 processes
 ESTree 13.0 s; the plugin's work (React's compiler and Babel, 17.7 s; the local plugin 3 s);
 oxlint's walker and context 9.7 s; JSON.parse of the requests 3.2 s; GC 4.7 s.
 
-Not portable to Vu with identical output: eslint-plugin-react-hooks 7.1.1's compiler rules. vlint's
+Not portable to Vu with identical output (measured in "eslint-plugin-react-hooks 7.1.1 against the
+native React Compiler" below): eslint-plugin-react-hooks 7.1.1's compiler rules. vlint's
 native React Compiler (rc_*.vu) is oxc's port of a later compiler, and they disagree on this very
 monorepo: the native react(purity) reports `new Date()` in render at six places in one package
 where react-hooks-js/purity (on as an error) reports nothing. The JS rules also print Babel code
@@ -2086,6 +2087,77 @@ since the type-aware run starts before the plugins load (spec_ta). The walls sum
 two lanes, and idx 86 (type-aware, 5 s) starts at about 39.3 s and runs last, alone: the job is about
 39.3 + 4.9. Cutting cpu shows little because the job isn't saturated: 335 cpu-s in 44 s is 7.6 of 10
 cores, with other work on the machine.
+
+### eslint-plugin-react-hooks 7.1.1 against the native React Compiler (measured 2026-11-26, later still)
+
+The question: could the React Compiler package's JS rules (about 34 of node's cpu-s in the job, its
+invocation about 7 s of wall) run on rc_*.vu instead of in node, with the same output? Not yet: the
+native port is a different compiler, and on the job's own files the two disagree on 80 of the 121
+files where either reports anything. Nothing was routed.
+
+What loads the rules: four invocations (three packages) list `{ "name": "react-hooks-js",
+"specifier": "eslint-plugin-react-hooks" }` in `jsPlugins`, all resolving to 7.1.1, its
+development build (no NODE_ENV). One enables 5 of its rules as errors (error-boundaries, globals,
+immutability, purity, refs), one 22 as errors in an override, one 14 as warnings (hidden by
+`--quiet`, but its disable directives still count). No rule has options, no settings are read
+(the plugin reads only `context.options[0]`, here `{}`). They go to node because every `jsPlugins`
+entry does: vlint maps no JS plugin to native rules, and its native `react(...)` compiler rules
+(rmore10.vu) are a port of oxc_react_compiler 1.90.0, oxc's Rust port of a later compiler, under
+oxc's names (`react/purity`; a directive naming `react/x` doesn't disable `react-hooks-js/x`, and
+the monorepo has both kinds). The plugin's own pipeline: `mayContainReactCode` (a top-level
+component or hook by name), Babel's parser for .ts/.tsx (Hermes for the rest; a parse failure
+reports nothing), Babel's `transformFromAstSync` with the compiler in lint mode (panicThreshold
+none, `validateExhaustiveEffectDependencies` 'off'), each CompileError reported by the rule of its
+category at its first error detail, the message `printErrorMessage(source, {eslint: true})`:
+"Error: REASON", the description, then per detail the absolute path, line and column, and a Babel
+code frame (2 lines above, 3 below, abbreviated past 10), with the detail's message.
+
+How it was measured (the session's scratch `m30/rc/`): every file of the four invocations' inputs
+(1,781), linted once with a config holding only the plugin and all 26 of its rules as errors and
+once with only the native `react/...` rules of the same names (22 exist; config, fbt, gating and
+memoized-effect-dependencies don't, preserve-manual-memoization is listed but not implemented), both
+`-f json`, matched by file, rule, span offset and length, and the reason. Once as the files are and
+once on a copy with every `eslint-disable`/`oxlint-disable` defaced (same length), so the
+directives don't hide what each side finds. The JS side through vlint's host gives the same 139
+diagnostics, messages included, as oxlint 1.79 on the copy.
+
+On the copy, the JS plugin 139 diagnostics, the native rules 187; 80 match by span (79 by reason too):
+
+| rule | both | JS only | native only | why |
+|---|---|---|---|---|
+| set-state-in-effect | 51 | | | |
+| todo | 20 | 36 | 71 | a `try` with `finally`: JS spans the whole statement, native the `finally` (25 / 36, native also more of them); `try` without `catch`: another reason and span (10 / 12); `throw` inside `try`: supported by 7.1.1, a Todo natively (23); `??=`: a Todo in 7.1.1 only (1) |
+| invariant | 1 | 15 | | 7.1.1 bugs the port doesn't have: `a?.['k']` (a string-keyed optional member) in a nested function gives "Expected an optional value to resolve to a call expression or member expression" (14); "[InferMutationAliasingEffects] Expected value kind to be initialized" (1) |
+| exhaustive-effect-dependencies | | | 26 | off in 7.1.1 |
+| purity | | | 6 | `new Date()` impure natively, not in 7.1.1 (`Date.now()`, `Math.random()` are in both) |
+| refs | 3 | 1 | 3 | the two versions' ValidateNoRefAccessInRender |
+| memo-dependencies | 1 | 6 | 1 | the two versions' ValidateExhaustiveDependencies |
+| preserve-manual-memoization | | 1 | | not implemented natively (it needs the reactive scopes pipeline) |
+| use-memo, static-components, no-deriving-state-in-effects | 4 | | | |
+
+And of the 80 that match by span, 77 have another description: oxc rewrote them (and
+its URLs); the plugin's are in its source. As the job sees it (the files as they are, each
+invocation's own rules): the 5-rule package would print 6 purity errors and 1 refs error the
+JS rules don't (they report nothing there), the 22-rule one 1 rule-suppression error, and the
+14-rule one would lose 24 set-state-in-effect warnings (hidden by `--quiet`, so the output only
+changes through directives). The 22-rule and 14-rule packages enable preserve-manual-memoization,
+so they couldn't be routed at all.
+
+Why it stops here: the differences aren't in a table or a message but in which functions each
+compiler lowers and bails out of (Todo and Invariant end a function's compile, so they decide
+where purity, refs and immutability are checked at all), in the aliasing inference and in two
+validations. Matching 7.1.1 means porting 7.1.1's compiler (TypeScript, with Babel's AST and
+scopes, its bugs included), not oxc's; matching only these files would be matching a corpus, and the
+next commit to the monorepo could print something else. The cost it would save: the native rules
+take 0.35 s of wall and 1.3 cpu-s on the 1,781 files, the JS plugin alone 9.0 s and 28.6 cpu-s
+(4 threads).
+
+What routing would need, if a port of 7.1.1 is made: a jsPlugins entry whose specifier resolves to
+a package named eslint-plugin-react-hooks at exactly the version ported; only the compiler rules
+(not rules-of-hooks or exhaustive-deps) and only `{}` or no options; the diagnostics under
+`react-hooks-js(...)` (the entry's name) with the plugin's messages and severity mapping;
+directives matched by that name; and node still started for the invocation's other JS plugins
+(every invocation of this job has the monorepo's local plugin, so node starts anyway).
 
 ### The checker's threads and its hot paths on the CI job's pattern (measured 2026-11-26, later still)
 
