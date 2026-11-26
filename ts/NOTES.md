@@ -1300,6 +1300,76 @@ Still wrong or not known:
   the main checker's own pre-check work and the copy per worker measured), N chosen from the
   program's size, idle threads not spinning.
 
+### Checking one program on threads: hardened, and in the job (2026-11-25, later)
+
+What the section above left, and what came of it (the session's scratch `m16/`: `dgate.sh` the
+determinism runs, `tsan_vt.sh`, `inv.sh` one invocation forked against threaded, `jobm.sh` the job):
+- The two TSan reports were one bug: `ct_orow` gave a published row before the worker's own, so a
+  worker whose fill of an object lost the race to publish went on writing members (an index
+  signature, a property, a symbol's flags) into the row other workers were reading. The worker's own
+  row now comes first while it fills. With it a third report showed (two workers making one numeric
+  literal both write its value): `ct_putf`/`ct_atf` relaxed atomics. TSan on the 344 multi-file
+  vtests and projects, 4 threads: 0 reports, 0 bad exits (was 2 reports); 8 threads, the first 195
+  cases: 0.
+- Fills claimed (ctab.h `ct_claim`, bind.ensure_resolved): counted, idx 59 on 8 threads lost 962-1344
+  fills a run (two workers filling one object, the loser's row unused but its member symbols and
+  signatures used until then: other ids for the same declarations), idx 31 on 2 threads 28-37. Now
+  `ho_resolved` goes from 0 to -(k + 1) for the worker k that fills it, and the others wait for it to
+  be published; a cycle of workers each waiting for another's fill (followed through each worker's
+  "waiting for" word, in its `ho_mine` column's header) is filled by the worker that finds it into a
+  row of its own, kept, as before; one waiting more than 10 s does the same (a worker that can't run).
+  What still is made twice: symbols' types (`sty_init`'s losers, 2,243 in one idx 59 run on 8
+  threads) and declared types (`dty_put`'s, 426), first published wins, as before.
+- The `ct_at` -1 crash: not seen in about 30 runs on idx 59 with 8 threads since ct_orow's fix
+  (and 12 on 2 and 4), against 1 in 6 before it; the likely cause, a published row written by a
+  second fill while another worker read it. Not reproduced, so not proven.
+- Idle threads don't spin: `sample` of an 8-thread idx 59 check shows the idle ones in kevent (Vu's
+  runtime sleeps a thread with nothing to run), sched_yield (ckl_publish's wait) at 0.4% of the
+  samples. What grows is writing the shared columns: new_obj 12% of the threads' samples against
+  2.5% serial (each new row raises ~20 columns' lengths with a compare-and-swap on a line every
+  bounds check reads). While threads write, a column's length is raised 64 rows at a time
+  (`ct_slack`), and the length lives in a cache line of its own: the check phase -5% on 8 threads
+  (6.95 against 7.33 s, two runs each); rows taken 64 at a time per thread on top gained nothing
+  measurable and was dropped. Serial: the same instructions (the slack is 0 then).
+- Determinism (step 5): after the claims, `dgate.sh` (each run's output, its "N of M files
+  checked, K linted" lines and its NOLINT lines against that idx's serial run): idx 31, 52, 86, 59 at
+  1, 2, 4 and 8 threads, 6 rounds each: 96 of 96 the same; before that 13 of 13 (idx 59 on 8 x5, idx
+  31 on 2 x8). Before the claims, 1 in 6 idx 59 runs on 8 threads marked other files unchecked
+  ("calling a union of functions", "a variable whose type evolves"), and the idx 31 case above ("a
+  JSX component of this type": a component's signatures counted twice, as a row written by two
+  fills would have them). One checker's output doesn't depend on the order either: VTSC_SHUFFLE 1, 2,
+  3 on idx 31 and 1, 2 on idx 59, the same output and file sets. Not made independent of timing:
+  `noshow_t` is set just after an interned union or object is made (chk.vu's cx_put of ht_noshow), so
+  another worker finding it in the cache in between prints it; and a type two workers make (the
+  `sty`/`dty` losers above) is the first one published. Neither was seen to change a run.
+- Wired (tsprog.threads_for, run_all), on by default: a program the job gives forked shards
+  (VTSC_JOBS > 1, in its worker process: at most the budget, 4 with --threads=4) and that has 3,000
+  files or more (VTSC_THREADS_MIN_FILES) is checked on that many threads in one process instead
+  (Prog.nthr; VTSC_OFILL and VTSC_PREDECL on for it). VTSC_THREADS_AUTO=0: the shards as before;
+  VTSC_THREADS=N forces N. One invocation as the job runs it (`inv.sh`, forked then threaded,
+  alternated, load 10-14, wall s / cpu s): idx 59 13.9 / 67.4 against 11.9 / 75.3; idx 52 4.11 and
+  3.97 / 20.2 and 19.6 against 3.44 and 3.45 / 17.4 and 17.8; idx 86 (2,710 files) 7.9 and 7.0 /
+  28.1 and 28.7 against 6.6 and 6.7 / 39.8 and 40.0 (threads cost it 40% more cpu: why it stays
+  forked); idx 31 7.5 / 48.6 against 7.0 / 45.1; idx 21 4.5 / 10.8 against 3.0 / 13.1. The whole cold
+  job (`jobm.sh`, two rounds alternated with oxlint 1.79, load 10-13): the shards 68.4 and 68.1 s,
+  370.6 and 369.3 cpu-s, 13.4 and 13.0 GB at the peak; every sharded program on threads 68.3 and 66.8
+  s, 388.2 and 386.6, 7.1 and 7.0 GB; 3,000 files or more on threads (the default now) 66.9 and 66.9
+  s, 374.8 and 375.3, 8.2 and 8.1 GB; oxlint 78.3 and 79.1 s, 475.8 and 477.9, 8.1 and 7.9 GB. The
+  job's 176 outputs the same in every vlint run. So the threads take ~1.4 s off the job's wall
+  (the job is two invocations at a time, mostly small ones) and a third off its memory; the check
+  phase of the biggest program, not the job, is where they pay (idx 59 alone: 27.7 s on one checker,
+  11.7 on 8 threads, 13.7 on 4).
+
+With the default on: the gate the same (176 job outputs, probes 135/135 and shuffled 1 and 2,
+vtests the 3 known failures), one checker's instructions 179.0 / 98.2 / 62.4 / 52.2 G on idx 59 /
+86 / 52 / 31; vtests with VTSC_THREADS=2 and =8 the same as one checker's, no panics.
+
+What's left: symbols' and declared types made by two workers (`sty`/`dty` losers) could be claimed
+as fills are, and `noshow_t` set before an interned type is published; idx 86-like programs (many
+declarations each worker types again) cost 40% more cpu on threads than forked, unexplained
+(contention on the shared columns' writes, or the per-worker copies of the main checker's maps);
+TSan on 8 threads only for the first 195 cases; vlint itself not under TSan (see above).
+
 ## Keeping the caches in CI
 
 What a CI job can keep between runs is one folder: `$XDG_CACHE_HOME/vlint` (`~/.cache/vlint`
