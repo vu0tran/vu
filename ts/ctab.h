@@ -51,16 +51,24 @@ static inline void *cg_view(int64_t a) { return ct_view(a); }
 // A table group: the row counter several columns share (a type's tk tf ta tb, an object's columns,
 // a signature's, a symbol's). A row is taken once (cg_row, a fetch-add), its entries written
 // (ct_put, cl_init), and the row's index handed to other tasks only after that.
+// (with workers, cg_rowk: rows taken CG_CHUNK at a time by each of the first CG_NW workers, kept in a
+// cache line of the group's per worker, so that threads making rows at once don't write the same
+// lines of every column, one row's entries next to another thread's, or fetch-add one counter)
+#define CG_CHUNK 64
+#define CG_NW 16
+#define CG_BYTES (128 * (CG_NW + 1))
 static inline void *cg_new(void *st) {
   // (a cache line of its own: every new row of the group is a fetch-add on it)
   int64_t *g = NULL;
-  if (posix_memalign((void **)&g, 128, 128) != 0) g = NULL;
+  if (posix_memalign((void **)&g, 128, CG_BYTES) != 0) g = NULL;
   if (!g) vu_panic(0, "cg_new: out of memory", 21);
-  memset(g, 0, 128);
+  memset(g, 0, CG_BYTES);
   cs_add(st, g, 3);
   return g;
 }
-static int64_t ct_slack_n;
+// (one for the program: a split build's parts share it, VU_G; a static would be each part's own, and the
+// parts that call ct_slack wouldn't be those whose ct_cover reads it)
+VU_G int64_t ct_slack_n;
 static inline int64_t cg_row(void *g) {
   int64_t r = __atomic_fetch_add((int64_t *)g, 1, __ATOMIC_RELAXED);
   if (r >= CT_MAX / 2) vu_panic(0, "cg_row: a table group is full", 29);
@@ -72,6 +80,24 @@ static inline int64_t cg_rows(void *g, int64_t n) {
   if (r + n > CT_MAX / 2) vu_panic(0, "cg_rows: a table group is full", 30);
   return r;
 }
+// n consecutive rows for the worker whose column of fills is mine (ct_worker's number in its header):
+// from its chunk while threads write the tables (ct_slack), else as cg_rows. The rows of a chunk not
+// used when the threads stop stay unwritten, as rows past a column's end read: 0.
+static inline int64_t cg_rowsk(void *g, void *mine, int64_t n) {
+  int64_t k = ((int64_t *)mine)[-3];
+  if (ct_slack_n == 0 || (uint64_t)k >= CG_NW || n > CG_CHUNK) return cg_rows(g, n);
+  int64_t *e = (int64_t *)g + 16 * (k + 1);
+  if (e[0] + n > e[1]) {
+    int64_t r = __atomic_fetch_add((int64_t *)g, CG_CHUNK, __ATOMIC_RELAXED);
+    if (r + CG_CHUNK > CT_MAX / 2) vu_panic(0, "cg_rowsk: a table group is full", 31);
+    e[0] = r;
+    e[1] = r + CG_CHUNK;
+  }
+  int64_t r = e[0];
+  e[0] += n;
+  return r;
+}
+static inline int64_t cg_rowk(void *g, void *mine) { return cg_rowsk(g, mine, 1); }
 static inline int64_t cg_len(void *g) { return __atomic_load_n((const int64_t *)g, __ATOMIC_ACQUIRE); }
 // (the length and the run counter, p[-2] and p[-1], in a cache line before the entries': read by
 // every bounds check, it is written only as the column grows)
@@ -169,7 +195,7 @@ static inline int64_t ct_orow(void *res, void *mine, int64_t o) {
 // waits: one that comes back to the waiting worker (each waits for an object another one is filling)
 // is a cycle, which serial checking meets as a fill reading its own rows so far.
 #define CT_NW 128
-static int64_t *ct_wk[CT_NW];
+VU_G int64_t *ct_wk[CT_NW];
 static inline void ct_worker(void *mine, int64_t k) {
   int64_t *p = mine;
   if ((uint64_t)k >= CT_NW) vu_panic(0, "ct_worker: too many workers", 27);
