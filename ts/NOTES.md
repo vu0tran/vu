@@ -35,7 +35,7 @@ and how well; this file says where things are. Keep it current when you move thi
 | `lout.vu` | reporters (`Diag`, `Lab`, `Rec`, `make_rec`) |
 | `lpart.vu` | `.vue`/`.astro`/`.svelte` script sections |
 | `ltsgo.vu` | type-aware rules via tsgolint |
-| `ljs.vu`, `lhost.vu`, `jsplug/` | JS plugins in node processes (`jsplug/estree.js` turns vlint's tree into oxc's ESTree) |
+| `ljs.vu`, `lhost.vu`, `jsplug/` | JS plugins in node processes (`jsplug/estree.js` turns vlint's tree into oxc's ESTree; `gen_host.py --snapshot` the host's startup snapshot, embedded by ljs_glue.c) |
 | `fixgen.vu` | `--fix` code printed as oxc_codegen prints it |
 | `lmeta.vu` | generated rule table (`M_*` rule ids, categories, fixability) |
 
@@ -2000,6 +2000,93 @@ type-aware rules 16%, resolving and the grafts 7.6% (kind_of 1.6, resolve_types 
 of the job's 360 in 137 processes; the React Compiler package's four 33.7, the 119 under a
 cpu-second 36.7 (median 0.28).
 
+### The node processes and the JS host's start (measured 2026-11-26, late)
+
+How it was measured (the session's scratch `m27/`): `jobw.py` the job with a `node` wrapper on PATH
+(`nw/node`) logging each node process's cpu and wall into one file per invocation; `one_n.sh` one
+invocation alone with a kept XDG folder (the host and node's compile cache warm, as in a job after
+its first invocation); `nodet/drive2.py` the host started alone N times (load a plugin, setup,
+close: the first answer, cpu, wall); `pinc.py` a `--cpu-prof` profile's self and inclusive times.
+The machine had a load of 4-15 from other work throughout; one job is noisy by 1-2 s.
+
+Before (f43469f8): node 95.9 cpu-s of the job's 358 in 135 processes; the 87 invocations with JS
+plugins started 48 processes beyond their first. With VLINT_JS_PROCS=1 node took 68.5 cpu-s and the
+job 333 cpu-s, and only the React Compiler package (idx 31) got slower (8.3 -> 14.3 s); the 34
+others that had started a second or third process took as long with one, 19 cpu-s less in all.
+
+What landed:
+- The processes sized by measured work (ljs_glue.c `vl_pick`): another process only when the work
+  left would end more than VLINT_JS_SPAWN_GAIN (3) seconds sooner, L / k - L / (k + 1) for k
+  processes, L the requests not sent yet at a warm process's time per request: the answers past
+  each process's first 16, and not the plugins' loads, which include node's start (they made 16
+  answers of a 610-file package look like 9 s of work; it had 0.7 s). The rule before was "more
+  than 1 s left per process" on those cold times. Idx 31 alone with 1/2/3/4 processes: 13.5 / 8.3 /
+  7.0 / 6.5 s, 34 / 38 / 41 / 43 cpu-s; it gets 2 or 3 (the estimate is remade as answers come).
+  Idx 21 (eslint-plugin-n), 16 and 52 get 1.
+- The host started from a V8 startup snapshot built at vlint's build time (`gen_host.py
+  --snapshot`: node runs the host as a script once and saves its heap in `jsplug/host.blob`, 9.5
+  MB; `jsplug/host_blob.h` embeds it with `#embed`; neither is checked in, a build without them
+  has no snapshot). vlint writes it beside the host script (`host-HASH-NODEVERSION.blob`, as it
+  writes the script) and gives it to node (`--snapshot-blob`) when `node --version` says the
+  version that built it (a node of another version refuses a blob with a message on stderr):
+  asked as soon as the root configuration is known to have JS plugins, 20 ms of cpu while vlint
+  plans. The host's code is compiled as a function named `vlint-js-host-HASH.js` (its lines as in
+  host.mjs) and its frames in answers are given the host script's URL, so stack traces in
+  diagnostics are the same with and without the snapshot (checked on a plugin that throws, also
+  through a symlinked cache folder). `import()` of a plugin goes through a vm.Script with
+  USE_MAIN_CONTEXT_DEFAULT_LOADER (a function compiled into a snapshot has no loader for it).
+  What the host reads of its environment as it starts is read when the snapshot is built, so no
+  snapshot with DEBUG or VLINT_JS_CHECK set, or NODE_OPTIONS other than heap sizes and warnings
+  (a preload would run before the snapshot's main); VLINT_JS_SNAPSHOT=0 turns it off. The host
+  started alone: first answer 83 -> 42 ms, cpu 87 -> 43 ms (`node -e 0` is 62 ms of cpu here: a
+  snapshot skips node's own bootstrap of its CommonJS loader too). In the job, vlint's wait for
+  the plugins at config time (start to "config"): 18.6 s summed over the invocations -> 8.4 s,
+  median 0.19 -> 0.08 s.
+- `debug` (eslint's code path analysis) not loaded without DEBUG (gen_host.py STARTUP): it loaded
+  node's tty and util at every start for an instance that does nothing.
+- (Not the JS side) the type-aware worker process waited for with its thread free (lcache.run_free:
+  posix_spawn, then waitpid WNOHANG between os.sleep): os.run blocked its thread in waitpid, and a
+  task that has started stays on its thread (only unstarted tasks move: tasks.c vu_steal), so when
+  the worker was waited for on the thread the main task was on, the module graph's main loop
+  stopped until the worker ended. Idx 59's graph took 0.8 s or 6.0 s, about one run in two (base
+  3 of 5 slow alone; in the job 59 took 8.8-9.2 s or 12.4-12.8 s); after, 6 of 6 fast. A sample of a
+  slow run shows every thread idle but the one in wait4. (The first try flushed every stdio stream,
+  fflush(NULL), and hung an invocation on a stream's lock: only stdout and stderr, as os.run does.)
+
+Not kept:
+- The JS answer read after the next file's native linting (JsPend: a thread sends a file's request
+  and lints its next file before reading the answer; two trees per worker). The threads waited on
+  node for 22% of idx 59's linting and 64% of idx 21's (send to answer summed over the requests), but
+  overlapping didn't show: 59 7.05-7.31 s against 7.05-7.15, 21 the same, 52 2.2 against 2.3.
+- VLINT_JS_SPAWN_GAIN=1: the lint-bound packages alone were faster (21 2.75 -> 1.96 s, 16 2.57 ->
+  1.97, 31 8.5 -> 6.0) but in the job the walls' sum was the same (83.7 against 83.6 s) for 8
+  cpu-s more.
+
+The React Compiler package's node time (idx 31, one process, `--cpu-prof`, 14.7 s of main thread):
+12.5 s in the plugin's runReactCompiler (Babel's transformFromAstSync 11.2 s, the compiler's passes
+9.0 of it), the host's own work (ESTree, the walker, the local plugin) 0.4 s, GC 1.0. Every one of
+its 22 rules reads the same compile (the plugin's LRU cache by file), so no rule is the cost; the
+plugin re-parses the text with Babel itself. It runs its development build (no NODE_ENV), as
+under oxlint. Nothing of it is vlint's to cut but the number of processes (each warms its own JIT,
+3-4 cpu-s).
+
+The job after (HEAD) against before (f43469f8) and oxlint 1.79, two rounds alternated (load 5-14):
+HEAD 44.8 and 44.3 s, 338 and 337 cpu-s; f43469f8 44.3 and 45.2 s, 357 and 356 cpu-s; oxlint 76.0
+and 77.1 s, 478 and 475 cpu-s. Every vlint run's 176 outputs as j_base. Node (the wrapper's job):
+95.9 -> 68.6 cpu-s, 135 -> 89 host processes (and 87 `node --version`, 1.8 cpu-s in all). So about
+20 cpu-s less, the wall the same within the noise. Alone, the lint-bound packages lose a little wall
+for their cpu (`one_n.sh`, f43469f8 -> HEAD): idx 31 6.6 -> 7.1 s, 42.6 -> 39.5 cpu-s; 21 2.53 ->
+2.74 s, 13.6 -> 9.3; 16 2.15 -> 2.64 s, 12.2 -> 8.9; 52 2.34 -> 2.51 s, 14.9 -> 13.9; 23 1.51 ->
+1.30 s, 4.9 -> 3.8; 59 7.33 -> 6.99 s (the graph stall gone), 58.3 -> 57.4.
+
+Where the job's wall goes, and why 40 s isn't reached: each invocation is bound by either its
+type-aware check (most: "type-aware plan" well after "linted") or its linting with the JS rules
+(59, 31, 52, 21, 16, 23); the node wait at config time is off the critical path of the first kind,
+since the type-aware run starts before the plugins load (spec_ta). The walls summed are about 84 s,
+two lanes, and idx 86 (type-aware, 5 s) starts at about 39.3 s and runs last, alone: the job is about
+39.3 + 4.9. Cutting cpu shows little because the job isn't saturated: 335 cpu-s in 44 s is 7.6 of 10
+cores, with other work on the machine.
+
 ## Keeping the caches in CI
 
 What a CI job can keep between runs is one folder: `$XDG_CACHE_HOME/vlint` (`~/.cache/vlint`
@@ -2009,8 +2096,10 @@ without XDG_CACHE_HOME). In it:
   files is checked on one worker, the rest of its results read
 - `tsconfig/`: each tsconfig's reading, with what it asked the file system (lprobe)
 - `modrec-BUILD/`: dependencies' module records (lmod)
-- `tslib-HASH/`, `host-HASH.mjs`, `node-compile-cache/`: the TypeScript lib vlint carries, its
-  JavaScript plugin host and node's compiled copy of it (all keyed by their content)
+- `tslib-HASH/`, `host-HASH.mjs`, `host-HASH-NODEVERSION.blob`, `node-compile-cache/`: the
+  TypeScript lib vlint carries, its JavaScript plugin host, the host's startup snapshot (when vlint
+  was built with one) and node's compiled copy of the plugins (all keyed by their content; the
+  snapshot and the host are written by vlint from what it carries, nothing is built at run time)
 
 BUILD, and the build part of the other keys, is VLINT_BUILD_ID: the linker's identifier of vlint's
 executable (Mach-O LC_UUID, ELF GNU build-id: hashes of the linked output, read from the image in
