@@ -19,6 +19,10 @@ for i in range(st+1,len(L)):
     m=re.match(r'^  (\w+): (.+?)(?:\s+=\s+(.+?))?\s*(?:#.*)?$', l)
     fields.append((m.group(1),m.group(2).strip(),(m.group(3) or '').strip()))
 EMPTY={'diags','kept','spec_keep','touch_moved','checked_log'}   # lists a merge appends: each worker's own
+# The type-aware rules' memos start empty in a worker: the rules run after the check, so the main
+# checker's are empty when the workers start, and a memo may start empty anyway (dep_memo holds
+# indexes into dep_reasons: the two go together)
+EMPTY|={'dep_memo','dep_reasons','mp_then_memo','mp_void_memo'}
 FRESH_TAB={'ho_mine'}
 VIEW={'Tab':'ct','Lst':'cl','Grp':'cg','Ns':'ns','Ik':'ik','Ph':'ph'}
 cps={}
@@ -56,6 +60,7 @@ def val(n,t):
         if n in FRESH_TAB: return f'ct_new(ffi, st)'
         v=VIEW[t]; return f'{v}_view(ffi, {v}_addr(ffi, m.{n}))'
     if t.startswith('SharedMap['): return f'm.{n}.share()'
+    if t=='NodeMap': return f'nm_copy(m.{n})'   # (NodeMap, nm_copy: above the markers)
     if scalar(t): return f'm.{n}'
     if t=='Str': return f'm.{n} + ""'
     if t.startswith('{') or t.startswith('['):
@@ -79,6 +84,8 @@ out.append('fn worker_carry(var w: C, f: C, want: {Str: Bool}):')
 for n,t,d in fields:
     if (t.startswith('{') or t.startswith('[')) and n not in EMPTY and n not in ('t','bd'):
         out.append(f'  if "{n}" in want: w.{n} = {gen_cp(t)}(f.{n})')
+    elif t=='NodeMap':
+        out.append(f'  if "{n}" in want: w.{n} = nm_copy(f.{n})')
 out.append('')
 for t in sorted(cps): out.append(cps[t]); out.append('')
 s=s+'\n'+'\n'.join(out)+E+tail

@@ -2584,6 +2584,101 @@ fn cs_put(var c: C, n: Int, sg: Int):
   if c.nt_pub_on and c.spec == 0 and c.t.value.nd[n].file != c.node_file: c.csig_pub.add(n, sg)
 
 
+# A map from nodes to Ints for the per-node caches (the checker's ntype, the rules' parents): the
+# nodes' numbers are dense, and a file's are together, so the values sit in pages of 256 nodes in one
+# list, a page made when a node in it is first set. Pages from base up, at most lim of them (-1: any
+# number); a key outside them goes in a map of its own (other). NM_NONE: none set. (The hash maps
+# they replaced cost about 5% of a type-aware run in their inserts and lookups.)
+const NM_NONE = -4611686018427387903
+
+type NodeMap:
+  base: Int = 0
+  lim: Int = -1
+  pg: [Int] = []      # page (node >> 8) - base -> where its 256 values start in vals, + 1 (0: no page)
+  vals: [Int] = []
+  other: {Int: Int} = {}
+  len: Int = 0
+
+# (the page of node n, -1 when it is outside the pages)
+fn nm_page(m: NodeMap, n: Int) -> Int:
+  if n < 0: return -1
+  let p = (n >> 8) - m.base
+  if p < 0 or (m.lim >= 0 and p >= m.lim): return -1
+  return p
+
+fn nm_get(m: NodeMap, n: Int, d: Int) -> Int:
+  let p = nm_page(m, n)
+  if p < 0: return m.other.get(n, d)
+  if p >= m.pg.len: return d
+  let b = m.pg[p]
+  if b == 0: return d
+  let v = m.vals[b - 1 + (n & 255)]
+  if v == NM_NONE: return d
+  return v
+
+fn nm_has(m: NodeMap, n: Int) -> Bool:
+  let p = nm_page(m, n)
+  if p < 0: return n in m.other
+  if p >= m.pg.len: return false
+  let b = m.pg[p]
+  return b != 0 and m.vals[b - 1 + (n & 255)] != NM_NONE
+
+# (a node with no value: stops the program, as a map's missing key does)
+fn nm_at(m: NodeMap, n: Int) -> Int:
+  let v = nm_get(m, n, NM_NONE)
+  if v == NM_NONE: panic("node map: node {n} has no value")
+  return v
+
+fn nm_set(var m: NodeMap, n: Int, v: Int):
+  if v == NM_NONE: panic("node map: the value kept for none")
+  let p = nm_page(m, n)
+  if p < 0:
+    if not (n in m.other): m.len += 1
+    m.other[n] = v
+    return
+  while m.pg.len <= p: m.pg.push(0)
+  if m.pg[p] == 0:
+    m.pg[p] = m.vals.len + 1
+    for _i in 0..256: m.vals.push(NM_NONE)
+  let at = m.pg[p] - 1 + (n & 255)
+  if m.vals[at] == NM_NONE: m.len += 1
+  m.vals[at] = v
+
+fn nm_del(var m: NodeMap, n: Int):
+  let p = nm_page(m, n)
+  if p < 0:
+    if m.other.remove(n): m.len -= 1
+    return
+  if p >= m.pg.len or m.pg[p] == 0: return
+  let at = m.pg[p] - 1 + (n & 255)
+  if m.vals[at] != NM_NONE:
+    m.vals[at] = NM_NONE
+    m.len -= 1
+
+# (the nodes with a value: the other map's, then the pages' in node order)
+fn nm_keys(m: NodeMap) -> [Int]:
+  var out: [Int] = []
+  for k, _v in m.other: out.push(k)
+  for p in 0..m.pg.len:
+    let b = m.pg[p]
+    if b == 0: continue
+    for i in 0..256:
+      if m.vals[b - 1 + i] != NM_NONE: out.push(((p + m.base) << 8) + i)
+  return out
+
+fn nm_copy(m: NodeMap) -> NodeMap:
+  var r = NodeMap(base: m.base, lim: m.lim)
+  for x in m.pg: r.pg.push(x)
+  for x in m.vals: r.vals.push(x)
+  for k, v in m.other: r.other[k] = v
+  r.len = m.len
+  return r
+
+# Pages for the nodes first..last (a file's), the rest in the other map.
+fn nm_window(first: Int, last: Int) -> NodeMap:
+  let b = first >> 8
+  return NodeMap(base: b, lim: (last >> 8) - b + 1)
+
 # ---- a worker's checker (made by ts/gen_worker.py: edit the generator, not this)
 # A worker's checker (VTSC_THREADS): the main one's tables as views (ho_mine its own, in st), its
 # SharedMaps, tree and binding as more handles, its settings, and a copy of every other map and
@@ -2891,6 +2986,10 @@ fn worker_checker(m: C, ffi: Ffi, st: Store) -> C:
   w.touch_moved = []
   w.cinit_narrow = m.cinit_narrow.share()
   w.cinit_busy = wcp_MIntBool(m.cinit_busy)
+  w.dep_memo = {}
+  w.dep_reasons = []
+  w.mp_then_memo = {}
+  w.mp_void_memo = {}
   w.has_enum = m.has_enum
   w.strict_sub_reads = m.strict_sub_reads
   w.disc_cache = wcp_MIntInt(m.disc_cache)
@@ -3177,101 +3276,6 @@ fn wcp_MIntBool(m: {Int: Bool}) -> {Int: Bool}:
   var out: {Int: Bool} = {}
   for k, v in m: out[k] = v
   return out
-
-# A map from nodes to Ints for the per-node caches (the checker's ntype, the rules' parents): the
-# nodes' numbers are dense, and a file's are together, so the values sit in pages of 256 nodes in one
-# list, a page made when a node in it is first set. Pages from base up, at most lim of them (-1: any
-# number); a key outside them goes in a map of its own (other). NM_NONE: none set. (The hash maps
-# they replaced cost about 5% of a type-aware run in their inserts and lookups.)
-const NM_NONE = -4611686018427387903
-
-type NodeMap:
-  base: Int = 0
-  lim: Int = -1
-  pg: [Int] = []      # page (node >> 8) - base -> where its 256 values start in vals, + 1 (0: no page)
-  vals: [Int] = []
-  other: {Int: Int} = {}
-  len: Int = 0
-
-# (the page of node n, -1 when it is outside the pages)
-fn nm_page(m: NodeMap, n: Int) -> Int:
-  if n < 0: return -1
-  let p = (n >> 8) - m.base
-  if p < 0 or (m.lim >= 0 and p >= m.lim): return -1
-  return p
-
-fn nm_get(m: NodeMap, n: Int, d: Int) -> Int:
-  let p = nm_page(m, n)
-  if p < 0: return m.other.get(n, d)
-  if p >= m.pg.len: return d
-  let b = m.pg[p]
-  if b == 0: return d
-  let v = m.vals[b - 1 + (n & 255)]
-  if v == NM_NONE: return d
-  return v
-
-fn nm_has(m: NodeMap, n: Int) -> Bool:
-  let p = nm_page(m, n)
-  if p < 0: return n in m.other
-  if p >= m.pg.len: return false
-  let b = m.pg[p]
-  return b != 0 and m.vals[b - 1 + (n & 255)] != NM_NONE
-
-# (a node with no value: stops the program, as a map's missing key does)
-fn nm_at(m: NodeMap, n: Int) -> Int:
-  let v = nm_get(m, n, NM_NONE)
-  if v == NM_NONE: panic("node map: node {n} has no value")
-  return v
-
-fn nm_set(var m: NodeMap, n: Int, v: Int):
-  if v == NM_NONE: panic("node map: the value kept for none")
-  let p = nm_page(m, n)
-  if p < 0:
-    if not (n in m.other): m.len += 1
-    m.other[n] = v
-    return
-  while m.pg.len <= p: m.pg.push(0)
-  if m.pg[p] == 0:
-    m.pg[p] = m.vals.len + 1
-    for _i in 0..256: m.vals.push(NM_NONE)
-  let at = m.pg[p] - 1 + (n & 255)
-  if m.vals[at] == NM_NONE: m.len += 1
-  m.vals[at] = v
-
-fn nm_del(var m: NodeMap, n: Int):
-  let p = nm_page(m, n)
-  if p < 0:
-    if m.other.remove(n): m.len -= 1
-    return
-  if p >= m.pg.len or m.pg[p] == 0: return
-  let at = m.pg[p] - 1 + (n & 255)
-  if m.vals[at] != NM_NONE:
-    m.vals[at] = NM_NONE
-    m.len -= 1
-
-# (the nodes with a value: the other map's, then the pages' in node order)
-fn nm_keys(m: NodeMap) -> [Int]:
-  var out: [Int] = []
-  for k, _v in m.other: out.push(k)
-  for p in 0..m.pg.len:
-    let b = m.pg[p]
-    if b == 0: continue
-    for i in 0..256:
-      if m.vals[b - 1 + i] != NM_NONE: out.push(((p + m.base) << 8) + i)
-  return out
-
-fn nm_copy(m: NodeMap) -> NodeMap:
-  var r = NodeMap(base: m.base, lim: m.lim)
-  for x in m.pg: r.pg.push(x)
-  for x in m.vals: r.vals.push(x)
-  for k, v in m.other: r.other[k] = v
-  r.len = m.len
-  return r
-
-# Pages for the nodes first..last (a file's), the rest in the other map.
-fn nm_window(first: Int, last: Int) -> NodeMap:
-  let b = first >> 8
-  return NodeMap(base: b, lim: (last >> 8) - b + 1)
 
 fn wcp_MIntInt(m: {Int: Int}) -> {Int: Int}:
   var out: {Int: Int} = {}
