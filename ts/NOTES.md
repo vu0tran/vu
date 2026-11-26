@@ -1722,8 +1722,16 @@ Then (the same gate):
   14,449-file package's program started checking about 0.5 s sooner (its worker 1.0 -> 0.45 s
   into the invocation).
 - A worker's job file had each linted file's rule list (2.8 KB) once per file: 40 MB of JSON for
-  the 14,449-file package, 0.15 s to write and read. Now each list once (Job's lsets, lset_of):
-  3.4 MB.
+  the 14,449-file package, 0.15 s to write and read; 3.4 MB with each list once. (Landed here as
+  Job's lsets/lset_of, then replaced by 4ecf45bb's tsprog.Rules, which does the same throughout.)
+- The late-lib restart: 69fdbf82 freed the first reading before reading everything again; with the
+  graft the first reading is kept and grafted (VTSC_GRAFT=0 is that freeing restart), then freed
+  as soon as it's grafted, not when the pass returns (it stayed through the check before). And
+  the graft moves the first reading's nodes up in place behind the new lib files (ast.graft_in_place;
+  VTSC_GRAFT=copy copies them into a new tree, as at first): the copy held the tree twice, the
+  14,449-file program's peak 5.7-5.8 GB against the freeing restart's 4.4; in place 4.3-4.4, the
+  2,710-file one's 3.04-3.07 against 2.88-3.06. Their second pass 1.17 and 0.49 s -> 0.24 and 0.09.
+  VTSC_GRAFT=check: 43 of 43 programs identical with it.
 - Once every file is linted, the JS plugins' hosts are let go (their fd 3 closed, ljs.release;
   waited for at exit) and the allocator's free memory is given back (lcache.release_memory):
   three hosts of 60-150 MB each no longer stay through the type-aware part (idx 86: 10.4 -> 10.0-10.3
