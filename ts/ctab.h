@@ -499,6 +499,84 @@ static inline void cx_del(void *h, int64_t k) {
   int64_t *p = h;
   if ((uint64_t)k < (uint64_t)ct_len0(p)) __atomic_store_n(&p[k], 0, __ATOMIC_RELEASE);
 }
+// A column of 32-bit entries (ct4_*, cx4_*): for a column whose values are ids, kinds and flags under
+// 2^31 (a symbol's, an object's), half the memory of an Int column. The same header (length and run
+// counter as Ints before the entries, ct_len), so ct_len, ct_cover and the views work on it. A value
+// out of range stops the program. cx4_ keeps a value + 2^31 (0: none).
+#define CT4_BYTES ((size_t)CT_MAX * 4 + (size_t)CT_HEAD * 8)
+static inline void *ct4_new(void *st) {
+  char *r = mmap(NULL, CT4_BYTES, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+  if (r == MAP_FAILED) vu_panic(0, "ct4_new: no address space for a column", 38);
+  void *t = r + CT_HEAD * 8;
+  cs_add(st, t, 6);
+  return t;
+}
+static inline void ct4_free(void *h) { munmap((char *)h - CT_HEAD * 8, CT4_BYTES); }
+static inline int32_t ct4_v(int64_t v) {
+  if (__builtin_expect(v < INT32_MIN || v > INT32_MAX, 0)) vu_panic(0, "ct4: a value past 32 bits", 25);
+  return (int32_t)v;
+}
+static inline void ct4_put(void *h, int64_t r, int64_t v) {
+  if ((uint64_t)r >= (uint64_t)CT_MAX) vu_panic(0, "ct4_put: index out of range", 27);
+  ((int32_t *)h)[r] = ct4_v(v);
+  ct_cover(h, r + 1);
+}
+static inline int64_t ct4_at(void *h, int64_t i) {
+  if (__builtin_expect((uint64_t)i >= (uint64_t)ct_len0(h), 0)) vu_panic(0, "ct4_at: index out of range", 26);
+  return ((const int32_t *)h)[i];
+}
+static inline void ct4_set(void *h, int64_t i, int64_t v) {
+  if ((uint64_t)i >= (uint64_t)ct_len0(h)) vu_panic(0, "ct4_set: index out of range", 27);
+  ((int32_t *)h)[i] = ct4_v(v);
+}
+static inline int64_t ct4_acq(void *h, int64_t i) {
+  if (__builtin_expect((uint64_t)i >= (uint64_t)ct_len0(h), 0)) vu_panic(0, "ct4_acq: index out of range", 27);
+  return __atomic_load_n(&((const int32_t *)h)[i], __ATOMIC_ACQUIRE);
+}
+static inline int64_t ct4_publish(void *h, int64_t i, int64_t v) {
+  if ((uint64_t)i >= (uint64_t)ct_len0(h)) vu_panic(0, "ct4_publish: index out of range", 31);
+  int32_t old = -1;
+  if (__atomic_compare_exchange_n(&((int32_t *)h)[i], &old, ct4_v(v), false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE)) return -1;
+  return old;
+}
+static inline int64_t ct4_get0(void *h, int64_t i) {
+  if ((uint64_t)i >= (uint64_t)ct_len0(h)) return 0;
+  return __atomic_load_n(&((const int32_t *)h)[i], __ATOMIC_RELAXED);
+}
+#define CX4_OFF ((int64_t)1 << 31)
+static inline uint32_t cx4_v(int64_t v) {
+  if (__builtin_expect(v <= -CX4_OFF || v >= CX4_OFF, 0)) vu_panic(0, "cx4: a value past 32 bits", 25);
+  return (uint32_t)(v + CX4_OFF);
+}
+static inline uint32_t cx4_ld(void *h, int64_t k) {
+  if ((uint64_t)k >= (uint64_t)ct_len0(h)) return 0;
+  return __atomic_load_n(&((const uint32_t *)h)[k], __ATOMIC_ACQUIRE);
+}
+static inline bool cx4_has(void *h, int64_t k) { return cx4_ld(h, k) != 0; }
+static inline int64_t cx4_get(void *h, int64_t k, int64_t d) {
+  uint32_t v = cx4_ld(h, k);
+  return v == 0 ? d : (int64_t)v - CX4_OFF;
+}
+static inline int64_t cx4_at(void *h, int64_t k) {
+  uint32_t v = cx4_ld(h, k);
+  if (v == 0) vu_panic(0, "cx_at: no value for that row", 28);
+  return (int64_t)v - CX4_OFF;
+}
+static inline void cx4_put(void *h, int64_t k, int64_t v) {
+  if ((uint64_t)k >= (uint64_t)CT_MAX) vu_panic(0, "cx_put: index out of range", 26);
+  __atomic_store_n(&((uint32_t *)h)[k], cx4_v(v), __ATOMIC_RELEASE);
+  ct_cover(h, k + 1);
+}
+static inline int64_t cx4_publish(void *h, int64_t k, int64_t v) {
+  if ((uint64_t)k >= (uint64_t)CT_MAX) vu_panic(0, "cx_publish: index out of range", 30);
+  uint32_t old = 0;
+  bool won = __atomic_compare_exchange_n(&((uint32_t *)h)[k], &old, cx4_v(v), false, __ATOMIC_RELEASE, __ATOMIC_ACQUIRE);
+  ct_cover(h, k + 1);
+  return won ? v : (int64_t)old - CX4_OFF;
+}
+static inline void cx4_del(void *h, int64_t k) {
+  if ((uint64_t)k < (uint64_t)ct_len0(h)) __atomic_store_n(&((uint32_t *)h)[k], 0, __ATOMIC_RELEASE);
+}
 static inline void *ckl_new(void *st) {
   cl_t *h = cl_new(st);
   h->pool[-1] = 1;
@@ -879,6 +957,7 @@ static inline void cs_free(void *p) {
   for (int64_t i = 0; i < s->n; i++) {
     switch (s->k[i]) {
       case 0: ct_free(s->p[i]); break;
+      case 6: ct4_free(s->p[i]); break;
       case 1: cl_free(s->p[i]); break;
       case 2: ph_free(s->p[i]); break;
       case 4: ik_free(s->p[i]); break;
@@ -899,12 +978,12 @@ static inline void cs_free(void *p) {
 static int ct_res_nz;
 static int64_t ct_res_nzb;
 // the bytes of a column's region in memory (its pages touched)
-static inline int64_t ct_resident(void *h) {
+static inline int64_t ct_resident_w(void *h, size_t w) {
   int64_t *base = (int64_t *)h - CT_HEAD;
-  size_t len = (size_t)(CT_MAX + CT_HEAD) * 8, pg = (size_t)getpagesize();
+  size_t len = (size_t)CT_MAX * w + CT_HEAD * 8, pg = (size_t)getpagesize();
   // (only up to the highest entry reserved or written: the length, or the run counter)
   int64_t hi = ((int64_t *)h)[-2] > ((int64_t *)h)[-1] ? ((int64_t *)h)[-2] : ((int64_t *)h)[-1];
-  size_t want = (size_t)(hi + CT_HEAD) * 8 + pg;
+  size_t want = (size_t)hi * w + CT_HEAD * 8 + pg;
   if (want < len) len = want;
   size_t np = (len + pg - 1) / pg;
   char *v = malloc(np);
@@ -924,6 +1003,7 @@ static inline int64_t ct_resident(void *h) {
   ct_res_nzb += nz * (int64_t)pg;
   return n * (int64_t)pg;
 }
+static inline int64_t ct_resident(void *h) { return ct_resident_w(h, 8); }
 static inline void cs_report(void *p) {
   cs_t *s = p;
   int64_t tot[6] = {0};
@@ -938,6 +1018,7 @@ static inline void cs_report(void *p) {
     // (resident: the pages of each region the process has touched, mincore)
     switch (s->k[i]) {
       case 0: b = ct_resident(x); break;
+      case 6: b = ct_resident_w(x, 4); break;
       case 1: b = ct_resident(((cl_t *)x)->row) + ct_resident(((cl_t *)x)->pool) + (((cl_t *)x)->sh ? ct_resident(((cl_t *)x)->se) + CL_SBUCKETS * 8 : 0); break;
       case 2: b = ct_resident(((ph_t *)x)->pool) + ct_resident(((ph_t *)x)->bloom) + PH_BUCKETS * 8; break;
       case 4: b = ct_resident(((ik_t *)x)->pool) + IK_BUCKETS * 8; break;
@@ -947,6 +1028,7 @@ static inline void cs_report(void *p) {
     by[i] = b;
     nzb[i] = ct_res_nzb;
     if (s->k[i] < 6) tot[s->k[i]] += b;
+    else if (s->k[i] == 6) tot[0] += b;
   }
 #ifdef __APPLE__
   {
