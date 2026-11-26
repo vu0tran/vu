@@ -687,7 +687,7 @@ with severities and options, `categories`, `plugins`, `env`/`globals` (globals r
 JSON errors as serde words them. `oxlint.config.ts` is reported as needing a JavaScript runtime.
 `jsPlugins` (in the config and in overrides): run in Node as oxlint runs them (see "JS plugins"
 below), except eslint-plugin-react-hooks 7.x's compiler rules, which vlint runs on its own React
-Compiler (below). Ignore files: `.gitignore` (and the folders above, up
+Compiler, and the rules of eslint-plugin-jsx-a11y 6.x and eslint-comments 4.x that it ports (below). Ignore files: `.gitignore` (and the folders above, up
 to the repository root, and `.git/info/exclude`), `.eslintignore`/`--ignore-path`.
 
 **eslint-plugin-react-hooks on the native React Compiler.** When `jsPlugins` loads
@@ -702,6 +702,28 @@ with 7.1.1 and none of those on, node isn't started for the plugin at all. The m
 the port is oxc's port of a later compiler, so the findings differ from 7.1.1's (ts/NOTES.md has
 them by kind). `VLINT_NATIVE_REACT_HOOKS=0`, or `"settings": { "vlint": { "nativeReactHooks":
 false } }` in the configuration, runs the plugin in node as before.
+
+**eslint-plugin-jsx-a11y and eslint-comments, natively.** Configurations load these two in
+`jsPlugins` for rules oxlint lacks or words otherwise. When `jsPlugins` loads
+eslint-plugin-jsx-a11y 6.x (under an alias) or @eslint-community/eslint-plugin-eslint-comments 4.x
+(under an alias or its own name), these rules run natively, under the configuration's names, with
+the same output as the plugin in node (`rxa11y.vu`, `rxcomments.vu`: ports of 6.10.2 and 4.7.2):
+jsx-a11y's `control-has-associated-label`, `interactive-supports-focus`,
+`no-interactive-element-to-noninteractive-role`, `no-noninteractive-element-interactions`,
+`no-noninteractive-element-to-interactive-role`, `no-onchange` and `label-has-for`, and all nine of
+eslint-comments' (`require-description`, `disable-enable-pair`, `no-unlimited-disable`, `no-use`,
+`no-duplicate-disable`, `no-aggregating-enable`, `no-unused-enable`, `no-restricted-disable`,
+`no-unused-disable`). The same messages, spans and order among the file's other JS plugin
+diagnostics, the same severities, disable directives and unused ones, the error the host gives
+when eslint-comments reports on a file's first line (its stack trace included) and the messages
+jsx-ast-utils prints for expressions it can't read. Measured: identical on 14,167 files of a large
+monorepo (6,347 diagnostics; 6,896 with five more jsx-a11y rules in node alongside) and on the
+code of jsx-a11y's own 5,453 test cases for these rules (ts/NOTES.md). The plugins' other rules, and these with options other
+than none or `{}`, stay in node; with the exact versions above and none of those on, node isn't
+started for the plugin. `VLINT_NATIVE_JS_PLUGINS=0` (or `VLINT_NATIVE_JSX_A11Y=0`,
+`VLINT_NATIVE_ESLINT_COMMENTS=0`, `VLINT_NATIVE_REACT_HOOKS=0`), or `"settings": { "vlint": {
+"nativeJsPlugins": false } }` (`nativeJsxA11y`, `nativeEslintComments`, `nativeReactHooks`) in the
+configuration that lists the plugin, runs them in node.
 
 **JS plugins** (`ljs.vu`, `ljs_glue.c`, `jsplug/`): vlint runs ESLint-style plugins with
 oxlint 1.90.0's own plugin runtime (its `dist`, MIT, embedded by `jsplug/gen_host.py` into
