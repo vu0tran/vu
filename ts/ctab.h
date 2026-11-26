@@ -555,6 +555,17 @@ static inline void *ph_new(void *st) {
 }
 // the entries in the table (VTSC_PHASES)
 static inline int64_t ph_count(void *p) { return (((ph_t *)p)->pool[-1] - 3) / 3; }
+#include <sys/resource.h>
+// the process's peak resident memory so far, in MB (VTSC_PHASES)
+static inline int64_t ct_maxrss(void) {
+  struct rusage r;
+  getrusage(RUSAGE_SELF, &r);
+#ifdef __APPLE__
+  return (int64_t)r.ru_maxrss >> 20;
+#else
+  return (int64_t)r.ru_maxrss >> 10;
+#endif
+}
 static inline void ph_free(void *p) {
   ph_t *h = p;
   free(h->head);
@@ -793,4 +804,34 @@ static inline void cs_free(void *p) {
   free(s->p);
   free(s->k);
   free(s);
+}
+// (VTSC_MEM) the store's tables by the memory their entries take, the largest 25 and each kind's sum
+#include <stdio.h>
+static inline void cs_report(void *p) {
+  cs_t *s = p;
+  int64_t tot[6] = {0};
+  int64_t *by = calloc((size_t)s->n + 1, sizeof *by);
+  for (int64_t i = 0; i < s->n; i++) {
+    int64_t b = 0;
+    void *x = s->p[i];
+    switch (s->k[i]) {
+      case 0: b = ct_len0((int64_t *)x) * 8; break;
+      case 1: b = ct_len0(((cl_t *)x)->row) * 8 + ((cl_t *)x)->pool[-1] * 8; break;
+      case 2: b = ((ph_t *)x)->pool[-1] * 8 + PH_BUCKETS * 8; break;
+      case 4: b = ((ik_t *)x)->pool[-1] * 8; break;
+      case 5: b = ((ns_t *)x)->pool[-1] * 8; break;
+      default: b = 0;
+    }
+    by[i] = b;
+    if (s->k[i] < 6) tot[s->k[i]] += b;
+  }
+  fprintf(stderr, "MEMT kinds MB: columns %lld lists %lld props %lld interned %lld names %lld\n", (long long)(tot[0] >> 20), (long long)(tot[1] >> 20), (long long)(tot[2] >> 20), (long long)(tot[4] >> 20), (long long)(tot[5] >> 20));
+  for (int r = 0; r < 25; r++) {
+    int64_t bi = -1;
+    for (int64_t i = 0; i < s->n; i++) if (by[i] > 0 && (bi < 0 || by[i] > by[bi])) bi = i;
+    if (bi < 0) break;
+    fprintf(stderr, "MEMT #%lld kind %d %lld MB\n", (long long)bi, s->k[bi], (long long)(by[bi] >> 20));
+    by[bi] = 0;
+  }
+  free(by);
 }
