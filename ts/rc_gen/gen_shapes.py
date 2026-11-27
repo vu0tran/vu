@@ -42,7 +42,7 @@ class P:
             if s.peek()[1] == '{':
                 s.take(); fields = []
                 while s.peek()[1] != '}':
-                    if s.peek()[1] == '..': s.take(); s.expr()
+                    if s.peek()[1] == '..': s.take(); fields.append(('__base', s.expr()))
                     else:
                         n = s.take()[1]; s.take(':'); fields.append((n, s.expr()))
                     if s.peek()[1] == ',': s.take()
@@ -53,8 +53,32 @@ class P:
                     args.append(s.expr())
                     if s.peek()[1] == ',': s.take()
                 s.take(')'); return ('call', v, args)
+            if s.peek()[1] == '.' and s.t[s.i + 1][0] == 'id' and s.t[s.i + 2][1] == '[':
+                s.take('.'); f = s.take()[1]; s.take('['); n = int(s.take()[1]); s.take(']')
+                return ('index', v, f, n)
             return ('path', v)
         raise Exception("bad token %s" % (s.peek(),))
+
+# a const table named in another (`&ARRAY_MAP_ALIASING`), an element of one of its list fields
+# (`ARRAY_MAP_ALIASING.effects[1]`), and a struct built from one (`..ARRAY_MAP_ALIASING`)
+def resolve(e):
+    if e[0] == 'path' and e[1] not in ('PURE_PRIMITIVE_FN', 'SYMBOL_FN', 'FREEZE_ARGS_FN') and re.search(r'const ' + e[1] + r':', src): return resolve(table(e[1]))
+    if e[0] == 'index':
+        base = resolve(('path', e[1]))
+        return resolve(dict(base[2])[e[2]][1][e[3]])
+    if e[0] == 'struct':
+        fs = [(n, resolve(x)) for n, x in e[2]]
+        base = [x for n, x in fs if n == '__base' and x[0] == 'struct']
+        fs = [(n, x) for n, x in fs if n != '__base' or x[0] == 'struct']
+        if base:
+            own = dict((n, x) for n, x in fs if n != '__base')
+            merged = [(n, own.get(n, x)) for n, x in base[0][2]]
+            merged += [(n, x) for n, x in fs if n != '__base' and n not in dict(base[0][2])]
+            fs = merged
+        return ('struct', e[1], fs)
+    if e[0] == 'list': return ('list', [resolve(x) for x in e[1]])
+    if e[0] == 'call': return ('call', e[1], [resolve(x) for x in e[2]])
+    return e
 
 def snake(n): return re.sub(r'(?<!^)(?=[A-Z])', '_', n).upper()
 EF = {'Read': 'EF_READ', 'Freeze': 'EF_FREEZE', 'Capture': 'EF_CAPTURE', 'ConditionallyMutateIterator': 'EF_COND_MUTATE_ITER',
@@ -115,7 +139,7 @@ def emit(e):
 def table(name):
     m = re.search(r'const ' + name + r':[^=]*=\s*', src)
     p = P(tokens(src[m.end():]))
-    return p.expr()
+    return resolve(p.expr())
 
 out = [open(sys.argv[3]).read()]
 for cname in ['PURE_PRIMITIVE_FN', 'SYMBOL_FN', 'FREEZE_ARGS_FN']:

@@ -58,11 +58,13 @@ type Node:
   reason: Bool = false       # MutationReason::AssignCurrentProperty
   value: Int = NV_OBJECT
   fid: Int = -1
+  called: Bool = false       # (oxlint 1.94) a mutation that may call this value has reached it
 
 # (the nodes in a list, by identifier through idx)
 type AState:
   idx: {Int: Int} = {}
   nodes: [Node] = []
+  called_decls: {Int: {Int: Bool}} = {}   # function -> the declarations it calls directly
 
 # an identifier's node's index, -1 none
 fn slot(s: AState, id: Int) -> Int:
@@ -121,7 +123,7 @@ fn render(s: AState, index: Int, start: Int, var e: Env):
     let c = slot(s, cur)
     if c < 0: continue
     let n = s.nodes[c]
-    if n.transitive != 0 or n.local != 0: continue
+    if n.called: continue
     if n.value == NV_FUNCTION: append_function_errors(&e, n.fid)
     for i in 0..n.created_from.k.len:
       if n.created_from.v[i] < index: queue.push(n.created_from.k[i])
@@ -135,24 +137,56 @@ type QE:
   transitive: Bool
   backwards: Bool
   kind: Int
+  may_call: Bool = true
+
+# directly_called_declarations: the declarations a function calls (a callee through its load)
+fn directly_called_declarations(e: Env, fid: Int) -> {Int: Bool}:
+  var loaded: {Int: Int} = {}
+  for ins in e.functions[fid].instructions:
+    match ins.value:
+      rc_hir.LoadLocal(p, _): loaded[ins.lvalue.identifier] = p.identifier
+      rc_hir.LoadContext(p, _, _): loaded[ins.lvalue.identifier] = p.identifier
+      _: nop_imar()
+  var out: {Int: Bool} = {}
+  for ins in e.functions[fid].instructions:
+    match ins.value:
+      rc_hir.CallExpression(c, _, _): out[e.identifiers[loaded.get(c.identifier, c.identifier)].declaration_id] = true
+      _: nop_imar()
+  return out
+
+fn nop_imar():
+  return
+
+fn is_fn_type(e: Env, id: Int) -> Bool:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TFunction(_, _, _, _): return true
+    _: return false
+  return false
 
 # end < 0: a simulated mutation
 fn mutate(var s: AState, index: Int, start: Int, end: Int, transitive: Bool, start_kind: Int, sp: Sp, reason: Bool, var e: Env, record: Bool):
   var seen: {Int: Int} = {}
+  var seen_call: {Int: Bool} = {}
   var queue: [QE] = [QE(start, transitive, true, start_kind)]
   while queue.len > 0:
     let q = queue.pop()
     let cur = q.place
-    if cur in seen and seen[cur] >= q.kind: continue
-    seen[cur] = q.kind
+    if cur in seen and seen[cur] >= q.kind and (seen_call[cur] or not q.may_call): continue
+    if cur in seen:
+      if q.kind > seen[cur]: seen[cur] = q.kind
+      seen_call[cur] = seen_call[cur] or q.may_call
+    else:
+      seen[cur] = q.kind
+      seen_call[cur] = q.may_call
     let c = slot(s, cur)
     if c < 0: continue
     if not s.nodes[c].reason: s.nodes[c].reason = reason
     if index > s.nodes[c].last_mutated: s.nodes[c].last_mutated = index
     let nid = s.nodes[c].id
     if end >= 0 and end > e.identifiers[nid].mutable_range.end: e.identifiers[nid].mutable_range.end = end
-    if s.nodes[c].value == NV_FUNCTION and s.nodes[c].transitive == 0 and s.nodes[c].local == 0 and record:
+    if s.nodes[c].value == NV_FUNCTION and q.may_call and not s.nodes[c].called and record:
       append_function_errors(&e, s.nodes[c].fid)
+    if q.may_call: s.nodes[c].called = true
     if q.transitive:
       if s.nodes[c].transitive < q.kind:
         s.nodes[c].transitive = q.kind
@@ -161,22 +195,32 @@ fn mutate(var s: AState, index: Int, start: Int, end: Int, transitive: Bool, sta
       if s.nodes[c].local < q.kind:
         s.nodes[c].local = q.kind
         s.nodes[c].lsp = sp
+    let mc = q.may_call
+    var capfn = -1
+    if s.nodes[c].value == NV_FUNCTION: capfn = s.nodes[c].fid
+    if q.transitive and capfn >= 0 and not (capfn in s.called_decls): s.called_decls[capfn] = directly_called_declarations(e, capfn)
     let n = s.nodes[c]
     for ed in n.edges:
       if ed.index >= index: break
       var k = q.kind
       if ed.kind == EK_MAYBE_ALIAS: k = MK_CONDITIONAL
-      queue.push(QE(ed.node, q.transitive, false, k))
+      queue.push(QE(ed.node, q.transitive, false, k, mc))
     for i in 0..n.created_from.k.len:
-      if n.created_from.v[i] < index: queue.push(QE(n.created_from.k[i], true, true, q.kind))
+      if n.created_from.v[i] < index: queue.push(QE(n.created_from.k[i], true, true, q.kind, mc))
     if q.backwards or n.value != NV_PHI:
       for i in 0..n.aliases.k.len:
-        if n.aliases.v[i] < index: queue.push(QE(n.aliases.k[i], q.transitive, true, q.kind))
+        if n.aliases.v[i] < index: queue.push(QE(n.aliases.k[i], q.transitive, true, q.kind, mc))
       for i in 0..n.maybe_aliases.k.len:
-        if n.maybe_aliases.v[i] < index: queue.push(QE(n.maybe_aliases.k[i], q.transitive, true, MK_CONDITIONAL))
+        if n.maybe_aliases.v[i] < index: queue.push(QE(n.maybe_aliases.k[i], q.transitive, true, MK_CONDITIONAL, mc))
     if q.transitive:
       for i in 0..n.captures.k.len:
-        if n.captures.v[i] < index: queue.push(QE(n.captures.k[i], q.transitive, true, q.kind))
+        if n.captures.v[i] < index:
+          let cap = n.captures.k[i]
+          # (oxlint 1.94: capturing a callback doesn't call it, unless the capturing function does)
+          var cm = mc
+          if mc and is_fn_type(e, cap):
+            cm = capfn >= 0 and s.called_decls[capfn].get(e.identifiers[cap].declaration_id, false)
+          queue.push(QE(cap, q.transitive, true, q.kind, cm))
 
 type PendingPhi:
   from: Place
