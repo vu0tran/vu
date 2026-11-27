@@ -1399,6 +1399,45 @@ launcher and one optional dependency per platform with the binary: Linux x64/ARM
 package's README. Each `vlint-vX.Y.Z` tag also puts the bare binaries on the GitHub release
 (`vlint-X.Y.Z-<platform>.tar.gz`). Releasing: `RELEASING.md`.
 
+## Many runs at once: `vlint --batch`
+
+A monorepo that lints each package with its own `vlint` command can run them all as one:
+
+```sh
+vlint --batch plan.json
+```
+
+`plan.json` is a JSON array of runs, each `{"args": [...]}`: the arguments that would follow
+`vlint`, with optional `"out"`, `"err"` and `"exit"` files for that run's standard output, standard
+error and exit code. A run without them prints to the batch's own, in the plan's order, each run's
+output whole. The batch exits with the largest of the runs' exit codes. Each run's output and exit
+code are what it gives alone (`ts/batch_test.sh` checks this on a made-up monorepo, and the CI job
+below gave all 176 of its outputs identical). Every run is in the folder vlint runs in.
+
+What the runs share: the JS plugins' node processes (each plugin loaded once and warm, not started
+again for every run), the files read, and the packages' declaration files parsed once for every
+program that has them. The largest runs start first, and the runs going at once are capped by
+their size, which is what holds the memory down: `VLINT_BATCH_JOBS` runs at a time (default 2 for
+each 5 CPUs), holding at most `VLINT_BATCH_CAP` permille of the largest run's files (1200).
+`VLINT_BATCH_ORDER=plan` keeps the plan's order, `VLINT_BATCH_SHARE=0` keeps each run's files and
+programs to itself (its larger programs checked in processes of their own, as alone), and
+`VLINT_BATCH_TRACE=1` says when each run starts and ends.
+
+On a monorepo's CI lint job (88 packages, `--type-aware --threads=4`, cold, on 10 cores; one run
+each, with other work on the machine, so a second or two either way):
+
+| | wall | CPU | peak memory |
+|---|---|---|---|
+| 88 runs, 2 at a time (the job as it was) | 35-42 s | 255-275 s | 4.3-4.9 GB |
+| 88 runs, 4 at a time | 30-37 s | 265-280 s | 6.4-7.0 GB |
+| one `vlint --batch` | 29-35 s | 226-252 s | 5.8-7.6 GB |
+
+Most of what the batch gains is the machine kept busy, which running more at once gives too; on
+top of that it does less work: node 48 -> 39 cpu-s (88 starts of the plugins' host become 4
+processes), system time 41-43 -> 27-30 s, and the packages' declaration files (1,114 MB parsed by
+the job's 123 programs, 132 MB of them distinct) parsed once, 3.7% of the batch process's
+instructions.
+
 ## The cache
 
 `vlint --cache` works like `eslint --cache`: it keeps each file's output in `.vlintcache` in the

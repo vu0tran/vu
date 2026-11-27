@@ -2891,3 +2891,54 @@ the heavy ones (59, 52, 21, 16) would take 5-12 times the cpu and, even split ov
 more wall than one node process. Not tried: a faster interpreter build (only -O2), QuickJS's own
 tuning; neither is a factor of five.
 
+
+### vlint --batch (2026-11-26)
+
+`vlint --batch PLAN.json` (vlint.vu `batch`): the plan's runs as tasks in one process, each run's
+output kept apart (`Sink`, `run_main`: main's body is `run`, which writes through the sink and
+throws its usage and configuration errors, "E" + stderr or "O" + stdout; a run alone writes straight
+through, outputs byte for byte as before).
+
+- The JS plugins: one registry for the batch (ljs.reg_serve, a task owning a Js, asked over
+  RegReq): a load is sent once, its rules' host ids the batch's; options ids the batch's, by host
+  id; the setup sent again only when there are new options. The glue (ljs_glue.c, vl_batch) appends
+  those lines to the prelude (vl_node_pcall, under vl_pmu) and sends a running process the lines it
+  hasn't had before its next request (vl_catch_up, w->psent), their answers left unread;
+  vl_node_expect_add sums the runs' lint requests for the spawn heuristic. A plugin file loaded
+  under a name another file already has (two copies of eslint-plugin-react-hooks under one alias in
+  the CI job's monorepo: "Plugin name ... is already registered") goes in as NAME~k, the run
+  still calling it NAME. A run alone uses none of this (Js.bat false).
+- The order: each run's files counted first (bsize: the walk with its ignore patterns), largest
+  first; started by the dispatcher when one ends, at most VLINT_BATCH_JOBS at once and their files
+  under VLINT_BATCH_CAP permille of the largest's (pick_run). Each run's freed memory given back
+  when it ends (release_memory): a 6,194-file run repeated left 10-15 MB more resident each time
+  without, with 68 MB still allocated at exit and 136 KB leaked (macOS `leaks`): malloc's keeping.
+- The type-aware parts: one file memo for the batch (Sink.fm, plan_lint's fm0) and every program
+  checked in the batch's process (VLINT_VTSC_INPROC=1, set by the batch): a worker process would
+  have its own memo. A package's file parsed once (tsprog.pkg_tree under pkg_key, as file 1;
+  ast.append_file_as moves its nodes' file, its statement list's f and the tables kept by file to
+  the program's index, as graft does; VTSC_PKG_TREES=1, which the batch sets). VTSC_PPARSE=check
+  on the whole job: 123 of 123 programs' trees identical to one parse (the first try missed the
+  statement list's f: 118 programs differed there, the job's outputs still identical).
+
+Measured on the CI job (cold, 10 cores, with other sessions' work on the machine: walls a second or
+two either way, so CPU and instructions are the numbers to compare):
+- separate runs 4 at a time against the batch without sharing the type-aware memo: 32.8-37.2 /
+  31.3-36.1 s, 271-279 / 238-260 cpu-s; the batch's peak 7.9-9.4 GB then (four large type-aware
+  workers at once; one node process grew to 1.36 GB over the batch, not its old space: capped at
+  384 MB it still reached 1.05 GB);
+- node: 48 cpu-s for the job's 88 processes (0.1-0.14 each to start, the rest the rules) against 39
+  for the batch's 4;
+- the order: in the plan's order the 4-second run 86 started 27 s in and ended the batch; largest
+  first with no cap all four large workers ran at once (8.5 GB);
+- the cap: 1200 6.9 GB at 34.3 s, 2000 7.9 GB at 31.4 s (one run each);
+- the shared memo with every program in the batch's process: 226-241 cpu-s against 244-250 with each
+  run's own, system time 27-30 against 41-43 s, the peak 5.8-6.0 GB against 6.2-6.7;
+- the package trees: the batch process's instructions 1,226 / 1,226 G without, 1,185 / 1,177 G with
+  (-3.7%); walls not distinguishable at a load of 18;
+- machine-wide CPU each second of a batch: 90-100% busy from 2 s to the last 3 s: the job is CPU
+  bound, 23-25 s of work for 10 cores, not idle cores.
+
+Not done: a run's own cwd (every run is in the batch's); a run's process.argv for its plugins (the
+batch's); the type-aware check of a run's larger programs in a process of their own, for its
+memory, which the shared memo can't reach (VLINT_BATCH_SHARE=0 does that, without the sharing).
