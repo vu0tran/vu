@@ -1,0 +1,283 @@
+# ValidatePreservedManualMemoization (oxc_react_compiler 1.94.0, react_compiler_validation/
+# validate_preserved_manual_memoization.rs): each useMemo/useCallback's dependencies must be the
+# ones the compiler infers for the scope it builds, the dependencies' scopes must be complete
+# before it, and its value must still be memoized. Function names follow the Rust source.
+
+import rc_hir
+import rc_env
+import rc_ops
+import rc_rf
+import rc_psd
+from rc_hir import Sp, Place, ManualMemoDep, DepPathEntry, PropLit
+from rc_env import Env, SDep
+from rc_rf import RF
+
+fn nop():
+  return
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var r = xs[0..xs.len]
+  return r
+
+fn cp_mdep(d: ManualMemoDep) -> ManualMemoDep:
+  return ManualMemoDep(d.global, d.name + "", d.value, d.constant, rc_psd.cp_path(d.path), d.sp)
+
+type MMS:
+  on: Bool = false
+  reassign: {Int: [Int]} = {}
+  sp: Sp = Sp(-1, -1)
+  callee_sp: Sp = Sp(-1, -1)
+  deps_sp: Sp = Sp(-1, -1)
+  decls: {Int: Bool} = {}
+  has_deps: Bool = false
+  deps: [ManualMemoDep] = []
+  id: Int = 0
+
+type VS:
+  mm: MMS = MMS()
+  scopes: {Int: Bool} = {}
+  pruned: {Int: Bool} = {}
+  temps: {Int: ManualMemoDep} = {}
+
+fn is_named(e: Env, id: Int) -> Bool:
+  return e.identifiers[id].name_kind == 1
+
+fn validate_preserved_manual_memoization(rf: RF, var e: Env):
+  var st = VS()
+  v_block(rf, rf.body, &st, &e)
+
+fn v_block(rf: RF, b: Int, var st: VS, var e: Env):
+  for s in rf.blocks[b]:
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_INSTR: v_instr(rf, rf.stmts[s].x, &st, &e)
+    elif k == rc_rf.ST_SCOPE: v_scope(rf, s, &st, &e)
+    elif k == rc_rf.ST_PRUNED:
+      v_block(rf, rf.stmts[s].block, &st, &e)
+      st.pruned[rf.stmts[s].x] = true
+    else:
+      let t = rf.terms[rf.stmts[s].x]
+      let tk = t.kind
+      if tk == rc_rf.RT_IF:
+        v_block(rf, t.b1, &st, &e)
+        if t.b2 >= 0: v_block(rf, t.b2, &st, &e)
+      elif tk == rc_rf.RT_SWITCH:
+        for c in t.cases:
+          if c.block >= 0: v_block(rf, c.block, &st, &e)
+      elif tk == rc_rf.RT_FOR or tk == rc_rf.RT_FOROF or tk == rc_rf.RT_FORIN or tk == rc_rf.RT_WHILE or tk == rc_rf.RT_DOWHILE or tk == rc_rf.RT_LABEL: v_block(rf, t.b1, &st, &e)
+      elif tk == rc_rf.RT_TRY:
+        v_block(rf, t.b1, &st, &e)
+        v_block(rf, t.b2, &st, &e)
+
+fn v_scope(rf: RF, s: Int, var st: VS, var e: Env):
+  let sid = rf.stmts[s].x
+  v_block(rf, rf.stmts[s].block, &st, &e)
+  if st.mm.on and st.mm.has_deps:
+    let deps = rc_psd.cp_dep_list(e.scopes[sid].dependencies)
+    for d in deps: validate_inferred_dep(d, st, &e)
+  st.scopes[sid] = true
+  for m in copy_ints(e.scopes[sid].merged): st.scopes[m] = true
+
+fn named_local(p: Place, sp: Sp) -> ManualMemoDep:
+  return ManualMemoDep(false, "", p, false, [], sp)
+
+fn record_temporaries(rf: RF, ri: Int, var st: VS, var e: Env):
+  let has = rf.instrs[ri].has_lvalue
+  let lv = rf.instrs[ri].lvalue
+  if has and lv.identifier in st.temps: return
+  if has and is_named(e, lv.identifier) and st.mm.on: st.mm.decls[e.identifiers[lv.identifier].declaration_id] = true
+  record_deps_in_value(rf, rf.instrs[ri].value, &st, &e)
+  if has: st.temps[lv.identifier] = named_local(lv, lv.sp)
+
+fn record_deps_in_value(rf: RF, x: Int, var st: VS, var e: Env):
+  let k = rf.vals[x].kind
+  if k == rc_rf.RV_SEQ:
+    for ri in rf.vals[x].instrs: v_instr(rf, ri, &st, &e)
+    record_deps_in_value(rf, rf.vals[x].a, &st, &e)
+  elif k == rc_rf.RV_OPT: record_deps_in_value(rf, rf.vals[x].a, &st, &e)
+  elif k == rc_rf.RV_COND:
+    record_deps_in_value(rf, rf.vals[x].a, &st, &e)
+    record_deps_in_value(rf, rf.vals[x].b, &st, &e)
+    record_deps_in_value(rf, rf.vals[x].c, &st, &e)
+  elif k == rc_rf.RV_LOGICAL:
+    record_deps_in_value(rf, rf.vals[x].a, &st, &e)
+    record_deps_in_value(rf, rf.vals[x].b, &st, &e)
+  else:
+    if not st.mm.on: return
+    var places: [Place] = []
+    match rf.vals[x].instr:
+      rc_hir.StoreLocal(lv, _, _): places.push(lv.place)
+      rc_hir.StoreContext(lv, _, _): places.push(lv.place)
+      rc_hir.Destructure(pat, _, _, _): places = rc_ops.pattern_operands(pat)
+      _: nop()
+    for p in places:
+      st.mm.decls[e.identifiers[p.identifier].declaration_id] = true
+      if is_named(e, p.identifier): st.temps[p.identifier] = named_local(p, p.sp)
+
+fn v_instr(rf: RF, ri: Int, var st: VS, var e: Env):
+  record_temporaries(rf, ri, &st, &e)
+  let x = rf.instrs[ri].value
+  if rf.vals[x].kind != rc_rf.RV_INSTR: return
+  let isp = rf.instrs[ri].sp
+  match rf.vals[x].instr:
+    rc_hir.StartMemoize(mid, has_deps, deps, deps_sp, invalid, callee_sp, _):
+      if st.mm.on: return
+      if invalid: return
+      var m = MMS(on: true, sp: isp, callee_sp: callee_sp, deps_sp: deps_sp, has_deps: has_deps, id: mid)
+      for d in deps: m.deps.push(cp_mdep(d))
+      st.mm = m
+      for d in deps:
+        if d.global: continue
+        let s = e.identifiers[d.value.identifier].scope
+        if s >= 0 and not st.scopes.get(s, false) and not st.pruned.get(s, false): rc_env.record_diagnostic(&e, preserve_memo_mutated_dependency(d.value.sp))
+    rc_hir.FinishMemoize(mid, decl, pruned, _):
+      if not st.mm.on: return
+      if st.mm.id != mid:
+        st.mm = MMS()
+        return
+      var m = MMS()
+      swap(&m, &st.mm)
+      var us = m.callee_sp
+      if us.s < 0: us = m.deps_sp
+      if us.s < 0: us = m.sp
+      if us.s < 0: us = decl.sp
+      var cs = Sp(-1, -1)
+      if m.sp.s >= 0 and m.sp.s < m.sp.e: cs = Sp(m.sp.s, m.sp.s + 1)
+      if not pruned:
+        let ds = e.identifiers[decl.identifier].scope
+        if ds < 0:
+          let dd = e.identifiers[decl.identifier].declaration_id
+          var check = [decl.identifier]
+          if dd in m.reassign: check = copy_ints(m.reassign[dd])
+          for id in check:
+            if is_unmemoized(id, st.scopes, e): rc_env.record_diagnostic(&e, preserve_memo_unmemoized(us, cs))
+        elif is_unmemoized(decl.identifier, st.scopes, e): rc_env.record_diagnostic(&e, preserve_memo_unmemoized(us, cs))
+    rc_hir.StoreLocal(lv, v, _):
+      if st.mm.on and lv.kind == rc_hir.IK_REASSIGN: add_reassign(&st.mm, e.identifiers[lv.place.identifier].declaration_id, v.identifier)
+    rc_hir.LoadLocal(p, _):
+      if st.mm.on and rf.instrs[ri].has_lvalue:
+        let l = rf.instrs[ri].lvalue.identifier
+        if e.identifiers[p.identifier].scope >= 0 and e.identifiers[l].scope < 0: add_reassign(&st.mm, e.identifiers[l].declaration_id, p.identifier)
+    _: nop()
+
+fn add_reassign(var m: MMS, d: Int, id: Int):
+  if not (d in m.reassign): m.reassign[d] = []
+  for x in m.reassign[d]:
+    if x == id: return
+  m.reassign[d].push(id)
+
+fn is_unmemoized(id: Int, done: {Int: Bool}, e: Env) -> Bool:
+  let s = e.identifiers[id].scope
+  if s < 0: return false
+  return not done.get(s, false)
+
+# ---- comparing dependencies (compare_deps / validate_inferred_dep)
+
+const CD_OK = 0
+const CD_ROOT = 1
+const CD_PATH = 2
+const CD_SUBPATH = 3
+const CD_REF = 4
+
+fn has_current(path: [DepPathEntry]) -> Bool:
+  for x in path:
+    if rc_psd.plit_is(x.property, "current"): return true
+  return false
+
+fn compare_deps(inf: ManualMemoDep, src: ManualMemoDep) -> Int:
+  var roots = false
+  if inf.global and src.global: roots = inf.name == src.name
+  elif not inf.global and not src.global: roots = inf.value.identifier == src.value.identifier
+  if not roots: return CD_ROOT
+  var n = inf.path.len
+  if src.path.len < n: n = src.path.len
+  var sub = true
+  for i in 0..n:
+    if not rc_psd.plit_eq(inf.path[i].property, src.path[i].property):
+      sub = false
+      break
+    elif inf.path[i].optional != src.path[i].optional: return CD_PATH
+  if sub and (src.path.len == inf.path.len or (inf.path.len >= src.path.len and not has_current(inf.path))): return CD_OK
+  if sub:
+    if has_current(src.path) or has_current(inf.path): return CD_REF
+    return CD_SUBPATH
+  return CD_PATH
+
+fn plit_text(p: PropLit) -> Str:
+  return p.s + ""
+
+fn ident_name(e: Env, id: Int) -> Str:
+  if e.identifiers[id].name_kind == 0: return "[unnamed]"
+  return e.identifiers[id].name + ""
+
+fn print_path(path: [DepPathEntry], with_optional: Bool) -> Str:
+  var out = ""
+  for x in path:
+    if with_optional and x.optional: out += "?."
+    else: out += "."
+    out += plit_text(x.property)
+  return out
+
+fn print_manual_memo_dependency(d: ManualMemoDep, e: Env) -> Str:
+  var root = d.name + ""
+  if not d.global: root = ident_name(e, d.value.identifier)
+  return root + print_path(d.path, true)
+
+fn result_desc(r: Int) -> Str:
+  if r == CD_OK: return "Dependencies equal"
+  if r == CD_ROOT or r == CD_PATH: return "Inferred different dependency than source"
+  if r == CD_REF: return "Differences in ref.current access"
+  return "Inferred less specific property than source"
+
+fn validate_inferred_dep(d: SDep, st: VS, var e: Env):
+  var nd = ManualMemoDep(false, "", Place(-1, 0, false, Sp(-1, -1)), false, [], Sp(-1, -1))
+  if d.identifier in st.temps:
+    let t = st.temps[d.identifier]
+    var path = rc_psd.cp_path(t.path)
+    for x in d.path: path.push(rc_psd.cp_entry(x))
+    nd = ManualMemoDep(t.global, t.name + "", t.value, t.constant, path, t.sp)
+  else:
+    if not is_named(e, d.identifier): return
+    let isp = e.identifiers[d.identifier].sp
+    nd = ManualMemoDep(false, "", Place(d.identifier, rc_hir.EF_READ, false, isp), false, rc_psd.cp_path(d.path), isp)
+  if not nd.global and st.mm.decls.get(e.identifiers[nd.value.identifier].declaration_id, false): return
+  var err = -1
+  for src in st.mm.deps:
+    let r = compare_deps(nd, src)
+    if r == CD_OK: return
+    if r > err: err = r
+  var extra = ""
+  if is_named(e, d.identifier):
+    let dep_str = ident_name(e, d.identifier) + print_path(d.path, true)
+    var srcs: [Str] = []
+    for src in st.mm.deps: srcs.push(print_manual_memo_dependency(src, e))
+    var desc = "Inferred dependency not present in source"
+    if err >= 0: desc = result_desc(err)
+    extra = "The inferred dependency was `{dep_str}`, but the source dependencies were [{", ".join(srcs)}]. {desc}"
+  let description = ("React Compiler has skipped optimizing this component because the existing manual memoization could not be preserved. The inferred dependencies did not match the manually specified dependencies, which could cause the value to change more or less frequently than expected. " + extra).strip()
+  var isp = d.sp
+  if isp.s < 0: isp = nd.sp
+  rc_env.record_diagnostic(&e, preserve_memo_inferred_dependencies(description, st.mm.deps_sp, isp, st.mm.sp))
+
+# ---- the diagnostics (diagnostics.rs)
+
+fn pmm_diag() -> rc_env.Diag:
+  return rc_env.diag(rc_env.EC_PRESERVE_MANUAL_MEMO, "Existing memoization could not be preserved")
+
+fn preserve_memo_mutated_dependency(sp: Sp) -> rc_env.Diag:
+  return rc_env.with_label(rc_env.with_help(pmm_diag(), "React Compiler has skipped optimizing this component because the existing manual memoization could not be preserved. This dependency may be mutated later, which could cause the value to change unexpectedly"), sp, "This dependency may be modified later")
+
+fn preserve_memo_unmemoized(sp: Sp, cs: Sp) -> rc_env.Diag:
+  var d = rc_env.with_label(rc_env.with_help(pmm_diag(), "React Compiler could not prove that this useMemo/useCallback remains memoized. Fix related React Compiler errors inside the callback first. If manual memoization is not required for semantics, remove it; otherwise restructure the callback to avoid values that invalidate memoization"), sp, "Manual memoization is not preserved here")
+  if cs.s >= 0 and (sp.s < 0 or cs.e <= sp.s or cs.s >= sp.e): d = rc_env.and_label(d, cs, "Manual memoization callback starts here")
+  return d
+
+fn preserve_memo_inferred_dependencies(description: Str, list_sp: Sp, inferred_sp: Sp, fallback_sp: Sp) -> rc_env.Diag:
+  var d = rc_env.with_help(pmm_diag(), description)
+  var primary = list_sp
+  if primary.s < 0: primary = inferred_sp
+  if primary.s < 0: primary = fallback_sp
+  var text = "Could not preserve existing manual memoization"
+  if list_sp.s >= 0: text = "This dependency list does not match the dependencies inferred from the callback"
+  d = rc_env.with_label(d, primary, text)
+  if inferred_sp.s >= 0 and not (inferred_sp.s == primary.s and inferred_sp.e == primary.e): d = rc_env.and_label(d, inferred_sp, "This dependency is inferred here")
+  return d

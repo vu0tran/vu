@@ -1,0 +1,1031 @@
+# The React Compiler's reactive scope passes on the HIR (oxc_react_compiler 1.94.0,
+# react_compiler_inference/ and react_compiler_optimization/): after infer_reactive_scope_variables
+# gives each group of co-mutated identifiers a scope, these align the scopes to the program's
+# blocks, merge the ones that overlap, and turn each into a Scope terminal (scope blocks in the
+# CFG), ready for propagate_scope_dependencies_hir (rc_psd.vu) and build_reactive_function
+# (rc_rf.vu). Pass and helper names follow the Rust source. A scope's range and the identifiers that
+# share it are tied by the range's id (MutableRange.id), as the TS compiler shares the object.
+
+import rc_hir
+import rc_env
+import rc_diags
+import rc_ops
+import rc_visit
+import rc_cfg
+import rc_build
+import rc_rsv
+import rc_shapes
+import rc_gdefs
+from rc_hir import Sp, Place, HirFunction, InstrValue, Terminal, BasicBlock, MutableRange, Phi
+from rc_env import Env
+
+fn nop():
+  return
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var r = xs[0..xs.len]
+  return r
+
+fn imin(a: Int, b: Int) -> Int:
+  if a < b: return a
+  return b
+
+fn imax(a: Int, b: Int) -> Int:
+  if a > b: return a
+  return b
+
+# the evaluation order of a block's first instruction, else of its terminal
+fn block_first_id(f: HirFunction, bid: Int) -> Int:
+  if f.body.blocks[bid].instructions.len > 0: return f.instructions[f.body.blocks[bid].instructions[0]].id
+  return rc_visit.term_id(f.body.blocks[bid].terminal)
+
+fn inst_lvalue_ids(f: HirFunction, iid: Int) -> [Int]:
+  var out: [Int] = []
+  for p in rc_ops.instr_lvalues(f.instructions[iid]): out.push(p.identifier)
+  return out
+
+fn inst_operand_ids(f: HirFunction, e: Env, iid: Int) -> [Int]:
+  var out: [Int] = []
+  for p in rc_ops.value_operands(f.instructions[iid].value, e): out.push(p.identifier)
+  return out
+
+fn term_operand_ids(t: Terminal) -> [Int]:
+  var out: [Int] = []
+  for p in rc_ops.term_operands(t): out.push(p.identifier)
+  return out
+
+fn fn_shape_of(e: Env, id: Int) -> Str:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TFunction(sh, has, _, _):
+      if has: return sh
+    _: return ""
+  return ""
+
+fn obj_shape_of(e: Env, id: Int) -> Str:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TObject(sh, has):
+      if has: return sh
+    _: return ""
+  return ""
+
+fn is_prim_id(e: Env, id: Int) -> Bool:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TPrimitive: return true
+    _: return false
+  return false
+
+fn hook_kind_of_id(e: Env, id: Int) -> Int:
+  return rc_shapes.hook_kind_of(e.reg, e.types[e.identifiers[id].type_])
+
+fn has_no_alias_signature(e: Env, id: Int) -> Bool:
+  let s = rc_shapes.function_signature(e.reg, e.types[e.identifiers[id].type_])
+  return s.len > 0 and s[0].no_alias
+
+# identifiers whose range is the range `rid` take the range [start, end)
+fn retarget_ranges(var e: Env, sid: Int, rid: Int):
+  let st = e.scopes[sid].range.start
+  let en = e.scopes[sid].range.end
+  for i in 0..e.identifiers.len:
+    if e.identifiers[i].scope == sid and e.identifiers[i].mutable_range.id == rid:
+      e.identifiers[i].mutable_range.start = st
+      e.identifiers[i].mutable_range.end = en
+
+# ---- memoize_fbt_and_macro_operands_in_same_scope (fbt/fbs tags and calls; no custom macros in
+# lint mode). A macro definition: level 0 transitive, 1 shallow; its properties by name ("*" any).
+
+type Macro:
+  level: Int
+  props: {Str: Int} = {}    # property -> index of its definition in the table
+
+type Macros:
+  defs: [Macro] = []
+  kinds: {Str: Int} = {}
+
+fn fbt_macros() -> Macros:
+  var m = Macros()
+  m.defs.push(Macro(0))                           # 0 transitive
+  m.defs.push(Macro(1))                           # 1 shallow
+  var en = Macro(0)                               # 2 fbt's enum
+  en.props["*"] = 1
+  en.props["enum"] = 0
+  m.defs.push(en)
+  var fbt = Macro(0)                              # 3 fbt
+  fbt.props["*"] = 1
+  fbt.props["enum"] = 2
+  m.defs.push(fbt)
+  for n in ["fbt", "fbt:enum", "fbs", "fbs:enum"]: m.kinds[n] = 3
+  for n in ["fbt:param", "fbt:plural", "fbs:param", "fbs:plural"]: m.kinds[n] = 1
+  return m
+
+fn memoize_fbt_and_macro_operands_in_same_scope(f: HirFunction, var e: Env) -> {Int: Bool}:
+  let m = fbt_macros()
+  var tags: {Int: Int} = {}
+  for bid in copy_ints(f.body.order):
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      match f.instructions[iid].value:
+        rc_hir.Primitive(v, _):
+          if v.kind == 4 and v.s in m.kinds: tags[lid] = m.kinds[v.s]
+        rc_hir.LoadGlobal(b, _):
+          if b.name in m.kinds: tags[lid] = m.kinds[b.name]
+        rc_hir.PropertyLoad(o, prop, _, _, _):
+          if not prop.is_num and o.identifier in tags:
+            let d = tags[o.identifier]
+            var pd = d
+            if m.defs[d].props.len > 0:
+              if prop.s in m.defs[d].props: pd = m.defs[d].props[prop.s]
+              elif "*" in m.defs[d].props: pd = m.defs[d].props["*"]
+            tags[lid] = pd
+        _: nop()
+  var values: {Int: Bool} = {}
+  for k in tags: values[k] = true
+  if tags.len == 0: return values
+  var bi = f.body.order.len - 1
+  while bi >= 0:
+    let bid = f.body.order[bi]
+    bi -= 1
+    var ii = f.body.blocks[bid].instructions.len - 1
+    while ii >= 0:
+      let iid = f.body.blocks[bid].instructions[ii]
+      ii -= 1
+      let lid = f.instructions[iid].lvalue.identifier
+      var skip = false
+      var def = -1
+      match f.instructions[iid].value:
+        rc_hir.DeclareContext(_, _): skip = true
+        rc_hir.DeclareLocal(_, _): skip = true
+        rc_hir.Destructure(_, _, _, _): skip = true
+        rc_hir.LoadContext(_, _, _): skip = true
+        rc_hir.LoadLocal(_, _): skip = true
+        rc_hir.PostfixUpdate(_, _, _, _): skip = true
+        rc_hir.PrefixUpdate(_, _, _, _): skip = true
+        rc_hir.StoreContext(_, _, _): skip = true
+        rc_hir.StoreLocal(_, _, _): skip = true
+        rc_hir.CallExpression(c, _, _): def = tags.get(c.identifier, tags.get(lid, -1))
+        rc_hir.MethodCall(_, p, _, _): def = tags.get(p.identifier, tags.get(lid, -1))
+        rc_hir.JsxExpression(builtin, tag_name, tag, _, _, _, _, _, _, _, _):
+          if builtin: def = m.kinds.get(tag_name, -1)
+          else: def = tags.get(tag.identifier, -1)
+          if def < 0: def = tags.get(lid, -1)
+        _: def = tags.get(lid, -1)
+      if skip: continue
+      let sid = e.identifiers[lid].scope
+      if sid < 0 or def < 0: continue
+      values[lid] = true
+      for op in rc_ops.value_operands(f.instructions[iid].value, e):
+        if m.defs[def].level == 0:
+          e.identifiers[op.identifier].scope = sid
+          expand_fbt_scope_range(&e, sid, op.identifier)
+          tags[op.identifier] = def
+        values[op.identifier] = true
+    for ph in f.body.blocks[bid].phis:
+      let pid = ph.place.identifier
+      let sid = e.identifiers[pid].scope
+      if sid < 0: continue
+      if not (pid in tags): continue
+      let def = tags[pid]
+      if m.defs[def].level == 1: continue
+      values[pid] = true
+      for op in ph.ops:
+        e.identifiers[op.identifier].scope = sid
+        expand_fbt_scope_range(&e, sid, op.identifier)
+        tags[op.identifier] = def
+        values[op.identifier] = true
+  return values
+
+fn expand_fbt_scope_range(var e: Env, sid: Int, op: Int):
+  let st = e.identifiers[op].mutable_range.start
+  if st == 0: return
+  let rid = e.scopes[sid].range.id
+  let old = e.scopes[sid].range.start
+  let ns = imin(old, st)
+  if ns == old: return
+  e.scopes[sid].range.start = ns
+  let nr = e.scopes[sid].range
+  for i in 0..e.identifiers.len:
+    if e.identifiers[i].scope == sid and e.identifiers[i].mutable_range.id == rid: e.identifiers[i].mutable_range = nr
+
+# ---- outline_functions (enableFunctionOutlining is on by default): a function expression that
+# captures nothing, has no own name and no reference to a binding outside the compiled function
+# (unless the compiled function is a declaration) becomes a LoadGlobal of a generated name. The
+# name is never one a local can have: no diagnostic prints it, and rename_variables only needs it
+# to differ from every local.
+
+fn outline_functions(var f: HirFunction, var e: Env, fbt: {Int: Bool}):
+  var acts: [Int] = []      # function id, and the instruction to outline (-1: recurse only)
+  var at: [Int] = []
+  for bid in copy_ints(f.body.order):
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      match f.instructions[iid].value:
+        rc_hir.FunctionExpression(_, _, _, fid, _, _):
+          if e.functions[fid].context.len == 0 and (not e.outer_ref.get(fid, false) or e.allow_outer_outlining) and not e.functions[fid].has_id and not fbt.get(lid, false):
+            acts.push(fid)
+            at.push(iid)
+          else:
+            acts.push(fid)
+            at.push(-1)
+        rc_hir.ObjectMethod(_, fid):
+          acts.push(fid)
+          at.push(-1)
+        _: nop()
+  for k in 0..acts.len:
+    let fid = acts[k]
+    var inner = rc_cfg.placeholder_function()
+    swap(&inner, &e.functions[fid])
+    outline_functions(&inner, &e, fbt)
+    swap(&inner, &e.functions[fid])
+    if at[k] >= 0:
+      e.outlined += 1
+      let name = "\0outlined{e.outlined}"
+      e.functions[fid].id = name + ""
+      e.functions[fid].has_id = true
+      let sp = rc_ops.value_sp(f.instructions[at[k]].value)
+      f.instructions[at[k]].value = rc_hir.LoadGlobal(rc_hir.NonLocal(rc_hir.NL_GLOBAL, name, "", ""), sp)
+
+# ---- align_method_call_scopes
+
+fn align_method_call_scopes(var f: HirFunction, var e: Env):
+  var mapping: {Int: Int} = {}      # property identifier -> its new scope (-1 none)
+  var merged = rc_rsv.DSet()
+  for bid in copy_ints(f.body.order):
+    for iid in f.body.blocks[bid].instructions:
+      match f.instructions[iid].value:
+        rc_hir.MethodCall(_, p, _, _):
+          let ls = e.identifiers[f.instructions[iid].lvalue.identifier].scope
+          let ps = e.identifiers[p.identifier].scope
+          if ls >= 0 and ps >= 0: rc_rsv.ds_union(&merged, [ls, ps])
+          elif ls >= 0: mapping[p.identifier] = ls
+          elif ps >= 0: mapping[p.identifier] = -1
+        rc_hir.FunctionExpression(_, _, _, fid, _, _): recurse_amcs(fid, &e)
+        rc_hir.ObjectMethod(_, fid): recurse_amcs(fid, &e)
+        _: nop()
+  apply_scope_merges(&merged, &e)
+  for bid in copy_ints(f.body.order):
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      if lid in mapping: e.identifiers[lid].scope = mapping[lid]
+      elif e.identifiers[lid].scope >= 0:
+        let cs = e.identifiers[lid].scope
+        if cs in merged.parent: e.identifiers[lid].scope = rc_rsv.ds_find(&merged, cs)
+
+fn recurse_amcs(fid: Int, var e: Env):
+  var inner = rc_cfg.placeholder_function()
+  swap(&inner, &e.functions[fid])
+  align_method_call_scopes(&inner, &e)
+  swap(&inner, &e.functions[fid])
+
+# a disjoint set of scopes: each root's range spans its members', and the identifiers sharing the
+# root's range follow it
+fn apply_scope_merges(var merged: rc_rsv.DSet, var e: Env):
+  var roots: [Int] = []
+  var ns: {Int: Int} = {}
+  var ne: {Int: Int} = {}
+  let keys = copy_ints(merged.keys)
+  for s in keys:
+    let r = rc_rsv.ds_find(&merged, s)
+    if s == r: continue
+    if not (r in ns):
+      roots.push(r)
+      ns[r] = e.scopes[r].range.start
+      ne[r] = e.scopes[r].range.end
+    ns[r] = imin(ns[r], e.scopes[s].range.start)
+    ne[r] = imax(ne[r], e.scopes[s].range.end)
+  var rids: {Int: Int} = {}
+  for r in roots: rids[r] = e.scopes[r].range.id
+  for r in roots:
+    e.scopes[r].range.start = ns[r]
+    e.scopes[r].range.end = ne[r]
+  for i in 0..e.identifiers.len:
+    let s = e.identifiers[i].scope
+    if s >= 0 and s in rids and e.identifiers[i].mutable_range.id == rids[s]:
+      e.identifiers[i].mutable_range.start = e.scopes[s].range.start
+      e.identifiers[i].mutable_range.end = e.scopes[s].range.end
+
+# ---- align_object_method_scopes
+
+fn align_object_method_scopes(var f: HirFunction, var e: Env):
+  for bid in copy_ints(f.body.order):
+    for iid in f.body.blocks[bid].instructions:
+      let fid = rc_ops.value_func(f.instructions[iid].value)
+      if fid >= 0:
+        var inner = rc_cfg.placeholder_function()
+        swap(&inner, &e.functions[fid])
+        align_object_method_scopes(&inner, &e)
+        swap(&inner, &e.functions[fid])
+  var decls: {Int: Bool} = {}
+  var merged = rc_rsv.DSet()
+  for bid in copy_ints(f.body.order):
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      match f.instructions[iid].value:
+        rc_hir.ObjectMethod(_, _): decls[lid] = true
+        rc_hir.ObjectExpression(props, _):
+          for p in props:
+            if decls.get(p.place.identifier, false):
+              let os = e.identifiers[p.place.identifier].scope
+              let ls = e.identifiers[lid].scope
+              if os >= 0 and ls >= 0: rc_rsv.ds_union(&merged, [os, ls])
+        _: nop()
+  apply_scope_merges(&merged, &e)
+  var remap: {Int: Int} = {}
+  let keys = copy_ints(merged.keys)
+  for s in keys:
+    let r = rc_rsv.ds_find(&merged, s)
+    if s != r: remap[s] = r
+  for bid in copy_ints(f.body.order):
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      let cs = e.identifiers[lid].scope
+      if cs >= 0 and cs in remap: e.identifiers[lid].scope = remap[cs]
+
+# ---- prune_unused_labels_hir
+
+fn prune_unused_labels_hir(var f: HirFunction):
+  var ml: [Int] = []
+  var mn: [Int] = []
+  var mf: [Int] = []
+  for bid in copy_ints(f.body.order):
+    match f.body.blocks[bid].terminal:
+      rc_hir.Label(next, _, ft, _, _):
+        match f.body.blocks[next].terminal:
+          rc_hir.Goto(target, variant, _, _):
+            if variant == rc_hir.GV_BREAK and target == ft and f.body.blocks[next].kind == rc_hir.BK_BLOCK and f.body.blocks[ft].kind == rc_hir.BK_BLOCK:
+              ml.push(bid)
+              mn.push(next)
+              mf.push(ft)
+          _: nop()
+      _: nop()
+  var rewrites: {Int: Int} = {}
+  for k in 0..ml.len:
+    let label = rewrites.get(ml[k], ml[k])
+    let next = mn[k]
+    let ft = mf[k]
+    var nb = rc_cfg.empty_block()
+    swap(&nb, &f.body.blocks[next])
+    var fb = rc_cfg.empty_block()
+    swap(&fb, &f.body.blocks[ft])
+    rc_cfg.remove_from_order(&f.body, next)
+    rc_cfg.remove_from_order(&f.body, ft)
+    for x in nb.instructions: f.body.blocks[label].instructions.push(x)
+    for x in fb.instructions: f.body.blocks[label].instructions.push(x)
+    swap(&f.body.blocks[label].terminal, &fb.terminal)
+    rewrites[ft] = label
+  if rewrites.len == 0: return
+  let order = copy_ints(f.body.order)
+  for bid in order:
+    var np: [Int] = []
+    var changed = false
+    for p in f.body.blocks[bid].preds:
+      if p in rewrites: changed = true
+    if not changed: continue
+    # (shift_remove the old, insert the new at the end when absent)
+    var keep: [Int] = []
+    var add: [Int] = []
+    for p in f.body.blocks[bid].preds:
+      if p in rewrites: add.push(rewrites[p])
+      else: keep.push(p)
+    for p in keep: np.push(p)
+    for p in add:
+      var dup = false
+      for q in np:
+        if q == p: dup = true
+      if not dup: np.push(p)
+    f.body.blocks[bid].preds = np
+
+# ---- align_reactive_scopes_to_block_scopes_hir
+
+fn record_place_id(id: Int, iden: Int, has_node: Bool, node: MutableRange, var e: Env, var active: {Int: Bool}, var seen: {Int: Bool}):
+  let sid = e.identifiers[iden].scope
+  if sid < 0: return
+  if not (id >= e.scopes[sid].range.start and id < e.scopes[sid].range.end): return
+  active[sid] = true
+  if sid in seen: return
+  seen[sid] = true
+  if has_node:
+    e.scopes[sid].range.start = imin(node.start, e.scopes[sid].range.start)
+    e.scopes[sid].range.end = imax(node.end, e.scopes[sid].range.end)
+
+fn align_reactive_scopes_to_block_scopes_hir(var f: HirFunction, var e: Env):
+  var orig: [MutableRange] = []
+  for s in e.scopes: orig.push(s.range)
+  var aft: [Int] = []                 # active block fallthrough ranges: fallthrough, range
+  var afr: [MutableRange] = []
+  var active: {Int: Bool} = {}
+  var seen: {Int: Bool} = {}
+  var vbn: {Int: MutableRange} = {}   # value block nodes
+  let order = copy_ints(f.body.order)
+  for bid in order:
+    let start = block_first_id(f, bid)
+    var keep: {Int: Bool} = {}
+    for s, _ in active:
+      if e.scopes[s].range.end > start: keep[s] = true
+    active = keep
+    if aft.len > 0 and aft[aft.len - 1] == bid:
+      let top = afr[afr.len - 1]
+      aft.pop()
+      afr.pop()
+      for s, _ in active: e.scopes[s].range.start = imin(e.scopes[s].range.start, top.start)
+    let has_node = bid in vbn
+    var node = MutableRange(-1, 0, 0)
+    if has_node: node = vbn[bid]
+    for iid in f.body.blocks[bid].instructions:
+      let ord = f.instructions[iid].id
+      for l in inst_lvalue_ids(f, iid): record_place_id(ord, l, has_node, node, &e, &active, &seen)
+      for o in inst_operand_ids(f, e, iid): record_place_id(ord, o, has_node, node, &e, &active, &seen)
+    let tid = rc_visit.term_id(f.body.blocks[bid].terminal)
+    for o in term_operand_ids(f.body.blocks[bid].terminal): record_place_id(tid, o, has_node, node, &e, &active, &seen)
+    let ft = rc_visit.fallthrough(f.body.blocks[bid].terminal)
+    var is_branch = false
+    var goto_block = -1
+    var tlo = false
+    match f.body.blocks[bid].terminal:
+      rc_hir.Branch(_, _, _, _, _, _): is_branch = true
+      rc_hir.Goto(b, _, _, _): goto_block = b
+      rc_hir.Ternary(_, _, _, _): tlo = true
+      rc_hir.Logical(_, _, _, _, _): tlo = true
+      rc_hir.Optional(_, _, _, _, _): tlo = true
+      _: nop()
+    let succs = rc_ops.term_all_blocks(f.body.blocks[bid].terminal)
+    if ft >= 0:
+      if not is_branch:
+        let next_id = block_first_id(f, ft)
+        for s, _ in active:
+          if e.scopes[s].range.end > tid: e.scopes[s].range.end = imax(e.scopes[s].range.end, next_id)
+        aft.push(ft)
+        afr.push(rc_env.new_mutable_range(&e, tid, next_id))
+        if has_node: vbn[ft] = node
+    elif goto_block >= 0:
+      var pos = -1
+      for i in 0..aft.len:
+        if pos < 0 and aft[i] == goto_block: pos = i
+      if pos >= 0 and pos != aft.len - 1:
+        let sr = afr[pos]
+        let first = block_first_id(f, aft[pos])
+        for s, _ in active:
+          if e.scopes[s].range.end <= tid: continue
+          e.scopes[s].range.start = imin(sr.start, e.scopes[s].range.start)
+          e.scopes[s].range.end = imax(first, e.scopes[s].range.end)
+    for succ in succs:
+      if succ in vbn: continue
+      let k = f.body.blocks[succ].kind
+      if k == rc_hir.BK_BLOCK or k == rc_hir.BK_CATCH: continue
+      if not has_node or tlo:
+        var vr = node
+        if not has_node:
+          if ft < 0: continue
+          let next_id = block_first_id(f, ft)
+          vr = rc_env.new_mutable_range(&e, tid, next_id)
+        vbn[succ] = vr
+      else: vbn[succ] = node
+  for i in 0..e.identifiers.len:
+    let s = e.identifiers[i].scope
+    if s >= 0 and e.identifiers[i].mutable_range.id == orig[s].id:
+      e.identifiers[i].mutable_range.start = e.scopes[s].range.start
+      e.identifiers[i].mutable_range.end = e.scopes[s].range.end
+
+# ---- merge_overlapping_reactive_scopes_hir
+
+type ScopeInfo:
+  start_ids: [Int] = []      # sorted by id, descending (popped from the end)
+  start_scopes: [[Int]] = []
+  end_ids: [Int] = []
+  end_scopes: [[Int]] = []
+  place_ids: [Int] = []      # place_scopes, in insertion order
+  place_scope: {Int: Int} = {}
+
+fn add_unique(var xs: [Int], x: Int):
+  for y in xs:
+    if y == x: return
+  xs.push(x)
+
+fn collect_place_scope(var info: ScopeInfo, var sm: {Int: [Int]}, var em: {Int: [Int]}, var sk: [Int], var ek: [Int], iden: Int, e: Env):
+  let sid = e.identifiers[iden].scope
+  if sid < 0: return
+  if not (iden in info.place_scope): info.place_ids.push(iden)
+  info.place_scope[iden] = sid
+  let st = e.scopes[sid].range.start
+  let en = e.scopes[sid].range.end
+  if st != en:
+    if not (st in sm):
+      sm[st] = []
+      sk.push(st)
+    add_unique(&sm[st], sid)
+    if not (en in em):
+      em[en] = []
+      ek.push(en)
+    add_unique(&em[en], sid)
+
+# (insertion sort: stable, as Rust's sort_unstable is on the short lists it sorts here)
+fn sort_desc(var xs: [Int]):
+  for i in 1..xs.len:
+    let x = xs[i]
+    var j = i - 1
+    while j >= 0 and xs[j] < x:
+      xs[j + 1] = xs[j]
+      j -= 1
+    xs[j + 1] = x
+
+fn collect_scope_info(f: HirFunction, e: Env) -> ScopeInfo:
+  var info = ScopeInfo()
+  var sm: {Int: [Int]} = {}
+  var em: {Int: [Int]} = {}
+  var sk: [Int] = []
+  var ek: [Int] = []
+  for bid in copy_ints(f.body.order):
+    for iid in f.body.blocks[bid].instructions:
+      for l in inst_lvalue_ids(f, iid): collect_place_scope(&info, &sm, &em, &sk, &ek, l, e)
+      for o in inst_operand_ids(f, e, iid): collect_place_scope(&info, &sm, &em, &sk, &ek, o, e)
+    for o in term_operand_ids(f.body.blocks[bid].terminal): collect_place_scope(&info, &sm, &em, &sk, &ek, o, e)
+  sort_desc(&sk)
+  sort_desc(&ek)
+  for k in sk:
+    info.start_ids.push(k)
+    info.start_scopes.push(copy_ints(sm[k]))
+  for k in ek:
+    info.end_ids.push(k)
+    info.end_scopes.push(copy_ints(em[k]))
+  return info
+
+type Trav:
+  joined: rc_rsv.DSet = rc_rsv.DSet()
+  active: [Int] = []
+
+fn index_of(xs: [Int], x: Int) -> Int:
+  for i in 0..xs.len:
+    if xs[i] == x: return i
+  return -1
+
+fn remove_at(var xs: [Int], i: Int):
+  var r: [Int] = []
+  for j in 0..xs.len:
+    if j != i: r.push(xs[j])
+  xs = r
+
+# sort scopes by a key descending (stable)
+fn sort_scopes_by(var xs: [Int], keys: {Int: Int}):
+  for i in 1..xs.len:
+    let x = xs[i]
+    var j = i - 1
+    while j >= 0 and keys[xs[j]] < keys[x]:
+      xs[j + 1] = xs[j]
+      j -= 1
+    xs[j + 1] = x
+
+fn visit_instruction_id(id: Int, var info: ScopeInfo, var st: Trav, e: Env):
+  let ne = info.end_ids.len
+  if ne > 0 and info.end_ids[ne - 1] <= id:
+    var scopes = copy_ints(info.end_scopes[ne - 1])
+    info.end_ids.pop()
+    info.end_scopes.pop()
+    var keys: {Int: Int} = {}
+    for s in scopes: keys[s] = e.scopes[s].range.start
+    sort_scopes_by(&scopes, keys)
+    for s in scopes:
+      let idx = index_of(st.active, s)
+      if idx >= 0:
+        if idx != st.active.len - 1:
+          var u = [s]
+          for j in idx + 1..st.active.len: u.push(st.active[j])
+          rc_rsv.ds_union(&st.joined, u)
+        remove_at(&st.active, idx)
+  let ns = info.start_ids.len
+  if ns > 0 and info.start_ids[ns - 1] <= id:
+    var scopes = copy_ints(info.start_scopes[ns - 1])
+    info.start_ids.pop()
+    info.start_scopes.pop()
+    var keys: {Int: Int} = {}
+    for s in scopes: keys[s] = e.scopes[s].range.end
+    sort_scopes_by(&scopes, keys)
+    for s in scopes: st.active.push(s)
+    for i in 1..scopes.len:
+      if e.scopes[scopes[i - 1]].range.end == e.scopes[scopes[i]].range.end: rc_rsv.ds_union(&st.joined, [scopes[i - 1], scopes[i]])
+
+fn visit_place_mo(id: Int, iden: Int, var st: Trav, e: Env):
+  let sid = e.identifiers[iden].scope
+  if sid < 0: return
+  if not rc_hir.range_contains(e.scopes[sid].range, id): return
+  if not rc_hir.range_contains(e.identifiers[iden].mutable_range, id): return
+  let idx = index_of(st.active, sid)
+  if idx >= 0 and idx != st.active.len - 1:
+    var u = [sid]
+    for j in idx + 1..st.active.len: u.push(st.active[j])
+    rc_rsv.ds_union(&st.joined, u)
+
+fn merge_overlapping_reactive_scopes_hir(var f: HirFunction, var e: Env):
+  var info = collect_scope_info(f, e)
+  let pids = copy_ints(info.place_ids)
+  var pscope: {Int: Int} = {}
+  for p in pids: pscope[p] = info.place_scope[p]
+  var st = Trav()
+  for bid in copy_ints(f.body.order):
+    for iid in f.body.blocks[bid].instructions:
+      let ord = f.instructions[iid].id
+      visit_instruction_id(ord, &info, &st, e)
+      let is_fn = rc_ops.value_func(f.instructions[iid].value) >= 0
+      for o in inst_operand_ids(f, e, iid):
+        if is_fn and is_prim_id(e, o): continue
+        visit_place_mo(ord, o, &st, e)
+      for l in inst_lvalue_ids(f, iid): visit_place_mo(ord, l, &st, e)
+    let tid = rc_visit.term_id(f.body.blocks[bid].terminal)
+    visit_instruction_id(tid, &info, &st, e)
+    for o in term_operand_ids(f.body.blocks[bid].terminal): visit_place_mo(tid, o, &st, e)
+  var groups_s: [Int] = []
+  var groups_r: [Int] = []
+  let keys = copy_ints(st.joined.keys)
+  for s in keys:
+    let r = rc_rsv.ds_find(&st.joined, s)
+    if s != r:
+      groups_s.push(s)
+      groups_r.push(r)
+  var root_rid: {Int: Int} = {}
+  var roots: [Int] = []
+  for r in groups_r:
+    if not (r in root_rid):
+      root_rid[r] = e.scopes[r].range.id
+      roots.push(r)
+  for k in 0..groups_s.len:
+    let s = groups_s[k]
+    let r = groups_r[k]
+    e.scopes[r].range.start = imin(e.scopes[r].range.start, e.scopes[s].range.start)
+    e.scopes[r].range.end = imax(e.scopes[r].range.end, e.scopes[s].range.end)
+  if roots.len > 0:
+    var by_rid: {Int: Int} = {}
+    for r in roots:
+      if not (root_rid[r] in by_rid): by_rid[root_rid[r]] = r
+    for i in 0..e.identifiers.len:
+      let rid = e.identifiers[i].mutable_range.id
+      if rid in by_rid:
+        let r = by_rid[rid]
+        e.identifiers[i].mutable_range.start = e.scopes[r].range.start
+        e.identifiers[i].mutable_range.end = e.scopes[r].range.end
+  for p in pids:
+    let os = pscope[p]
+    let nx = rc_rsv.ds_find(&st.joined, os)
+    if nx != os: e.identifiers[p].scope = nx
+
+# ---- assert_valid_block_nesting and recursively_traverse_items
+
+fn get_scopes(f: HirFunction, e: Env) -> [Int]:
+  var seen: {Int: Bool} = {}
+  var out: [Int] = []
+  for bid in copy_ints(f.body.order):
+    for iid in f.body.blocks[bid].instructions:
+      for l in inst_lvalue_ids(f, iid): gs_visit(e, l, &seen, &out)
+      for o in inst_operand_ids(f, e, iid): gs_visit(e, o, &seen, &out)
+    for o in term_operand_ids(f.body.blocks[bid].terminal): gs_visit(e, o, &seen, &out)
+  return out
+
+fn gs_visit(e: Env, iden: Int, var seen: {Int: Bool}, var out: [Int]):
+  let s = e.identifiers[iden].scope
+  if s < 0: return
+  if e.scopes[s].range.start == e.scopes[s].range.end: return
+  if s in seen: return
+  seen[s] = true
+  out.push(s)
+
+# items as (start, end, tag) triples sorted by start, then end descending, then tag; the order
+# they're entered and exited in (tag >= 0 entered, -tag - 1 exited), or a nesting error
+fn traverse_ranges(var starts: [Int], var ends: [Int], var tags: [Int], var e: Env) -> [Int]:
+  let n = starts.len
+  var idx: [Int] = []
+  for i in 0..n: idx.push(i)
+  for i in 1..n:
+    let x = idx[i]
+    var j = i - 1
+    while j >= 0 and range_after(starts, ends, tags, idx[j], x):
+      idx[j + 1] = idx[j]
+      j -= 1
+    idx[j + 1] = x
+  var events: [Int] = []
+  var act: [Int] = []
+  for x in idx:
+    while act.len > 0:
+      let p = act[act.len - 1]
+      let disjoint = starts[x] >= ends[p]
+      let nested = ends[x] <= ends[p]
+      if not disjoint and not nested:
+        rc_env.throw(&e, rc_diags.invalid_block_nesting("{starts[p]}", "{ends[p]}", "{starts[x]}", "{ends[x]}"))
+        return events
+      if not disjoint: break
+      act.pop()
+      events.push(-tags[p] - 1)
+    events.push(tags[x])
+    act.push(x)
+  while act.len > 0:
+    let p = act.pop()
+    events.push(-tags[p] - 1)
+  return events
+
+fn range_after(starts: [Int], ends: [Int], tags: [Int], a: Int, b: Int) -> Bool:
+  if starts[a] != starts[b]: return starts[a] > starts[b]
+  if ends[a] != ends[b]: return ends[a] < ends[b]
+  return tags[a] > tags[b]
+
+fn assert_valid_block_nesting(f: HirFunction, var e: Env):
+  var starts: [Int] = []
+  var ends: [Int] = []
+  var tags: [Int] = []
+  for s in get_scopes(f, e):
+    starts.push(e.scopes[s].range.start)
+    ends.push(e.scopes[s].range.end)
+    tags.push(tags.len)
+  for bid in copy_ints(f.body.order):
+    let ft = rc_visit.fallthrough(f.body.blocks[bid].terminal)
+    if ft < 0: continue
+    if not (ft in f.body.blocks):
+      rc_env.throw(&e, terminal_unknown_block(ft, f.body.blocks[bid].terminal))
+      return
+    starts.push(rc_visit.term_id(f.body.blocks[bid].terminal))
+    ends.push(block_first_id(f, ft))
+    tags.push(tags.len)
+  traverse_ranges(&starts, &ends, &tags, &e)
+
+fn terminal_unknown_block(b: Int, t: Terminal) -> rc_env.Diag:
+  let reason = "Terminal successor references unknown block"
+  return rc_env.with_label(rc_env.with_help(rc_env.diag(rc_env.EC_INVARIANT, reason), "Block bb{b} does not exist for terminal '{terminal_name(t)}'"), rc_visit.term_sp(t), reason)
+
+fn terminal_name(t: Terminal) -> Str:
+  match t:
+    rc_hir.Unreachable(_, _): return "unreachable"
+    rc_hir.Throw(_, _, _): return "throw"
+    rc_hir.Return(_, _, _, _, _, _): return "return"
+    rc_hir.Goto(_, _, _, _): return "goto"
+    rc_hir.If(_, _, _, _, _, _, _, _): return "if"
+    rc_hir.Branch(_, _, _, _, _, _): return "branch"
+    rc_hir.Switch(_, _, _, _, _): return "switch"
+    rc_hir.DoWhile(_, _, _, _, _, _): return "do-while"
+    rc_hir.While(_, _, _, _, _, _): return "while"
+    rc_hir.For(_, _, _, _, _, _, _, _): return "for"
+    rc_hir.ForOf(_, _, _, _, _, _, _, _): return "for-of"
+    rc_hir.ForIn(_, _, _, _, _, _, _): return "for-in"
+    rc_hir.Logical(_, _, _, _, _): return "logical"
+    rc_hir.Ternary(_, _, _, _): return "ternary"
+    rc_hir.Optional(_, _, _, _, _): return "optional"
+    rc_hir.Label(_, _, _, _, _): return "label"
+    rc_hir.Sequence(_, _, _, _): return "sequence"
+    rc_hir.MaybeThrow(_, _, _, _, _, _): return "maybe-throw"
+    rc_hir.Try(_, _, _, _, _, _, _, _, _): return "try"
+    rc_hir.Scope(_, _, _, _, _): return "scope"
+    rc_hir.PrunedScope(_, _, _, _, _): return "pruned-scope"
+  return ""
+
+# ---- build_reactive_scope_terminals_hir
+
+fn build_reactive_scope_terminals_hir(var f: HirFunction, var e: Env):
+  let scopes = get_scopes(f, e)
+  var starts: [Int] = []
+  var ends: [Int] = []
+  var tags: [Int] = []
+  for s in scopes:
+    starts.push(e.scopes[s].range.start)
+    ends.push(e.scopes[s].range.end)
+    tags.push(s)
+  let events = traverse_ranges(&starts, &ends, &tags, &e)
+  if e.failed: return
+  # the rewrites: kind 0 start (block, fallthrough, order, scope), 1 end (order, fallthrough)
+  var rk: [Int] = []
+  var rb: [Int] = []
+  var rf: [Int] = []
+  var ro: [Int] = []
+  var rs: [Int] = []
+  var fts: {Int: Int} = {}
+  for ev in events:
+    if ev >= 0:
+      let b = rc_env.next_block_id(&e)
+      let ft = rc_env.next_block_id(&e)
+      rk.push(0)
+      rb.push(b)
+      rf.push(ft)
+      ro.push(e.scopes[ev].range.start)
+      rs.push(ev)
+      fts[ev] = ft
+    else:
+      let s = -ev - 1
+      rk.push(1)
+      rb.push(-1)
+      rf.push(fts[s])
+      ro.push(e.scopes[s].range.end)
+      rs.push(s)
+  var q = rk.len - 1         # (the queue reversed: the next rewrite is at q, going down)
+  var qi = 0
+  var final_of: {Int: Int} = {}
+  var nb: {Int: BasicBlock} = {}
+  var norder: [Int] = []
+  let order = copy_ints(f.body.order)
+  for bid in order:
+    var cur_id = bid
+    var preds = copy_ints(f.body.blocks[bid].preds)
+    var slice = 0
+    var nrw = 0
+    let n = f.body.blocks[bid].instructions.len
+    for i in 0..n + 1:
+      var ord = 0
+      if i < n: ord = f.instructions[f.body.blocks[bid].instructions[i]].id
+      else: ord = rc_visit.term_id(f.body.blocks[bid].terminal)
+      while qi <= q and ro[qi] <= ord:
+        var t = rc_hir.Goto(rf[qi], rc_hir.GV_BREAK, ro[qi], rc_hir.nosp())
+        if rk[qi] == 0: t = rc_hir.Scope(rf[qi], rb[qi], rs[qi], ro[qi], rc_hir.nosp())
+        var phis: [Phi] = []
+        if nrw == 0: phis = cp_phis(f.body.blocks[bid].phis)
+        var ins: [Int] = []
+        for j in slice..i: ins.push(f.body.blocks[bid].instructions[j])
+        nb[cur_id] = BasicBlock(f.body.blocks[bid].kind, cur_id, ins, t, preds, phis)
+        norder.push(cur_id)
+        nrw += 1
+        preds = [cur_id]
+        if rk[qi] == 0: cur_id = rb[qi]
+        else: cur_id = rf[qi]
+        slice = i
+        qi += 1
+    if nrw > 0:
+      var ins: [Int] = []
+      for j in slice..n: ins.push(f.body.blocks[bid].instructions[j])
+      var term = rc_hir.Unreachable(0, rc_hir.nosp())
+      swap(&term, &f.body.blocks[bid].terminal)
+      nb[cur_id] = BasicBlock(f.body.blocks[bid].kind, cur_id, ins, term, preds, [])
+      norder.push(cur_id)
+      final_of[bid] = cur_id
+    else:
+      var b = rc_cfg.empty_block()
+      swap(&b, &f.body.blocks[bid])
+      nb[bid] = b
+      norder.push(bid)
+  f.body.blocks = nb
+  f.body.order = norder
+  if final_of.len > 0:
+    for bid in copy_ints(f.body.order):
+      for pi in 0..f.body.blocks[bid].phis.len:
+        var olds: [Int] = []
+        for pb in f.body.blocks[bid].phis[pi].ops_block:
+          if pb in final_of: olds.push(pb)
+        for ob in olds:
+          let p = rc_cfg.phi_remove(&f.body.blocks[bid].phis[pi], ob)
+          rc_cfg.phi_set(&f.body.blocks[bid].phis[pi], final_of[ob], p)
+  rc_cfg.reverse_postorder(&f.body)
+  rc_build.mark_predecessors(&f.body)
+  rc_cfg.mark_ids(&f)
+  fix_scope_and_identifier_ranges(f, &e)
+
+fn cp_phis(xs: [Phi]) -> [Phi]:
+  var out: [Phi] = []
+  for p in xs:
+    var ops: [Place] = []
+    for o in p.ops: ops.push(o)
+    out.push(Phi(p.place, copy_ints(p.ops_block), ops))
+  return out
+
+fn fix_scope_and_identifier_ranges(f: HirFunction, var e: Env):
+  var orig: [MutableRange] = []
+  for s in e.scopes: orig.push(s.range)
+  for bid in copy_ints(f.body.order):
+    var ft = -1
+    var sid = -1
+    var id = 0
+    match f.body.blocks[bid].terminal:
+      rc_hir.Scope(x, _, s, i, _):
+        ft = x
+        sid = s
+        id = i
+      rc_hir.PrunedScope(x, _, s, i, _):
+        ft = x
+        sid = s
+        id = i
+      _: nop()
+    if sid >= 0:
+      e.scopes[sid].range.start = id
+      e.scopes[sid].range.end = block_first_id(f, ft)
+  for i in 0..e.identifiers.len:
+    let s = e.identifiers[i].scope
+    if s >= 0 and e.identifiers[i].mutable_range.id == orig[s].id:
+      e.identifiers[i].mutable_range.start = e.scopes[s].range.start
+      e.identifiers[i].mutable_range.end = e.scopes[s].range.end
+
+# ---- flatten_reactive_loops_hir
+
+fn flatten_reactive_loops_hir(var f: HirFunction):
+  var loops: [Int] = []
+  for bid in copy_ints(f.body.order):
+    var nl: [Int] = []
+    for x in loops:
+      if x != bid: nl.push(x)
+    loops = nl
+    var lf = -1
+    var to_prune = false
+    var sb = 0
+    var sf = 0
+    var ss = 0
+    var si = 0
+    var ssp = rc_hir.nosp()
+    match f.body.blocks[bid].terminal:
+      rc_hir.DoWhile(_, _, _, x, _, _): lf = x
+      rc_hir.For(_, _, _, _, _, x, _, _): lf = x
+      rc_hir.ForIn(_, _, _, _, x, _, _): lf = x
+      rc_hir.ForOf(_, _, _, _, _, x, _, _): lf = x
+      rc_hir.While(_, _, _, x, _, _): lf = x
+      rc_hir.Scope(x, b, s, i, sp):
+        if loops.len > 0:
+          to_prune = true
+          sf = x
+          sb = b
+          ss = s
+          si = i
+          ssp = sp
+      _: nop()
+    if lf >= 0: loops.push(lf)
+    if to_prune: f.body.blocks[bid].terminal = rc_hir.PrunedScope(sf, sb, ss, si, ssp)
+
+# ---- flatten_scopes_with_hooks_or_use_hir
+
+fn is_hook_or_use(e: Env, id: Int) -> Bool:
+  return hook_kind_of_id(e, id) >= 0 or fn_shape_of(e, id) == rc_gdefs.BUILT_IN_USE_OPERATOR_ID
+
+# is_known_pure_tagged_template (react_compiler_inference/mod.rs)
+fn is_known_pure_tagged_template(e: Env, tag: Int, subs: Int) -> Bool:
+  let sig = rc_shapes.function_signature(e.reg, e.types[e.identifiers[tag].type_])
+  if sig.len == 0: return false
+  let s = sig[0]
+  if s.hook_kind >= 0 or s.impure or s.has_known_incompatible or s.aliasing.len > 0 or s.callee_effect != rc_hir.EF_READ: return false
+  if not (s.return_value_kind == rc_hir.VK_PRIMITIVE or s.return_value_kind == rc_hir.VK_FROZEN or s.return_value_kind == rc_hir.VK_MUTABLE): return false
+  for i in 0..subs + 1:
+    var eff = s.rest_param
+    if i < s.positional_params.len: eff = s.positional_params[i]
+    if eff != rc_hir.EF_READ: return false
+  return true
+
+fn flatten_scopes_with_hooks_or_use_hir(var f: HirFunction, var e: Env):
+  var ab: [Int] = []
+  var af: [Int] = []
+  var prune: [Int] = []
+  for bid in copy_ints(f.body.order):
+    var nb: [Int] = []
+    var nf: [Int] = []
+    for i in 0..ab.len:
+      if af[i] != bid:
+        nb.push(ab[i])
+        nf.push(af[i])
+    ab = nb
+    af = nf
+    for iid in f.body.blocks[bid].instructions:
+      var hit = false
+      match f.instructions[iid].value:
+        rc_hir.CallExpression(c, _, _): hit = is_hook_or_use(e, c.identifier)
+        rc_hir.TaggedTemplateExpression(tag, _, subs, _, _): hit = not is_known_pure_tagged_template(e, tag.identifier, subs.len)
+        rc_hir.MethodCall(_, p, _, _): hit = is_hook_or_use(e, p.identifier)
+        _: nop()
+      if hit:
+        for x in ab: prune.push(x)
+        ab = []
+        af = []
+    match f.body.blocks[bid].terminal:
+      rc_hir.Scope(ft, _, _, _, _):
+        ab.push(bid)
+        af.push(ft)
+      _: nop()
+  for id in prune:
+    var sb = -1
+    var ft = 0
+    var ord = 0
+    var sp = rc_hir.nosp()
+    var scope = 0
+    match f.body.blocks[id].terminal:
+      rc_hir.Scope(x, b, s, i, y):
+        sb = b
+        ft = x
+        ord = i
+        sp = y
+        scope = s
+      _: nop()
+    if sb < 0:
+      rc_env.throw(&e, rc_diags.expected_scope_terminal("{id}"))
+      return
+    var label = false
+    if f.body.blocks[sb].instructions.len == 1:
+      match f.body.blocks[sb].terminal:
+        rc_hir.Goto(b, _, _, _): label = b == ft
+        _: nop()
+    if label: f.body.blocks[id].terminal = rc_hir.Label(sb, rc_hir.nosp(), ft, ord, sp)
+    else: f.body.blocks[id].terminal = rc_hir.PrunedScope(ft, sb, scope, ord, sp)
+
+# ---- assert_terminal_successors_exist, assert_terminal_preds_exist
+
+fn assert_terminal_successors_exist(f: HirFunction, var e: Env):
+  for bid in copy_ints(f.body.order):
+    for s in rc_ops.term_all_blocks(f.body.blocks[bid].terminal):
+      if not (s in f.body.blocks):
+        rc_env.throw(&e, terminal_unknown_block(s, f.body.blocks[bid].terminal))
+        return
+
+fn assert_terminal_preds_exist(f: HirFunction, var e: Env):
+  for bid in copy_ints(f.body.order):
+    for p in f.body.blocks[bid].preds:
+      if not (p in f.body.blocks):
+        rc_env.throw(&e, rc_diags.expected_predecessor_block_to_exist("{bid}", "{p}"))
+        return
+      var found = false
+      for s in rc_visit.successors(f.body.blocks[p].terminal):
+        if s == bid: found = true
+      if not found:
+        rc_env.throw(&e, rc_diags.terminal_successor_does_not_reference_correct_predecessor("{bid}", "{p}"))
+        return
+

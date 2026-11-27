@@ -1,0 +1,225 @@
+# The reactive function's visitor (oxc_react_compiler 1.94.0, react_compiler_reactive_scopes/
+# visitors.rs ReactiveFunctionVisitor, read-only) as a list of events in visiting order, which a
+# pass then folds over: the places and lvalues with their evaluation order, the instructions' ends,
+# the scopes' and blocks' starts and ends, the terminals and the values' ends. `tr` takes the
+# transform's order for a for loop's parts (init, test, update, body) instead of the visitor's
+# (init, test, body, update); `hir` adds each function expression's lowered function after its
+# value, as visit_hir_function walks it (its params, instructions and terminal operands).
+
+import rc_hir
+import rc_env
+import rc_ops
+import rc_visit
+import rc_rf
+from rc_hir import Sp, Place, HirFunction
+from rc_env import Env
+from rc_rf import RF
+
+const EV_ID = 0
+const EV_PLACE = 1
+const EV_LVALUE = 2
+const EV_PARAM = 3
+const EV_INSTR_END = 4       # a: the instruction (-1 an inner function's)
+const EV_SCOPE_BEGIN = 5     # a: the scope, b: the statement
+const EV_SCOPE_END = 6
+const EV_PRUNED_BEGIN = 7
+const EV_PRUNED_END = 8
+const EV_BLOCK_BEGIN = 9     # a: the block, b: 1 when it's a pruned scope's
+const EV_BLOCK_END = 10
+const EV_TERM_BEGIN = 11     # a: the terminal
+const EV_TERM_END = 12
+const EV_VALUE_END = 13      # a: the value
+const EV_HIR_BEGIN = 14      # a: the function
+const EV_HIR_END = 15
+
+type Ev:
+  k: [Int] = []
+  a: [Int] = []
+  b: [Int] = []
+  p: [Place] = []
+
+fn push(var v: Ev, k: Int, a: Int, b: Int, p: Place):
+  v.k.push(k)
+  v.a.push(a)
+  v.b.push(b)
+  v.p.push(p)
+
+fn np() -> Place:
+  return Place(-1, 0, false, Sp(-1, -1))
+
+fn events(rf: RF, e: Env, tr: Bool, hir: Bool) -> Ev:
+  var v = Ev()
+  ev_block(rf, e, rf.body, 0, tr, hir, &v)
+  return v
+
+fn ev_block(rf: RF, e: Env, b: Int, pruned: Int, tr: Bool, hir: Bool, var v: Ev):
+  push(&v, EV_BLOCK_BEGIN, b, pruned, np())
+  for s in rf.blocks[b]:
+    let st = rf.stmts[s]
+    if st.kind == rc_rf.ST_INSTR: ev_instr(rf, e, st.x, tr, hir, &v)
+    elif st.kind == rc_rf.ST_SCOPE:
+      push(&v, EV_SCOPE_BEGIN, st.x, s, np())
+      ev_block(rf, e, st.block, 0, tr, hir, &v)
+      push(&v, EV_SCOPE_END, st.x, s, np())
+    elif st.kind == rc_rf.ST_PRUNED:
+      push(&v, EV_PRUNED_BEGIN, st.x, s, np())
+      ev_block(rf, e, st.block, 1, tr, hir, &v)
+      push(&v, EV_PRUNED_END, st.x, s, np())
+    else: ev_term(rf, e, st.x, tr, hir, &v)
+  push(&v, EV_BLOCK_END, b, pruned, np())
+
+fn ev_instr(rf: RF, e: Env, ri: Int, tr: Bool, hir: Bool, var v: Ev):
+  let ins = rf.instrs[ri]
+  push(&v, EV_ID, ins.id, 0, np())
+  if ins.has_lvalue: push(&v, EV_LVALUE, ins.id, 0, ins.lvalue)
+  if rf.vals[ins.value].kind == rc_rf.RV_INSTR:
+    for p in rc_ops.value_lvalues(rf.vals[ins.value].instr): push(&v, EV_LVALUE, ins.id, 0, p)
+  ev_value(rf, e, ins.id, ins.value, tr, hir, &v)
+  push(&v, EV_INSTR_END, ri, 0, np())
+
+fn ev_value(rf: RF, e: Env, id: Int, x: Int, tr: Bool, hir: Bool, var v: Ev):
+  let k = rf.vals[x].kind
+  if k == rc_rf.RV_OPT: ev_value(rf, e, id, rf.vals[x].a, tr, hir, &v)
+  elif k == rc_rf.RV_LOGICAL:
+    ev_value(rf, e, id, rf.vals[x].a, tr, hir, &v)
+    ev_value(rf, e, id, rf.vals[x].b, tr, hir, &v)
+  elif k == rc_rf.RV_COND:
+    ev_value(rf, e, id, rf.vals[x].a, tr, hir, &v)
+    ev_value(rf, e, id, rf.vals[x].b, tr, hir, &v)
+    ev_value(rf, e, id, rf.vals[x].c, tr, hir, &v)
+  elif k == rc_rf.RV_SEQ:
+    for ri in rf.vals[x].instrs: ev_instr(rf, e, ri, tr, hir, &v)
+    ev_value(rf, e, rf.vals[x].id, rf.vals[x].a, tr, hir, &v)
+  else:
+    for p in rc_ops.value_operands(rf.vals[x].instr, e): push(&v, EV_PLACE, id, 0, p)
+  push(&v, EV_VALUE_END, x, 0, np())
+  if hir and k == rc_rf.RV_INSTR:
+    let fid = rc_ops.value_func(rf.vals[x].instr)
+    if fid >= 0: ev_hir(e, fid, &v)
+
+fn ev_hir(e: Env, fid: Int, var v: Ev):
+  push(&v, EV_HIR_BEGIN, fid, 0, np())
+  for p in e.functions[fid].params: push(&v, EV_PARAM, 0, 0, p.place)
+  for bid in e.functions[fid].body.order:
+    for iid in e.functions[fid].body.blocks[bid].instructions:
+      let id = e.functions[fid].instructions[iid].id
+      push(&v, EV_ID, id, 0, np())
+      push(&v, EV_LVALUE, id, 0, e.functions[fid].instructions[iid].lvalue)
+      for p in rc_ops.value_lvalues(e.functions[fid].instructions[iid].value): push(&v, EV_LVALUE, id, 0, p)
+      for p in rc_ops.value_operands(e.functions[fid].instructions[iid].value, e): push(&v, EV_PLACE, id, 0, p)
+      push(&v, EV_INSTR_END, -1, 0, np())
+      let nf = rc_ops.value_func(e.functions[fid].instructions[iid].value)
+      if nf >= 0: ev_hir(e, nf, &v)
+    let tid = rc_visit.term_id(e.functions[fid].body.blocks[bid].terminal)
+    for p in rc_ops.term_operands(e.functions[fid].body.blocks[bid].terminal): push(&v, EV_PLACE, tid, 0, p)
+  push(&v, EV_HIR_END, fid, 0, np())
+
+fn ev_term(rf: RF, e: Env, ti: Int, tr: Bool, hir: Bool, var v: Ev):
+  push(&v, EV_TERM_BEGIN, ti, 0, np())
+  let t = rf.terms[ti]
+  let id = t.id
+  push(&v, EV_ID, id, 0, np())
+  let k = t.kind
+  if k == rc_rf.RT_RETURN or k == rc_rf.RT_THROW: push(&v, EV_PLACE, id, 0, t.value)
+  elif k == rc_rf.RT_FOR:
+    ev_value(rf, e, id, t.v1, tr, hir, &v)
+    ev_value(rf, e, id, t.v2, tr, hir, &v)
+    if tr:
+      if t.v3 >= 0: ev_value(rf, e, id, t.v3, tr, hir, &v)
+      ev_block(rf, e, t.b1, 0, tr, hir, &v)
+    else:
+      ev_block(rf, e, t.b1, 0, tr, hir, &v)
+      if t.v3 >= 0: ev_value(rf, e, id, t.v3, tr, hir, &v)
+  elif k == rc_rf.RT_FOROF:
+    ev_value(rf, e, id, t.v1, tr, hir, &v)
+    ev_value(rf, e, id, t.v2, tr, hir, &v)
+    ev_block(rf, e, t.b1, 0, tr, hir, &v)
+  elif k == rc_rf.RT_FORIN:
+    ev_value(rf, e, id, t.v1, tr, hir, &v)
+    ev_block(rf, e, t.b1, 0, tr, hir, &v)
+  elif k == rc_rf.RT_DOWHILE:
+    ev_block(rf, e, t.b1, 0, tr, hir, &v)
+    ev_value(rf, e, id, t.v1, tr, hir, &v)
+  elif k == rc_rf.RT_WHILE:
+    ev_value(rf, e, id, t.v1, tr, hir, &v)
+    ev_block(rf, e, t.b1, 0, tr, hir, &v)
+  elif k == rc_rf.RT_IF:
+    push(&v, EV_PLACE, id, 0, t.value)
+    ev_block(rf, e, t.b1, 0, tr, hir, &v)
+    if t.b2 >= 0: ev_block(rf, e, t.b2, 0, tr, hir, &v)
+  elif k == rc_rf.RT_SWITCH:
+    push(&v, EV_PLACE, id, 0, t.value)
+    for c in t.cases:
+      if c.has_test: push(&v, EV_PLACE, id, 0, c.test)
+      if c.block >= 0: ev_block(rf, e, c.block, 0, tr, hir, &v)
+  elif k == rc_rf.RT_LABEL: ev_block(rf, e, t.b1, 0, tr, hir, &v)
+  elif k == rc_rf.RT_TRY:
+    ev_block(rf, e, t.b1, 0, tr, hir, &v)
+    if t.has_binding: push(&v, EV_PLACE, id, 0, t.value)
+    ev_block(rf, e, t.b2, 0, tr, hir, &v)
+  push(&v, EV_TERM_END, ti, 0, np())
+
+# a terminal's child blocks and values, in the transform's order: kind 0 value, 1 block
+fn term_parts(t: rc_rf.RTerm, var kinds: [Int], var xs: [Int]):
+  let k = t.kind
+  if k == rc_rf.RT_FOR:
+    kinds.push(0)
+    xs.push(t.v1)
+    kinds.push(0)
+    xs.push(t.v2)
+    if t.v3 >= 0:
+      kinds.push(0)
+      xs.push(t.v3)
+    kinds.push(1)
+    xs.push(t.b1)
+  elif k == rc_rf.RT_FOROF:
+    kinds.push(0)
+    xs.push(t.v1)
+    kinds.push(0)
+    xs.push(t.v2)
+    kinds.push(1)
+    xs.push(t.b1)
+  elif k == rc_rf.RT_FORIN:
+    kinds.push(0)
+    xs.push(t.v1)
+    kinds.push(1)
+    xs.push(t.b1)
+  elif k == rc_rf.RT_DOWHILE:
+    kinds.push(1)
+    xs.push(t.b1)
+    kinds.push(0)
+    xs.push(t.v1)
+  elif k == rc_rf.RT_WHILE:
+    kinds.push(0)
+    xs.push(t.v1)
+    kinds.push(1)
+    xs.push(t.b1)
+  elif k == rc_rf.RT_IF:
+    kinds.push(1)
+    xs.push(t.b1)
+    if t.b2 >= 0:
+      kinds.push(1)
+      xs.push(t.b2)
+  elif k == rc_rf.RT_SWITCH:
+    for c in t.cases:
+      if c.block >= 0:
+        kinds.push(1)
+        xs.push(c.block)
+  elif k == rc_rf.RT_LABEL:
+    kinds.push(1)
+    xs.push(t.b1)
+  elif k == rc_rf.RT_TRY:
+    kinds.push(1)
+    xs.push(t.b1)
+    kinds.push(1)
+    xs.push(t.b2)
+
+# the blocks of a terminal (in order)
+fn term_blocks(t: rc_rf.RTerm) -> [Int]:
+  var ks: [Int] = []
+  var xs: [Int] = []
+  term_parts(t, &ks, &xs)
+  var out: [Int] = []
+  for i in 0..ks.len:
+    if ks[i] == 1: out.push(xs[i])
+  return out

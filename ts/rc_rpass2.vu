@@ -1,0 +1,794 @@
+# The React Compiler's reactive function passes, continued (oxc_react_compiler 1.94.0,
+# react_compiler_reactive_scopes/): merge_reactive_scopes_that_invalidate_together,
+# promote_used_temporaries and rename_variables, each named as its Rust file.
+
+import rc_hir
+import rc_env
+import rc_diags
+import rc_ops
+import rc_rf
+import rc_rvisit
+import rc_scopes
+import rc_psd
+import rc_gdefs
+from rc_hir import Sp, Place, InstrValue, DepPathEntry
+from rc_env import Env, SDep, SDecl
+from rc_rf import RF
+
+fn nop():
+  return
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var r = xs[0..xs.len]
+  return r
+
+fn cp_deps(xs: [SDep]) -> [SDep]:
+  var out: [SDep] = []
+  for x in xs: out.push(rc_psd.cp_dep(x))
+  return out
+
+# ---- merge_reactive_scopes_that_invalidate_together
+
+type MS:
+  last: {Int: Int} = {}      # declaration -> its last use
+  temps: {Int: Int} = {}     # declaration -> the declaration it loads
+
+fn merge_reactive_scopes_that_invalidate_together(var rf: RF, var e: Env):
+  var st = MS()
+  let ev = rc_rvisit.events(rf, e, false, false)
+  for i in 0..ev.k.len:
+    if ev.k[i] == rc_rvisit.EV_PLACE:
+      let d = e.identifiers[ev.p[i].identifier].declaration_id
+      if not (d in st.last) or ev.a[i] > st.last[d]: st.last[d] = ev.a[i]
+  mrs_block(&rf, rf.body, &e, false, [], &st)
+
+fn mrs_block(var rf: RF, b: Int, var e: Env, has: Bool, deps: [SDep], var st: MS):
+  let old = copy_ints(rf.blocks[b])
+  var out: [Int] = []
+  for s in old:
+    if e.failed: return
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_SCOPE:
+      let sid = rf.stmts[s].x
+      let sd = cp_deps(e.scopes[sid].dependencies)
+      mrs_block(&rf, rf.stmts[s].block, &e, true, sd, &st)
+      if has and are_equal_dependencies(deps, sd, e):
+        for x in copy_ints(rf.blocks[rf.stmts[s].block]): out.push(x)
+      else: out.push(s)
+    elif k == rc_rf.ST_PRUNED:
+      mrs_block(&rf, rf.stmts[s].block, &e, has, deps, &st)
+      out.push(s)
+    elif k == rc_rf.ST_TERM:
+      for cb in rc_rvisit.term_blocks(rf.terms[rf.stmts[s].x]): mrs_block(&rf, cb, &e, has, deps, &st)
+      out.push(s)
+    else: out.push(s)
+  rf.blocks[b] = out
+  merge_scopes_in_block(&rf, b, &e, &st)
+
+type Cur:
+  on: Bool = false
+  scope: Int = -1
+  from: Int = 0
+  to: Int = 0
+  lvalues: {Int: Bool} = {}
+
+fn close_cur(var c: Cur, var mf: [Int], var mt: [Int], var ms: [Int]):
+  if c.on and c.to > c.from + 1:
+    mf.push(c.from)
+    mt.push(c.to)
+    ms.push(c.scope)
+  c = Cur()
+
+fn merge_scopes_in_block(var rf: RF, b: Int, var e: Env, var st: MS):
+  var c = Cur()
+  var mf: [Int] = []
+  var mt: [Int] = []
+  var ms: [Int] = []
+  var in_memo = false
+  let stmts = copy_ints(rf.blocks[b])
+  for i in 0..stmts.len:
+    let s = stmts[i]
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_TERM or k == rc_rf.ST_PRUNED:
+      close_cur(&c, &mf, &mt, &ms)
+    elif k == rc_rf.ST_INSTR:
+      let ri = rf.stmts[s].x
+      let x = rf.instrs[ri].value
+      if rf.vals[x].kind != rc_rf.RV_INSTR:
+        close_cur(&c, &mf, &mt, &ms)
+        continue
+      var kind = 0     # 1 simple, 2 store local, 3 memo marker, 0 other
+      var is_start = false
+      var load_src = -1
+      var slk = 0
+      var sl_place = -1
+      var sl_value = -1
+      match rf.vals[x].instr:
+        rc_hir.BinaryExpression(_, _, _, _): kind = 1
+        rc_hir.ComputedLoad(_, _, _): kind = 1
+        rc_hir.JSXText(_, _): kind = 1
+        rc_hir.LoadGlobal(_, _): kind = 1
+        rc_hir.LoadLocal(p, _):
+          kind = 1
+          load_src = p.identifier
+        rc_hir.Primitive(_, _): kind = 1
+        rc_hir.PropertyLoad(_, _, _, _, _): kind = 1
+        rc_hir.TemplateLiteral(_, _, _): kind = 1
+        rc_hir.UnaryExpression(_, _, _): kind = 1
+        rc_hir.StoreLocal(lv, v, _):
+          kind = 2
+          slk = lv.kind
+          sl_place = lv.place.identifier
+          sl_value = v.identifier
+        rc_hir.StartMemoize(_, _, _, _, _, _, _):
+          kind = 3
+          is_start = true
+        rc_hir.FinishMemoize(_, _, _, _): kind = 3
+        _: kind = 0
+      if kind == 1:
+        if c.on and rf.instrs[ri].has_lvalue:
+          let d = e.identifiers[rf.instrs[ri].lvalue.identifier].declaration_id
+          c.lvalues[d] = true
+          if load_src >= 0: st.temps[d] = e.identifiers[load_src].declaration_id
+      elif kind == 2:
+        if c.on:
+          if slk == rc_hir.IK_CONST:
+            if rf.instrs[ri].has_lvalue: c.lvalues[e.identifiers[rf.instrs[ri].lvalue.identifier].declaration_id] = true
+            let sd = e.identifiers[sl_place].declaration_id
+            c.lvalues[sd] = true
+            let vd = e.identifiers[sl_value].declaration_id
+            st.temps[sd] = st.temps.get(vd, vd)
+          else: close_cur(&c, &mf, &mt, &ms)
+      elif kind == 3:
+        in_memo = is_start
+        close_cur(&c, &mf, &mt, &ms)
+      else: close_cur(&c, &mf, &mt, &ms)
+    else:
+      let next = rf.stmts[s].x
+      if c.on:
+        let cur = c.scope
+        let mcs = in_memo and can_merge_constant_scope_in_manual_memo(cur, next, e)
+        if (mcs or can_merge_scopes(cur, next, e, st)) and are_lvalues_last_used_by_scope(next, c.lvalues, st, e):
+          if mcs: inherit_dependencies(cur, next, &e, st, rf, stmts, c.to, i)
+          let ne = e.scopes[next].range.end
+          if ne > e.scopes[cur].range.end: e.scopes[cur].range.end = ne
+          var nk: [Int] = []
+          var ni: [Int] = []
+          var ns: [Int] = []
+          for nd in e.scopes[next].declarations:
+            nk.push(nd.key)
+            ni.push(nd.identifier)
+            ns.push(nd.scope)
+          for q in 0..nk.len:
+            var found = false
+            for j in 0..e.scopes[cur].declarations.len:
+              if e.scopes[cur].declarations[j].key == nk[q]:
+                e.scopes[cur].declarations[j].identifier = ni[q]
+                e.scopes[cur].declarations[j].scope = ns[q]
+                found = true
+                break
+            if not found: e.scopes[cur].declarations.push(SDecl(nk[q], ni[q], ns[q]))
+          update_scope_declarations(cur, st, &e)
+          c.to = i + 1
+          c.lvalues = {}
+          if not scope_is_eligible_for_merging(next, e): close_cur(&c, &mf, &mt, &ms)
+        else:
+          close_cur(&c, &mf, &mt, &ms)
+          if scope_is_eligible_for_merging(next, e): c = Cur(true, next, i, i + 1)
+      elif scope_is_eligible_for_merging(next, e): c = Cur(true, next, i, i + 1)
+  close_cur(&c, &mf, &mt, &ms)
+  if mf.len == 0: return
+  var out: [Int] = []
+  var idx = 0
+  for m in 0..mf.len:
+    while idx < mf[m]:
+      out.push(stmts[idx])
+      idx += 1
+    let ms0 = stmts[idx]
+    if rf.stmts[ms0].kind != rc_rf.ST_SCOPE:
+      rc_env.throw(&e, rc_diags.invariant_merge_consecutive_scopes_expected_scope_at_starting_index())
+      return
+    idx += 1
+    let mb = rf.stmts[ms0].block
+    let msid = rf.stmts[ms0].x
+    while idx < mt[m]:
+      let s2 = stmts[idx]
+      idx += 1
+      if rf.stmts[s2].kind == rc_rf.ST_SCOPE:
+        for x in copy_ints(rf.blocks[rf.stmts[s2].block]): rf.blocks[mb].push(x)
+        e.scopes[msid].merged.push(rf.stmts[s2].x)
+      else: rf.blocks[mb].push(s2)
+    out.push(ms0)
+  while idx < stmts.len:
+    out.push(stmts[idx])
+    idx += 1
+  rf.blocks[b] = out
+
+fn update_scope_declarations(sid: Int, st: MS, var e: Env):
+  let end = e.scopes[sid].range.end
+  var keep: [SDecl] = []
+  for d in e.scopes[sid].declarations:
+    let dd = e.identifiers[d.identifier].declaration_id
+    if not (dd in st.last) or st.last[dd] >= end: keep.push(SDecl(d.key, d.identifier, d.scope))
+  e.scopes[sid].declarations = keep
+
+fn are_lvalues_last_used_by_scope(sid: Int, lvalues: {Int: Bool}, st: MS, e: Env) -> Bool:
+  let end = e.scopes[sid].range.end
+  for l, _ in lvalues:
+    if l in st.last and st.last[l] >= end: return false
+  return true
+
+fn is_always_invalidating_type(e: Env, id: Int) -> Bool:
+  match e.types[e.identifiers[id].type_]:
+    rc_hir.TObject(sh, has):
+      if not has: return false
+      return sh == rc_gdefs.BUILT_IN_ARRAY_ID or sh == rc_gdefs.BUILT_IN_OBJECT_ID or sh == rc_gdefs.BUILT_IN_FUNCTION_ID or sh == rc_gdefs.BUILT_IN_JSX_ID
+    rc_hir.TFunction(_, _, _, _): return true
+    _: return false
+  return false
+
+fn are_equal_dependencies(a: [SDep], b: [SDep], e: Env) -> Bool:
+  if a.len != b.len: return false
+  for x in a:
+    let xd = e.identifiers[x.identifier].declaration_id
+    var found = false
+    for y in b:
+      if e.identifiers[y.identifier].declaration_id == xd and rc_psd.are_equal_paths(x.path, y.path): found = true
+    if not found: return false
+  return true
+
+fn can_merge_scopes(cur: Int, next: Int, e: Env, st: MS) -> Bool:
+  if e.scopes[cur].reassignments.len > 0 or e.scopes[next].reassignments.len > 0: return false
+  if are_equal_dependencies(e.scopes[cur].dependencies, e.scopes[next].dependencies, e): return true
+  var cdd: [SDep] = []
+  for d in e.scopes[cur].declarations: cdd.push(SDep(d.identifier, true, [], Sp(-1, -1)))
+  if are_equal_dependencies(cdd, e.scopes[next].dependencies, e): return true
+  if e.scopes[next].dependencies.len == 0: return false
+  for dep in e.scopes[next].dependencies:
+    if dep.path.len > 0: return false
+    if not is_always_invalidating_type(e, dep.identifier): return false
+    let dd = e.identifiers[dep.identifier].declaration_id
+    var any = false
+    for d in e.scopes[cur].declarations:
+      let x = e.identifiers[d.identifier].declaration_id
+      if x == dd or st.temps.get(dd, -1) == x: any = true
+    if not any: return false
+  return true
+
+fn can_merge_constant_scope_in_manual_memo(cur: Int, next: Int, e: Env) -> Bool:
+  return e.scopes[cur].dependencies.len == 0 and e.scopes[cur].reassignments.len == 0 and e.scopes[next].dependencies.len > 0 and e.scopes[next].reassignments.len == 0
+
+fn push_dependency(var deps: [SDep], own d: SDep, e: Env):
+  let dd = e.identifiers[d.identifier].declaration_id
+  for x in deps:
+    if e.identifiers[x.identifier].declaration_id == dd and rc_psd.are_equal_paths(x.path, d.path): return
+  deps.push(d)
+
+# (the statements between the current scope and the next: stmts[from..to])
+fn inherit_dependencies(cur: Int, next: Int, var e: Env, st: MS, rf: RF, stmts: [Int], from: Int, to: Int):
+  var cdecls: [Int] = []
+  for d in e.scopes[cur].declarations: cdecls.push(e.identifiers[d.identifier].declaration_id)
+  var deps = cp_deps(e.scopes[next].dependencies)
+  var si = to - 1
+  while si >= from:
+    let s = stmts[si]
+    si -= 1
+    if rf.stmts[s].kind != rc_rf.ST_INSTR: continue
+    let ri = rf.stmts[s].x
+    let x = rf.instrs[ri].value
+    if rf.vals[x].kind != rc_rf.RV_INSTR: continue
+    var lvd = -1
+    if rf.instrs[ri].has_lvalue: lvd = e.identifiers[rf.instrs[ri].lvalue.identifier].declaration_id
+    var sld = -1
+    match rf.vals[x].instr:
+      rc_hir.StoreLocal(lv, _, _): sld = e.identifiers[lv.place.identifier].declaration_id
+      _: nop()
+    var replaced: [SDep] = []
+    var j = 0
+    while j < deps.len:
+      let dd = e.identifiers[deps[j].identifier].declaration_id
+      if (lvd >= 0 and dd == lvd) or (sld >= 0 and dd == sld):
+        # (swap_remove)
+        var last = deps.pop()
+        if j < deps.len:
+          swap(&last, &deps[j])
+        replaced.push(last)
+      else: j += 1
+    for k in 0..replaced.len:
+      var d = rc_psd.cp_dep(replaced[k])
+      match rf.vals[x].instr:
+        rc_hir.LoadLocal(p, _):
+          d.identifier = p.identifier
+          push_dependency(&deps, d, e)
+        rc_hir.StoreLocal(_, p, _):
+          d.identifier = p.identifier
+          push_dependency(&deps, d, e)
+        rc_hir.PropertyLoad(o, prop, computed, psp, _):
+          d.identifier = o.identifier
+          var np = [DepPathEntry(rc_psd.cp_plit(prop), computed, false, psp)]
+          for y in d.path: np.push(rc_psd.cp_entry(y))
+          d.path = np
+          push_dependency(&deps, d, e)
+        _:
+          for op in rc_ops.value_operands(rf.vals[x].instr, e): push_dependency(&deps, SDep(op.identifier, op.reactive, [], op.sp), e)
+  var keep: [SDep] = []
+  for d in deps:
+    let dd = e.identifiers[d.identifier].declaration_id
+    var drop = false
+    for c in cdecls:
+      if c == dd or st.temps.get(dd, -1) == c: drop = true
+    if not drop: keep.push(rc_psd.cp_dep(d))
+  e.scopes[cur].dependencies = keep
+
+fn scope_is_eligible_for_merging(sid: Int, e: Env) -> Bool:
+  if e.scopes[sid].dependencies.len == 0: return true
+  for d in e.scopes[sid].declarations:
+    if is_always_invalidating_type(e, d.identifier): return true
+  return false
+
+# ---- promote_used_temporaries
+
+type PInfo:
+  active: [Int] = []
+  used_outside: Bool = false
+
+type PS:
+  tags: {Int: Bool} = {}
+  promoted: {Int: Bool} = {}
+  pruned: {Int: PInfo} = {}
+  hook_results: {Int: Bool} = {}
+  hook_used: [Int] = []
+
+fn named(e: Env, id: Int) -> Bool:
+  return e.identifiers[id].name_kind != 0
+
+fn promote_identifier(id: Int, var st: PS, var e: Env):
+  let d = e.identifiers[id].declaration_id
+  e.identifiers[id].name_kind = 2
+  if st.tags.get(d, false): e.identifiers[id].name = "#T{d}"
+  else: e.identifiers[id].name = "#t{d}"
+  st.promoted[d] = true
+
+fn promote_used_temporaries(rf: RF, var e: Env):
+  var st = PS()
+  var active: [Int] = []
+  cp_block(rf, rf.body, &st, &active, e)
+  for id in copy_ints(st.hook_used):
+    if not named(e, id): promote_identifier(id, &st, &e)
+  for p in rf.params:
+    if not named(e, p.place.identifier): promote_identifier(p.place.identifier, &st, &e)
+  pt_block(rf, rf.body, &st, &e)
+  var consts: {Int: Bool} = {}
+  var globals: {Int: Bool} = {}
+  for p in rf.params: consts[p.place.identifier] = true
+  var inter: {Int: Bool} = {}     # identifier -> needs promotion
+  pi_block(rf, rf.body, &st, &inter, &consts, &globals, &e)
+  for p in rf.params:
+    let id = p.place.identifier
+    if not named(e, id) and st.promoted.get(e.identifiers[id].declaration_id, false): promote_identifier(id, &st, &e)
+  pa_block(rf, rf.body, &st, &e)
+
+# (the visitor's order for a terminal's parts)
+fn parts(t: rc_rf.RTerm, var ks: [Int], var xs: [Int]):
+  if t.kind == rc_rf.RT_FOR:
+    ks.push(0)
+    xs.push(t.v1)
+    ks.push(0)
+    xs.push(t.v2)
+    ks.push(1)
+    xs.push(t.b1)
+    if t.v3 >= 0:
+      ks.push(0)
+      xs.push(t.v3)
+    return
+  rc_rvisit.term_parts(t, &ks, &xs)
+
+fn cp_place(p: Place, var st: PS, active: [Int], e: Env):
+  if active.len == 0: return
+  let d = e.identifiers[p.identifier].declaration_id
+  if st.hook_results.get(d, false): st.hook_used.push(p.identifier)
+  if d in st.pruned:
+    let last = active[active.len - 1]
+    var found = false
+    for x in st.pruned[d].active:
+      if x == last: found = true
+    if not found: st.pruned[d].used_outside = true
+
+fn cp_block(rf: RF, b: Int, var st: PS, var active: [Int], e: Env):
+  for s in rf.blocks[b]:
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_INSTR: cp_instr(rf, rf.stmts[s].x, &st, &active, e)
+    elif k == rc_rf.ST_SCOPE:
+      active.push(rf.stmts[s].x)
+      cp_block(rf, rf.stmts[s].block, &st, &active, e)
+      active.pop()
+    elif k == rc_rf.ST_PRUNED:
+      for d in e.scopes[rf.stmts[s].x].declarations: st.pruned[e.identifiers[d.identifier].declaration_id] = PInfo(copy_ints(active))
+      cp_block(rf, rf.stmts[s].block, &st, &active, e)
+    else:
+      let t = rf.terms[rf.stmts[s].x]
+      if t.kind == rc_rf.RT_RETURN or t.kind == rc_rf.RT_THROW or t.kind == rc_rf.RT_IF or t.kind == rc_rf.RT_SWITCH: cp_place(t.value, &st, active, e)
+      if t.kind == rc_rf.RT_SWITCH:
+        for c in t.cases:
+          if c.has_test: cp_place(c.test, &st, active, e)
+          if c.block >= 0: cp_block(rf, c.block, &st, &active, e)
+        continue
+      var ks: [Int] = []
+      var xs: [Int] = []
+      parts(t, &ks, &xs)
+      for i in 0..ks.len:
+        if t.kind == rc_rf.RT_TRY and i == 1 and t.has_binding: cp_place(t.value, &st, active, e)
+        if ks[i] == 1: cp_block(rf, xs[i], &st, &active, e)
+        else: cp_value(rf, xs[i], &st, &active, e)
+
+fn cp_instr(rf: RF, ri: Int, var st: PS, var active: [Int], e: Env):
+  cp_value(rf, rf.instrs[ri].value, &st, &active, e)
+  if not rf.instrs[ri].has_lvalue: return
+  let x = rf.instrs[ri].value
+  if rf.vals[x].kind != rc_rf.RV_INSTR: return
+  var hook = -1
+  match rf.vals[x].instr:
+    rc_hir.CallExpression(c, _, _): hook = c.identifier
+    rc_hir.MethodCall(_, p, _, _): hook = p.identifier
+    _: nop()
+  if hook >= 0 and rc_scopes.hook_kind_of_id(e, hook) >= 0: st.hook_results[e.identifiers[rf.instrs[ri].lvalue.identifier].declaration_id] = true
+
+fn cp_value(rf: RF, x: Int, var st: PS, var active: [Int], e: Env):
+  let k = rf.vals[x].kind
+  if k == rc_rf.RV_INSTR:
+    for p in rc_ops.value_operands(rf.vals[x].instr, e): cp_place(p, &st, active, e)
+    match rf.vals[x].instr:
+      rc_hir.JsxExpression(builtin, _, tag, _, _, _, _, _, _, _, _):
+        if not builtin: st.tags[e.identifiers[tag.identifier].declaration_id] = true
+      _: nop()
+  elif k == rc_rf.RV_SEQ:
+    for ri in rf.vals[x].instrs: cp_instr(rf, ri, &st, &active, e)
+    cp_value(rf, rf.vals[x].a, &st, &active, e)
+  elif k == rc_rf.RV_COND:
+    cp_value(rf, rf.vals[x].a, &st, &active, e)
+    cp_value(rf, rf.vals[x].b, &st, &active, e)
+    cp_value(rf, rf.vals[x].c, &st, &active, e)
+  elif k == rc_rf.RV_LOGICAL:
+    cp_value(rf, rf.vals[x].a, &st, &active, e)
+    cp_value(rf, rf.vals[x].b, &st, &active, e)
+  elif k == rc_rf.RV_OPT: cp_value(rf, rf.vals[x].a, &st, &active, e)
+
+fn pt_block(rf: RF, b: Int, var st: PS, var e: Env):
+  for s in rf.blocks[b]:
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_INSTR: pt_value(rf, rf.instrs[rf.stmts[s].x].value, &st, &e)
+    elif k == rc_rf.ST_SCOPE:
+      let sid = rf.stmts[s].x
+      var ids: [Int] = []
+      for d in e.scopes[sid].dependencies: ids.push(d.identifier)
+      for d in e.scopes[sid].declarations: ids.push(d.identifier)
+      for id in ids:
+        if not named(e, id): promote_identifier(id, &st, &e)
+      pt_block(rf, rf.stmts[s].block, &st, &e)
+    elif k == rc_rf.ST_PRUNED:
+      let sid = rf.stmts[s].x
+      var ids: [Int] = []
+      for d in e.scopes[sid].declarations: ids.push(d.identifier)
+      for id in ids:
+        let dd = e.identifiers[id].declaration_id
+        if not named(e, id) and dd in st.pruned and st.pruned[dd].used_outside: promote_identifier(id, &st, &e)
+      pt_block(rf, rf.stmts[s].block, &st, &e)
+    else:
+      var ks: [Int] = []
+      var xs: [Int] = []
+      parts(rf.terms[rf.stmts[s].x], &ks, &xs)
+      for i in 0..ks.len:
+        if ks[i] == 1: pt_block(rf, xs[i], &st, &e)
+        else: pt_value(rf, xs[i], &st, &e)
+
+fn pt_value(rf: RF, x: Int, var st: PS, var e: Env):
+  let k = rf.vals[x].kind
+  if k == rc_rf.RV_INSTR:
+    let fid = rc_ops.value_func(rf.vals[x].instr)
+    if fid >= 0: visit_hir_function_for_promotion(fid, &st, &e)
+  elif k == rc_rf.RV_SEQ:
+    for ri in rf.vals[x].instrs: pt_value(rf, rf.instrs[ri].value, &st, &e)
+    pt_value(rf, rf.vals[x].a, &st, &e)
+  elif k == rc_rf.RV_COND:
+    pt_value(rf, rf.vals[x].a, &st, &e)
+    pt_value(rf, rf.vals[x].b, &st, &e)
+    pt_value(rf, rf.vals[x].c, &st, &e)
+  elif k == rc_rf.RV_LOGICAL:
+    pt_value(rf, rf.vals[x].a, &st, &e)
+    pt_value(rf, rf.vals[x].b, &st, &e)
+  elif k == rc_rf.RV_OPT: pt_value(rf, rf.vals[x].a, &st, &e)
+
+fn visit_hir_function_for_promotion(fid: Int, var st: PS, var e: Env):
+  var ps: [Int] = []
+  for p in e.functions[fid].params: ps.push(p.place.identifier)
+  for id in ps:
+    if not named(e, id): promote_identifier(id, &st, &e)
+  var nested: [Int] = []
+  for bid in e.functions[fid].body.order:
+    for iid in e.functions[fid].body.blocks[bid].instructions:
+      let n = rc_ops.value_func(e.functions[fid].instructions[iid].value)
+      if n >= 0: nested.push(n)
+  for n in nested: visit_hir_function_for_promotion(n, &st, &e)
+
+fn pi_place(p: Place, var st: PS, inter: {Int: Bool}, consts: {Int: Bool}, var e: Env):
+  if p.identifier in inter:
+    let id = p.identifier
+    if inter[id] and not named(e, id) and not consts.get(id, false): promote_identifier(id, &st, &e)
+
+fn pi_block(rf: RF, b: Int, var st: PS, var inter: {Int: Bool}, var consts: {Int: Bool}, var globals: {Int: Bool}, var e: Env):
+  for s in rf.blocks[b]:
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_INSTR: pi_instr(rf, rf.stmts[s].x, &st, &inter, &consts, &globals, &e)
+    elif k == rc_rf.ST_SCOPE or k == rc_rf.ST_PRUNED: pi_block(rf, rf.stmts[s].block, &st, &inter, &consts, &globals, &e)
+    else:
+      let t = rf.terms[rf.stmts[s].x]
+      if t.kind == rc_rf.RT_RETURN or t.kind == rc_rf.RT_THROW or t.kind == rc_rf.RT_IF or t.kind == rc_rf.RT_SWITCH: pi_place(t.value, &st, inter, consts, &e)
+      if t.kind == rc_rf.RT_SWITCH:
+        for c in t.cases:
+          if c.has_test: pi_place(c.test, &st, inter, consts, &e)
+          if c.block >= 0: pi_block(rf, c.block, &st, &inter, &consts, &globals, &e)
+        continue
+      var ks: [Int] = []
+      var xs: [Int] = []
+      parts(t, &ks, &xs)
+      for i in 0..ks.len:
+        if t.kind == rc_rf.RT_TRY and i == 1 and t.has_binding: pi_place(t.value, &st, inter, consts, &e)
+        if ks[i] == 1: pi_block(rf, xs[i], &st, &inter, &consts, &globals, &e)
+        else: pi_value(rf, xs[i], &st, &inter, &consts, &globals, &e)
+
+fn pi_value(rf: RF, x: Int, var st: PS, var inter: {Int: Bool}, var consts: {Int: Bool}, var globals: {Int: Bool}, var e: Env):
+  let k = rf.vals[x].kind
+  if k == rc_rf.RV_INSTR:
+    for p in rc_ops.value_operands(rf.vals[x].instr, e): pi_place(p, &st, inter, consts, &e)
+  elif k == rc_rf.RV_SEQ:
+    for ri in rf.vals[x].instrs: pi_instr(rf, ri, &st, &inter, &consts, &globals, &e)
+    pi_value(rf, rf.vals[x].a, &st, &inter, &consts, &globals, &e)
+  elif k == rc_rf.RV_COND:
+    pi_value(rf, rf.vals[x].a, &st, &inter, &consts, &globals, &e)
+    pi_value(rf, rf.vals[x].b, &st, &inter, &consts, &globals, &e)
+    pi_value(rf, rf.vals[x].c, &st, &inter, &consts, &globals, &e)
+  elif k == rc_rf.RV_LOGICAL:
+    pi_value(rf, rf.vals[x].a, &st, &inter, &consts, &globals, &e)
+    pi_value(rf, rf.vals[x].b, &st, &inter, &consts, &globals, &e)
+  elif k == rc_rf.RV_OPT: pi_value(rf, rf.vals[x].a, &st, &inter, &consts, &globals, &e)
+
+fn is_const_kind(k: Int) -> Bool:
+  return k == rc_hir.IK_CONST or k == rc_hir.IK_HOISTED_CONST
+
+fn pi_instr(rf: RF, ri: Int, var st: PS, var inter: {Int: Bool}, var consts: {Int: Bool}, var globals: {Int: Bool}, var e: Env):
+  let x = rf.instrs[ri].value
+  if rf.vals[x].kind != rc_rf.RV_INSTR:
+    pi_value(rf, x, &st, &inter, &consts, &globals, &e)
+    return
+  let has = rf.instrs[ri].has_lvalue
+  let lid = rf.instrs[ri].lvalue.identifier
+  var group = 0      # 1 side effects, 2 declare, 3 load, 4 property load, 5 load global, 0 other
+  var const_store = false
+  match rf.vals[x].instr:
+    rc_hir.CallExpression(_, _, _): group = 1
+    rc_hir.MethodCall(_, p, _, _):
+      group = 1
+      consts[p.identifier] = true
+    rc_hir.Await(_, _): group = 1
+    rc_hir.PropertyStore(_, _, _, _, _, _): group = 1
+    rc_hir.PropertyDelete(_, _, _, _): group = 1
+    rc_hir.ComputedStore(_, _, _, _): group = 1
+    rc_hir.ComputedDelete(_, _, _): group = 1
+    rc_hir.PostfixUpdate(_, _, _, _): group = 1
+    rc_hir.PrefixUpdate(_, _, _, _): group = 1
+    rc_hir.StoreLocal(lv, _, _):
+      group = 1
+      if is_const_kind(lv.kind):
+        consts[lv.place.identifier] = true
+        const_store = true
+    rc_hir.StoreContext(lv, _, _):
+      group = 1
+      if is_const_kind(lv.kind):
+        consts[lv.place.identifier] = true
+        const_store = true
+    rc_hir.StoreGlobal(_, _, _): group = 1
+    rc_hir.Destructure(pat, kind, _, _):
+      group = 1
+      if is_const_kind(kind):
+        for p in rc_ops.pattern_operands(pat): consts[p.identifier] = true
+        const_store = true
+    rc_hir.DeclareContext(lv, _):
+      group = 2
+      if is_const_kind(lv.kind): consts[lv.place.identifier] = true
+    rc_hir.DeclareLocal(lv, _):
+      group = 2
+      if is_const_kind(lv.kind): consts[lv.place.identifier] = true
+    rc_hir.LoadContext(p, _, _):
+      group = 3
+      if has and not named(e, lid):
+        if consts.get(p.identifier, false): consts[lid] = true
+        inter[lid] = false
+    rc_hir.LoadLocal(p, _):
+      group = 3
+      if has and not named(e, lid):
+        if consts.get(p.identifier, false): consts[lid] = true
+        inter[lid] = false
+    rc_hir.PropertyLoad(o, _, _, _, _):
+      group = 4
+      if has:
+        if globals.get(o.identifier, false):
+          globals[lid] = true
+          consts[lid] = true
+        if not named(e, lid): inter[lid] = false
+    rc_hir.ComputedLoad(o, _, _):
+      group = 4
+      if has:
+        if globals.get(o.identifier, false):
+          globals[lid] = true
+          consts[lid] = true
+        if not named(e, lid): inter[lid] = false
+    rc_hir.LoadGlobal(_, _):
+      group = 5
+      if has: globals[lid] = true
+    _: nop()
+  for p in rc_ops.value_operands(rf.vals[x].instr, e): pi_place(p, &st, inter, consts, &e)
+  if group == 1:
+    if not const_store and (not has or named(e, lid)):
+      for k, var v in inter: v = true
+    if has and not named(e, lid): inter[lid] = false
+
+fn pa_place(id: Int, var st: PS, var e: Env):
+  if not named(e, id) and st.promoted.get(e.identifiers[id].declaration_id, false): promote_identifier(id, &st, &e)
+
+fn pa_block(rf: RF, b: Int, var st: PS, var e: Env):
+  for s in rf.blocks[b]:
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_INSTR: pa_instr(rf, rf.stmts[s].x, &st, &e)
+    elif k == rc_rf.ST_SCOPE or k == rc_rf.ST_PRUNED:
+      pa_block(rf, rf.stmts[s].block, &st, &e)
+      let sid = rf.stmts[s].x
+      var ids: [Int] = []
+      for d in e.scopes[sid].declarations: ids.push(d.identifier)
+      for d in e.scopes[sid].dependencies: ids.push(d.identifier)
+      for r in e.scopes[sid].reassignments: ids.push(r)
+      for id in ids: pa_place(id, &st, &e)
+    else:
+      let t = rf.terms[rf.stmts[s].x]
+      if t.kind == rc_rf.RT_RETURN or t.kind == rc_rf.RT_THROW or t.kind == rc_rf.RT_IF or t.kind == rc_rf.RT_SWITCH: pa_place(t.value.identifier, &st, &e)
+      if t.kind == rc_rf.RT_SWITCH:
+        for c in t.cases:
+          if c.has_test: pa_place(c.test.identifier, &st, &e)
+          if c.block >= 0: pa_block(rf, c.block, &st, &e)
+        continue
+      var ks: [Int] = []
+      var xs: [Int] = []
+      parts(t, &ks, &xs)
+      for i in 0..ks.len:
+        if t.kind == rc_rf.RT_TRY and i == 1 and t.has_binding: pa_place(t.value.identifier, &st, &e)
+        if ks[i] == 1: pa_block(rf, xs[i], &st, &e)
+        else: pa_value(rf, xs[i], &st, &e)
+
+fn pa_instr(rf: RF, ri: Int, var st: PS, var e: Env):
+  if rf.instrs[ri].has_lvalue: pa_place(rf.instrs[ri].lvalue.identifier, &st, &e)
+  pa_value(rf, rf.instrs[ri].value, &st, &e)
+
+fn pa_value(rf: RF, x: Int, var st: PS, var e: Env):
+  let k = rf.vals[x].kind
+  if k == rc_rf.RV_INSTR:
+    for p in rc_ops.value_operands(rf.vals[x].instr, e): pa_place(p.identifier, &st, &e)
+    let fid = rc_ops.value_func(rf.vals[x].instr)
+    if fid >= 0:
+      var ps: [Int] = []
+      for p in e.functions[fid].params: ps.push(p.place.identifier)
+      for id in ps: pa_place(id, &st, &e)
+  elif k == rc_rf.RV_SEQ:
+    for ri in rf.vals[x].instrs: pa_instr(rf, ri, &st, &e)
+    pa_value(rf, rf.vals[x].a, &st, &e)
+  elif k == rc_rf.RV_COND:
+    pa_value(rf, rf.vals[x].a, &st, &e)
+    pa_value(rf, rf.vals[x].b, &st, &e)
+    pa_value(rf, rf.vals[x].c, &st, &e)
+  elif k == rc_rf.RV_LOGICAL:
+    pa_value(rf, rf.vals[x].a, &st, &e)
+    pa_value(rf, rf.vals[x].b, &st, &e)
+  elif k == rc_rf.RV_OPT: pa_value(rf, rf.vals[x].a, &st, &e)
+
+# ---- rename_variables
+
+type RS:
+  seen: {Int: Str} = {}         # declaration -> its new name
+  stack: [{Str: Int}] = []
+  globals: {Str: Bool} = {}
+  names: {Str: Bool} = {}
+
+fn lookup(st: RS, name: Str) -> Bool:
+  for m in st.stack:
+    if name in m: return true
+  return false
+
+fn visit_identifier(var st: RS, id: Int, e: Env):
+  if e.identifiers[id].name_kind == 0: return
+  let d = e.identifiers[id].declaration_id
+  if d in st.seen: return
+  let orig = e.identifiers[id].name + ""
+  let promoted = e.identifiers[id].name_kind == 2
+  let temp = promoted and orig.startswith("#t")
+  let jsx = promoted and orig.startswith("#T")
+  var n = 0
+  var name = orig + ""
+  if temp:
+    name = "t{n}"
+    n += 1
+  elif jsx:
+    name = "T{n}"
+    n += 1
+  while lookup(st, name) or name in st.globals:
+    if temp: name = "t{n}"
+    elif jsx: name = "T{n}"
+    else: name = orig + "${n}"
+    n += 1
+  st.seen[d] = name + ""
+  let top = st.stack.len - 1
+  st.stack[top][name] = d
+  st.names[name] = true
+
+fn rename_variables(rf: RF, var e: Env):
+  var st = RS()
+  collect_globals_block(rf, rf.body, e, &st.globals)
+  st.stack.push({})
+  st.stack.push({})
+  for p in rf.params: visit_identifier(&st, p.place.identifier, e)
+  let ev = rc_rvisit.events(rf, e, false, true)
+  for i in 0..ev.k.len:
+    let k = ev.k[i]
+    if k == rc_rvisit.EV_PLACE or k == rc_rvisit.EV_LVALUE or k == rc_rvisit.EV_PARAM: visit_identifier(&st, ev.p[i].identifier, e)
+    elif k == rc_rvisit.EV_BLOCK_BEGIN:
+      if ev.b[i] == 0: st.stack.push({})
+    elif k == rc_rvisit.EV_BLOCK_END:
+      if ev.b[i] == 0: st.stack.pop()
+    elif k == rc_rvisit.EV_SCOPE_BEGIN:
+      var ids: [Int] = []
+      for d in e.scopes[ev.a[i]].declarations: ids.push(d.identifier)
+      for id in ids: visit_identifier(&st, id, e)
+  for i in 0..e.identifiers.len:
+    let d = e.identifiers[i].declaration_id
+    if d in st.seen and e.identifiers[i].name_kind != 0:
+      e.identifiers[i].name = st.seen[d] + ""
+      e.identifiers[i].name_kind = 1
+
+fn collect_globals_block(rf: RF, b: Int, e: Env, var g: {Str: Bool}):
+  for s in rf.blocks[b]:
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_INSTR: collect_globals_value(rf, rf.instrs[rf.stmts[s].x].value, e, &g)
+    elif k == rc_rf.ST_SCOPE or k == rc_rf.ST_PRUNED: collect_globals_block(rf, rf.stmts[s].block, e, &g)
+    else:
+      var ks: [Int] = []
+      var xs: [Int] = []
+      parts(rf.terms[rf.stmts[s].x], &ks, &xs)
+      for i in 0..ks.len:
+        if ks[i] == 1: collect_globals_block(rf, xs[i], e, &g)
+        else: collect_globals_value(rf, xs[i], e, &g)
+
+fn collect_globals_value(rf: RF, x: Int, e: Env, var g: {Str: Bool}):
+  let k = rf.vals[x].kind
+  if k == rc_rf.RV_INSTR:
+    match rf.vals[x].instr:
+      rc_hir.LoadGlobal(b, _): g[b.name] = true
+      _: nop()
+    let fid = rc_ops.value_func(rf.vals[x].instr)
+    if fid >= 0: collect_globals_hir(fid, e, &g)
+  elif k == rc_rf.RV_SEQ:
+    for ri in rf.vals[x].instrs: collect_globals_value(rf, rf.instrs[ri].value, e, &g)
+    collect_globals_value(rf, rf.vals[x].a, e, &g)
+  elif k == rc_rf.RV_COND:
+    collect_globals_value(rf, rf.vals[x].a, e, &g)
+    collect_globals_value(rf, rf.vals[x].b, e, &g)
+    collect_globals_value(rf, rf.vals[x].c, e, &g)
+  elif k == rc_rf.RV_LOGICAL:
+    collect_globals_value(rf, rf.vals[x].a, e, &g)
+    collect_globals_value(rf, rf.vals[x].b, e, &g)
+  elif k == rc_rf.RV_OPT: collect_globals_value(rf, rf.vals[x].a, e, &g)
+
+fn collect_globals_hir(fid: Int, e: Env, var g: {Str: Bool}):
+  for bid in e.functions[fid].body.order:
+    for iid in e.functions[fid].body.blocks[bid].instructions:
+      match e.functions[fid].instructions[iid].value:
+        rc_hir.LoadGlobal(b, _): g[b.name] = true
+        _: nop()
+      let n = rc_ops.value_func(e.functions[fid].instructions[iid].value)
+      if n >= 0: collect_globals_hir(n, e, &g)

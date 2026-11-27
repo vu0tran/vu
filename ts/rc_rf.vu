@@ -1,0 +1,817 @@
+# The React Compiler's ReactiveFunction (oxc_react_compiler 1.94.0, react_compiler_hir/reactive.rs)
+# and BuildReactiveFunction (react_compiler_reactive_scopes/build_reactive_function.rs): the HIR's
+# control-flow graph turned back into a tree of blocks, statements and values, with the reactive
+# scopes as blocks. The tree lives in tables (RF): a block is a list of statement indices; a
+# statement is an instruction, a terminal or a (pruned) scope with its own block; values nest
+# by index. Names follow the Rust source.
+
+import rc_hir
+import rc_env
+import rc_diags
+import rc_ops
+import rc_visit
+from rc_hir import Sp, Place, HirFunction, InstrValue, Terminal, Param
+from rc_env import Env
+
+fn nop():
+  return
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var r = xs[0..xs.len]
+  return r
+
+fn noplace() -> Place:
+  return Place(-1, rc_hir.EF_UNKNOWN, false, rc_hir.nosp())
+
+# ReactiveValue
+const RV_INSTR = 0
+const RV_LOGICAL = 1
+const RV_COND = 2
+const RV_SEQ = 3
+const RV_OPT = 4
+
+# a: left / test / the inner value; b: right / consequent; c: alternate
+type RVal:
+  kind: Int
+  instr: InstrValue = rc_hir.Debugger(Sp(-1, -1))
+  op: Int = 0
+  a: Int = -1
+  b: Int = -1
+  c: Int = -1
+  instrs: [Int] = []
+  id: Int = 0
+  optional: Bool = false
+
+type RInstr:
+  id: Int
+  has_lvalue: Bool
+  lvalue: Place
+  value: Int
+  sp: Sp
+
+# ReactiveStatement
+const ST_INSTR = 0
+const ST_TERM = 1
+const ST_SCOPE = 2
+const ST_PRUNED = 3
+
+# x: the instruction or terminal index, or the scope id; block: a scope's block
+type RStmt:
+  kind: Int
+  x: Int
+  block: Int = -1
+
+# ReactiveTerminal
+const RT_BREAK = 0
+const RT_CONTINUE = 1
+const RT_RETURN = 2
+const RT_THROW = 3
+const RT_SWITCH = 4
+const RT_DOWHILE = 5
+const RT_WHILE = 6
+const RT_FOR = 7
+const RT_FOROF = 8
+const RT_FORIN = 9
+const RT_IF = 10
+const RT_LABEL = 11
+const RT_TRY = 12
+
+# ReactiveTerminalTargetKind
+const TK_IMPLICIT = 0
+const TK_LABELED = 1
+const TK_UNLABELED = 2
+
+type RCase:
+  has_test: Bool
+  test: Place
+  block: Int          # -1 none
+  sp: Sp
+
+# value: return/throw value, if/switch test, try handler binding (has_binding)
+# b1: loop block, consequent, label block, try block; b2: alternate (-1 none), handler
+# v1: init (for, for-of, for-in), test (while, do-while); v2: test (for, for-of); v3: update (-1)
+type RTerm:
+  kind: Int
+  id: Int = 0
+  target: Int = 0
+  target_kind: Int = 0
+  value: Place = Place(-1, 0, false, Sp(-1, -1))
+  has_binding: Bool = false
+  cases: [RCase] = []
+  b1: Int = -1
+  b2: Int = -1
+  v1: Int = -1
+  v2: Int = -1
+  v3: Int = -1
+  sp1: Sp = Sp(-1, -1)
+  sp2: Sp = Sp(-1, -1)
+  left_sp: Sp = Sp(-1, -1)
+  tsp: Sp = Sp(-1, -1)
+  has_label: Bool = false
+  label: Int = 0
+  implicit: Bool = false
+  sp: Sp = Sp(-1, -1)
+
+type RF:
+  stmts: [RStmt] = []
+  instrs: [RInstr] = []
+  vals: [RVal] = []
+  terms: [RTerm] = []
+  blocks: [[Int]] = []
+  body: Int = 0
+  params: [Param] = []
+  has_self: Bool = false
+  self_binding: Place = Place(-1, 0, false, Sp(-1, -1))
+  fn_type: Int = 2
+
+fn new_block(var rf: RF) -> Int:
+  rf.blocks.push([])
+  return rf.blocks.len - 1
+
+fn add_val(var rf: RF, own v: RVal) -> Int:
+  rf.vals.push(v)
+  return rf.vals.len - 1
+
+fn add_instr(var rf: RF, id: Int, has_lv: Bool, lv: Place, value: Int, sp: Sp) -> Int:
+  rf.instrs.push(RInstr(id, has_lv, lv, value, sp))
+  return rf.instrs.len - 1
+
+fn add_stmt(var rf: RF, kind: Int, x: Int, block: Int) -> Int:
+  rf.stmts.push(RStmt(kind, x, block))
+  return rf.stmts.len - 1
+
+fn add_term(var rf: RF, own t: RTerm) -> Int:
+  rf.terms.push(t)
+  return rf.terms.len - 1
+
+fn push_instr_stmt(var rf: RF, b: Int, ri: Int):
+  let s = add_stmt(&rf, ST_INSTR, ri, -1)
+  rf.blocks[b].push(s)
+
+fn push_term_stmt(var rf: RF, b: Int, own t: RTerm):
+  let ti = add_term(&rf, t)
+  let s = add_stmt(&rf, ST_TERM, ti, -1)
+  rf.blocks[b].push(s)
+
+# ---- build_reactive_function
+
+# a control flow target: kind 0 if, 1 switch, 2 case, 3 loop
+type CFT:
+  kind: Int
+  block: Int
+  id: Int
+  continue_block: Int = -1
+  loop_block: Int = -1
+  owns_loop: Bool = false
+
+type Cx:
+  next_schedule_id: Int = 0
+  emitted: {Int: Bool} = {}
+  scope_fallthroughs: {Int: Bool} = {}
+  scheduled: {Int: Bool} = {}
+  catch_handlers: {Int: Bool} = {}
+  stack: [CFT] = []
+
+type Drv:
+  cx: Cx = Cx()
+  rf: RF = RF()
+  hf: HirFunction
+  moved: {Int: Bool} = {}
+  unreachable: {Int: Bool} = {}   # (the terminals are moved into the tree as they're visited)
+
+fn reachable(d: Drv, id: Int) -> Bool:
+  return not d.unreachable.get(id, false)
+
+fn schedule(var d: Drv, var e: Env, block: Int, kind: Int) -> Int:
+  let id = d.cx.next_schedule_id
+  d.cx.next_schedule_id += 1
+  if d.cx.scheduled.get(block, false):
+    rc_env.throw(&e, rc_diags.break_block_already_scheduled("{block}"))
+    return -1
+  d.cx.scheduled[block] = true
+  d.cx.stack.push(CFT(kind, block, id))
+  return id
+
+fn schedule_loop(var d: Drv, var e: Env, ft: Int, cont: Int, lb: Int) -> Int:
+  let id = d.cx.next_schedule_id
+  d.cx.next_schedule_id += 1
+  d.cx.scheduled[ft] = true
+  if d.cx.scheduled.get(cont, false):
+    rc_env.throw(&e, rc_diags.continue_block_already_scheduled("{cont}"))
+    return -1
+  d.cx.scheduled[cont] = true
+  var owns = false
+  if lb >= 0:
+    owns = not d.cx.scheduled.get(lb, false)
+    d.cx.scheduled[lb] = true
+  d.cx.stack.push(CFT(3, ft, id, cont, lb, owns))
+  return id
+
+fn unschedule(var d: Drv, var e: Env, sid: Int):
+  if d.cx.stack.len == 0: return
+  let last = d.cx.stack.pop()
+  if last.id != sid:
+    rc_env.throw(&e, rc_diags.invariant_can_only_unschedule_last_target())
+    return
+  if last.kind == 3:
+    d.cx.scheduled.remove(last.block)
+    d.cx.scheduled.remove(last.continue_block)
+    if last.owns_loop and last.loop_block >= 0: d.cx.scheduled.remove(last.loop_block)
+  else: d.cx.scheduled.remove(last.block)
+
+fn unschedule_all(var d: Drv, var e: Env, ids: [Int]):
+  var i = ids.len - 1
+  while i >= 0:
+    unschedule(&d, &e, ids[i])
+    if e.failed: return
+    i -= 1
+
+fn is_scheduled(d: Drv, b: Int) -> Bool:
+  return d.cx.scheduled.get(b, false) or d.cx.catch_handlers.get(b, false)
+
+# get_break_target: false when there is none (thrown)
+fn get_break_target(d: Drv, var e: Env, block: Int, var target: Int, var kind: Int) -> Bool:
+  var pl = false
+  var i = d.cx.stack.len - 1
+  while i >= 0:
+    let t = d.cx.stack[i]
+    if t.block == block:
+      if t.kind == 3:
+        if pl: kind = TK_LABELED
+        else: kind = TK_UNLABELED
+      elif i == d.cx.stack.len - 1: kind = TK_IMPLICIT
+      else: kind = TK_LABELED
+      target = t.block
+      return true
+    pl = pl or t.kind == 3
+    i -= 1
+  rc_env.throw(&e, rc_diags.expected_break_target("{block}"))
+  return false
+
+fn get_continue_target(d: Drv, block: Int, var target: Int, var kind: Int) -> Bool:
+  var pl = false
+  var i = d.cx.stack.len - 1
+  while i >= 0:
+    let t = d.cx.stack[i]
+    if t.kind == 3 and t.continue_block == block:
+      if pl: kind = TK_LABELED
+      elif i == d.cx.stack.len - 1: kind = TK_IMPLICIT
+      else: kind = TK_UNLABELED
+      target = t.block
+      return true
+    pl = pl or t.kind == 3
+    i -= 1
+  return false
+
+# an HIR instruction's value moved into the tree (each is emitted once)
+fn take_value(var d: Drv, iid: Int) -> Int:
+  var v = rc_hir.Debugger(rc_hir.nosp())
+  swap(&v, &d.hf.instructions[iid].value)
+  d.moved[iid] = true
+  return add_val(&d.rf, RVal(kind: RV_INSTR, instr: v))
+
+fn instr_from_hir(var d: Drv, iid: Int) -> Int:
+  let id = d.hf.instructions[iid].id
+  let lv = d.hf.instructions[iid].lvalue
+  let sp = d.hf.instructions[iid].sp
+  let v = take_value(&d, iid)
+  return add_instr(&d.rf, id, true, lv, v, sp)
+
+fn build_reactive_function(own hf: HirFunction, var e: Env) -> RF:
+  var params: [Param] = []
+  for p in hf.params: params.push(p)
+  var d = Drv(hf: hf)
+  d.rf.params = params
+  var unr: {Int: Bool} = {}
+  for bid in d.hf.body.order:
+    match d.hf.body.blocks[bid].terminal:
+      rc_hir.Unreachable(_, _): unr[bid] = true
+      _: nop()
+  d.unreachable = unr
+  d.rf.has_self = d.hf.has_self
+  d.rf.self_binding = d.hf.self_binding
+  d.rf.fn_type = d.hf.fn_type
+  let body = new_block(&d.rf)
+  d.rf.body = body
+  visit_block(&d, &e, d.hf.body.entry, body)
+  var rf = RF()
+  swap(&rf, &d.rf)
+  return rf
+
+fn traverse_block(var d: Drv, var e: Env, bid: Int) -> Int:
+  let b = new_block(&d.rf)
+  visit_block(&d, &e, bid, b)
+  return b
+
+fn label_of(var t: RTerm, ft: Int):
+  if ft >= 0:
+    t.has_label = true
+    t.label = ft
+
+fn visit_block(var d: Drv, var e: Env, bid0: Int, out: Int):
+  var bid = bid0
+  while true:
+    if d.cx.emitted.get(bid, false):
+      rc_env.throw(&e, rc_diags.block_already_emitted("{bid}"))
+      return
+    d.cx.emitted[bid] = true
+    let ins = copy_ints(d.hf.body.blocks[bid].instructions)
+    var term = rc_hir.Unreachable(0, rc_hir.nosp())
+    swap(&term, &d.hf.body.blocks[bid].terminal)
+    var tsp = rc_visit.term_sp(term)
+    if tsp.s < 0: tsp = Sp(0, 0)
+    for iid in ins:
+      let ri = instr_from_hir(&d, iid)
+      push_instr_stmt(&d.rf, out, ri)
+    var ids: [Int] = []
+    var next = -1
+    match term:
+      rc_hir.If(test, cons, csp, alt, asp, ft, id, _):
+        var fid = -1
+        if reachable(d, ft) and not is_scheduled(d, ft): fid = ft
+        var alt_id = -1
+        if alt != ft: alt_id = alt
+        if fid >= 0:
+          ids.push(schedule(&d, &e, fid, 0))
+          if e.failed: return
+        if is_scheduled(d, cons):
+          rc_env.throw(&e, rc_diags.if_consequent_already_scheduled("{cons}"))
+          return
+        let cb = traverse_block(&d, &e, cons)
+        if e.failed: return
+        var ab = -1
+        if alt_id >= 0:
+          if is_scheduled(d, alt_id):
+            rc_env.throw(&e, rc_diags.if_alternate_already_scheduled("{alt_id}"))
+            return
+          ab = traverse_block(&d, &e, alt_id)
+          if e.failed: return
+        unschedule_all(&d, &e, ids)
+        if e.failed: return
+        var t = RTerm(kind: RT_IF, id: id, value: test, b1: cb, b2: ab, sp1: csp, sp2: asp, sp: tsp)
+        label_of(&t, fid)
+        push_term_stmt(&d.rf, out, t)
+        next = fid
+      rc_hir.Switch(test, cases, ft, id, _):
+        var fid = -1
+        if reachable(d, ft) and not is_scheduled(d, ft): fid = ft
+        if fid >= 0:
+          ids.push(schedule(&d, &e, fid, 1))
+          if e.failed: return
+        var rcs: [RCase] = []
+        var ci = cases.len - 1
+        while ci >= 0:
+          let cbid = cases[ci].block
+          if is_scheduled(d, cbid):
+            if cbid != ft:
+              rc_env.throw(&e, rc_diags.invariant_unexpected_switch_where_case_already_scheduled_and_block_not_fallthrough())
+              return
+            ci -= 1
+            continue
+          let cb = traverse_block(&d, &e, cbid)
+          if e.failed: return
+          ids.push(schedule(&d, &e, cbid, 2))
+          if e.failed: return
+          rcs.push(RCase(cases[ci].has_test, cases[ci].test, cb, cases[ci].sp))
+          ci -= 1
+        var rev: [RCase] = []
+        var k = rcs.len - 1
+        while k >= 0:
+          rev.push(RCase(rcs[k].has_test, rcs[k].test, rcs[k].block, rcs[k].sp))
+          k -= 1
+        unschedule_all(&d, &e, ids)
+        if e.failed: return
+        var t = RTerm(kind: RT_SWITCH, id: id, value: test, cases: rev, sp: tsp)
+        label_of(&t, fid)
+        push_term_stmt(&d.rf, out, t)
+        next = fid
+      rc_hir.DoWhile(lb, lsp, test, ft, id, sp):
+        var fid = -1
+        if not is_scheduled(d, ft): fid = ft
+        var lid = -1
+        if not is_scheduled(d, lb) and lb != ft: lid = lb
+        ids.push(schedule_loop(&d, &e, ft, test, lb))
+        if e.failed: return
+        if lid < 0:
+          rc_env.throw(&e, rc_diags.invariant_unexpected_do_while_where_loop_already_scheduled())
+          return
+        let body = traverse_block(&d, &e, lid)
+        if e.failed: return
+        let tr = visit_value_block(&d, &e, test, sp, -1)
+        if e.failed: return
+        unschedule_all(&d, &e, ids)
+        if e.failed: return
+        var t = RTerm(kind: RT_DOWHILE, id: id, b1: body, v1: tr.value, sp1: lsp, sp: tsp)
+        label_of(&t, fid)
+        push_term_stmt(&d.rf, out, t)
+        next = fid
+      rc_hir.While(test, lb, lsp, ft, id, sp):
+        var fid = -1
+        if reachable(d, ft) and not is_scheduled(d, ft): fid = ft
+        var lid = -1
+        if not is_scheduled(d, lb) and lb != ft: lid = lb
+        ids.push(schedule_loop(&d, &e, ft, test, lb))
+        if e.failed: return
+        let tr = visit_value_block(&d, &e, test, sp, -1)
+        if e.failed: return
+        if lid < 0:
+          rc_env.throw(&e, rc_diags.invariant_unexpected_while_where_loop_already_scheduled())
+          return
+        let body = traverse_block(&d, &e, lid)
+        if e.failed: return
+        unschedule_all(&d, &e, ids)
+        if e.failed: return
+        var t = RTerm(kind: RT_WHILE, id: id, b1: body, v1: tr.value, sp1: lsp, sp: tsp)
+        label_of(&t, fid)
+        push_term_stmt(&d.rf, out, t)
+        next = fid
+      rc_hir.For(init, test, upd, lb, lsp, ft, id, sp):
+        var lid = -1
+        if not is_scheduled(d, lb) and lb != ft: lid = lb
+        var fid = -1
+        if not is_scheduled(d, ft): fid = ft
+        var cont = test
+        if upd >= 0: cont = upd
+        ids.push(schedule_loop(&d, &e, ft, cont, lb))
+        if e.failed: return
+        let ir = visit_value_block(&d, &e, init, sp, -1)
+        if e.failed: return
+        let iv = value_block_result_to_sequence(&d, ir, sp)
+        let tr = visit_value_block(&d, &e, test, sp, -1)
+        if e.failed: return
+        var uv = -1
+        if upd >= 0:
+          let ur = visit_value_block(&d, &e, upd, sp, -1)
+          if e.failed: return
+          uv = ur.value
+        if lid < 0:
+          rc_env.throw(&e, rc_diags.invariant_unexpected_where_loop_already_scheduled())
+          return
+        let body = traverse_block(&d, &e, lid)
+        if e.failed: return
+        unschedule_all(&d, &e, ids)
+        if e.failed: return
+        var t = RTerm(kind: RT_FOR, id: id, b1: body, v1: iv, v2: tr.value, v3: uv, sp1: lsp, sp: tsp)
+        label_of(&t, fid)
+        push_term_stmt(&d.rf, out, t)
+        next = fid
+      rc_hir.ForOf(init, test, lb, lsp, left_sp, ft, id, sp):
+        var lid = -1
+        if not is_scheduled(d, lb) and lb != ft: lid = lb
+        var fid = -1
+        if not is_scheduled(d, ft): fid = ft
+        ids.push(schedule_loop(&d, &e, ft, init, lb))
+        if e.failed: return
+        let ir = visit_value_block(&d, &e, init, sp, -1)
+        if e.failed: return
+        let iv = value_block_result_to_sequence(&d, ir, sp)
+        let tr = visit_value_block(&d, &e, test, sp, -1)
+        if e.failed: return
+        let tv = value_block_result_to_sequence(&d, tr, sp)
+        if lid < 0:
+          rc_env.throw(&e, rc_diags.invariant_unexpected_where_loop_already_scheduled_2())
+          return
+        let body = traverse_block(&d, &e, lid)
+        if e.failed: return
+        unschedule_all(&d, &e, ids)
+        if e.failed: return
+        var t = RTerm(kind: RT_FOROF, id: id, b1: body, v1: iv, v2: tv, sp1: lsp, left_sp: left_sp, tsp: sp, sp: tsp)
+        label_of(&t, fid)
+        push_term_stmt(&d.rf, out, t)
+        next = fid
+      rc_hir.ForIn(init, lb, lsp, left_sp, ft, id, sp):
+        var lid = -1
+        if not is_scheduled(d, lb) and lb != ft: lid = lb
+        var fid = -1
+        if not is_scheduled(d, ft): fid = ft
+        ids.push(schedule_loop(&d, &e, ft, init, lb))
+        if e.failed: return
+        let ir = visit_value_block(&d, &e, init, sp, -1)
+        if e.failed: return
+        let iv = value_block_result_to_sequence(&d, ir, sp)
+        if lid < 0:
+          rc_env.throw(&e, rc_diags.invariant_unexpected_where_loop_already_scheduled_3())
+          return
+        let body = traverse_block(&d, &e, lid)
+        if e.failed: return
+        unschedule_all(&d, &e, ids)
+        if e.failed: return
+        var t = RTerm(kind: RT_FORIN, id: id, b1: body, v1: iv, sp1: lsp, left_sp: left_sp, tsp: sp, sp: tsp)
+        label_of(&t, fid)
+        push_term_stmt(&d.rf, out, t)
+        next = fid
+      rc_hir.Label(lb, bsp, ft, id, _):
+        var fid = -1
+        if reachable(d, ft) and not is_scheduled(d, ft): fid = ft
+        if fid >= 0:
+          ids.push(schedule(&d, &e, fid, 0))
+          if e.failed: return
+        if is_scheduled(d, lb):
+          rc_env.throw(&e, rc_diags.invariant_unexpected_label_where_block_already_scheduled())
+          return
+        let body = traverse_block(&d, &e, lb)
+        if e.failed: return
+        unschedule_all(&d, &e, ids)
+        if e.failed: return
+        var t = RTerm(kind: RT_LABEL, id: id, b1: body, sp1: bsp, sp: tsp)
+        label_of(&t, fid)
+        push_term_stmt(&d.rf, out, t)
+        next = fid
+      rc_hir.Goto(gb, variant, id, _):
+        if variant == rc_hir.GV_BREAK:
+          visit_break(&d, &e, gb, id, tsp, out)
+          if e.failed: return
+        elif variant == rc_hir.GV_CONTINUE:
+          visit_continue(&d, &e, gb, id, tsp, out)
+          if e.failed: return
+      rc_hir.MaybeThrow(cont, _, _, _, _, _):
+        if not is_scheduled(d, cont): next = cont
+      rc_hir.Try(tb, bsp, has_b, binding, h, hsp, ft, id, _):
+        var fid = -1
+        if reachable(d, ft) and not is_scheduled(d, ft): fid = ft
+        if fid >= 0:
+          ids.push(schedule(&d, &e, fid, 0))
+          if e.failed: return
+        d.cx.catch_handlers[h] = true
+        let body = traverse_block(&d, &e, tb)
+        if e.failed: return
+        let hb = traverse_block(&d, &e, h)
+        if e.failed: return
+        unschedule_all(&d, &e, ids)
+        if e.failed: return
+        var t = RTerm(kind: RT_TRY, id: id, value: binding, has_binding: has_b, b1: body, b2: hb, sp1: bsp, sp2: hsp, sp: tsp)
+        label_of(&t, fid)
+        push_term_stmt(&d.rf, out, t)
+        next = fid
+      rc_hir.Scope(ft, sb, scope, _, _):
+        var fid = -1
+        if not is_scheduled(d, ft): fid = ft
+        if fid >= 0:
+          ids.push(schedule(&d, &e, fid, 0))
+          if e.failed: return
+          d.cx.scope_fallthroughs[fid] = true
+        if is_scheduled(d, sb):
+          rc_env.throw(&e, rc_diags.invariant_unexpected_scope_where_block_already_scheduled())
+          return
+        let body = traverse_block(&d, &e, sb)
+        if e.failed: return
+        unschedule_all(&d, &e, ids)
+        if e.failed: return
+        let s = add_stmt(&d.rf, ST_SCOPE, scope, body)
+        d.rf.blocks[out].push(s)
+        next = fid
+      rc_hir.PrunedScope(ft, sb, scope, _, _):
+        var fid = -1
+        if not is_scheduled(d, ft): fid = ft
+        if fid >= 0:
+          ids.push(schedule(&d, &e, fid, 0))
+          if e.failed: return
+          d.cx.scope_fallthroughs[fid] = true
+        if is_scheduled(d, sb):
+          rc_env.throw(&e, rc_diags.invariant_unexpected_scope_where_block_already_scheduled_2())
+          return
+        let body = traverse_block(&d, &e, sb)
+        if e.failed: return
+        unschedule_all(&d, &e, ids)
+        if e.failed: return
+        let s = add_stmt(&d.rf, ST_PRUNED, scope, body)
+        d.rf.blocks[out].push(s)
+        next = fid
+      rc_hir.Return(v, _, id, _, _, _): push_term_stmt(&d.rf, out, RTerm(kind: RT_RETURN, id: id, value: v, sp: tsp))
+      rc_hir.Throw(v, id, _): push_term_stmt(&d.rf, out, RTerm(kind: RT_THROW, id: id, value: v, sp: tsp))
+      rc_hir.Unreachable(_, _): nop()
+      rc_hir.Branch(test, cons, alt, _, id, _):
+        var cb = -1
+        if is_scheduled(d, cons):
+          cb = new_block(&d.rf)
+          visit_break(&d, &e, cons, id, tsp, cb)
+          if e.failed: return
+        else:
+          cb = traverse_block(&d, &e, cons)
+          if e.failed: return
+        if is_scheduled(d, alt):
+          rc_env.throw(&e, rc_diags.invariant_unexpected_branch_where_alternate_already_scheduled())
+          return
+        let ab = traverse_block(&d, &e, alt)
+        if e.failed: return
+        push_term_stmt(&d.rf, out, RTerm(kind: RT_IF, id: id, value: test, b1: cb, b2: ab, sp: tsp))
+      _:
+        # Sequence, Optional, Ternary, Logical
+        let ft = rc_visit.fallthrough(term)
+        var fid = -1
+        if not is_scheduled(d, ft): fid = ft
+        if fid >= 0:
+          ids.push(schedule(&d, &e, fid, 0))
+          if e.failed: return
+        let r = visit_value_block_terminal(&d, &e, term)
+        if e.failed: return
+        unschedule_all(&d, &e, ids)
+        if e.failed: return
+        let ri = add_instr(&d.rf, r.id, true, r.place, r.value, rc_visit.term_sp(term))
+        push_instr_stmt(&d.rf, out, ri)
+        next = fid
+    if next < 0: return
+    bid = next
+
+type VBR:
+  block: Int
+  place: Place
+  value: Int
+  id: Int
+
+fn visit_value_block(var d: Drv, var e: Env, bid: Int, sp: Sp, ft: Int) -> VBR:
+  let bad = VBR(-1, noplace(), -1, 0)
+  if ft >= 0 and bid == ft:
+    rc_env.throw(&e, rc_diags.unexpected_value_block_fallthrough("{bid}"))
+    return bad
+  let ins = copy_ints(d.hf.body.blocks[bid].instructions)
+  var kind = 0
+  var test = noplace()
+  var tid = 0
+  var cont = -1
+  match d.hf.body.blocks[bid].terminal:
+    rc_hir.Branch(t, _, _, _, id, _):
+      kind = 1
+      test = t
+      tid = id
+    rc_hir.Goto(_, _, _, _): kind = 2
+    rc_hir.MaybeThrow(c, _, _, _, _, _):
+      kind = 3
+      cont = c
+    _: kind = 4
+  if kind == 1:
+    if ins.len == 0:
+      let v = add_val(&d.rf, RVal(kind: RV_INSTR, instr: rc_hir.LoadLocal(test, test.sp)))
+      return VBR(bid, test, v, tid)
+    return extract_value_block_result(&d, e, ins, bid)
+  if kind == 2:
+    if ins.len == 0:
+      rc_env.throw(&e, rc_diags.empty_goto("{bid}", rc_hir.nosp()))
+      return bad
+    return extract_value_block_result(&d, e, ins, bid)
+  if kind == 3:
+    var cgoto = false
+    match d.hf.body.blocks[cont].terminal:
+      rc_hir.Goto(_, _, _, _): cgoto = true
+      _: nop()
+    if d.hf.body.blocks[cont].instructions.len == 0 and cgoto: return extract_value_block_result(&d, e, ins, cont)
+    let c = visit_value_block(&d, &e, cont, sp, ft)
+    if e.failed: return bad
+    return wrap_with_sequence(&d, ins, c)
+  var term = rc_hir.Unreachable(0, rc_hir.nosp())
+  swap(&term, &d.hf.body.blocks[bid].terminal)
+  let init = visit_value_block_terminal(&d, &e, term)
+  swap(&term, &d.hf.body.blocks[bid].terminal)
+  if e.failed: return bad
+  let ii = add_instr(&d.rf, init.id, true, init.place, init.value, sp)
+  let fin = visit_value_block(&d, &e, init.fallthrough, sp, -1)
+  if e.failed: return bad
+  var all: [Int] = []
+  for iid in ins: all.push(instr_from_hir(&d, iid))
+  all.push(ii)
+  let v = add_val(&d.rf, RVal(kind: RV_SEQ, instrs: all, id: fin.id, a: fin.value))
+  return VBR(fin.block, fin.place, v, fin.id)
+
+type VTR:
+  value: Int
+  place: Place
+  fallthrough: Int
+  id: Int
+
+fn visit_test_block(var d: Drv, var e: Env, tb: Int, sp: Sp, kind: Str, var cons: Int, var alt: Int, var bsp: Sp) -> VBR:
+  let t = visit_value_block(&d, &e, tb, sp, -1)
+  if e.failed: return t
+  match d.hf.body.blocks[t.block].terminal:
+    rc_hir.Branch(_, c, a, _, _, s):
+      cons = c
+      alt = a
+      bsp = s
+    _:
+      rc_env.throw(&e, rc_env.diag(rc_env.EC_INVARIANT, "Expected a branch terminal for {kind} test block, got {rc_visit_name(d.hf.body.blocks[t.block].terminal)}"))
+  return t
+
+fn rc_visit_name(t: Terminal) -> Str:
+  match t:
+    rc_hir.Goto(_, _, _, _): return "Discriminant(4)"
+    rc_hir.MaybeThrow(_, _, _, _, _, _): return "Discriminant(18)"
+    _: return "Discriminant(?)"
+  return ""
+
+fn visit_value_block_terminal(var d: Drv, var e: Env, t: Terminal) -> VTR:
+  let bad = VTR(-1, noplace(), -1, 0)
+  match t:
+    rc_hir.Sequence(b, ft, id, sp):
+      let r = visit_value_block(&d, &e, b, sp, ft)
+      if e.failed: return bad
+      return VTR(r.value, r.place, ft, id)
+    rc_hir.Optional(optional, test, ft, id, sp):
+      var cons = -1
+      var alt = -1
+      var bsp = rc_hir.nosp()
+      let tr = visit_test_block(&d, &e, test, sp, "optional", &cons, &alt, &bsp)
+      if e.failed: return bad
+      let c = visit_value_block(&d, &e, cons, sp, ft)
+      if e.failed: return bad
+      let ti = add_instr(&d.rf, tr.id, true, tr.place, tr.value, bsp)
+      let call = add_val(&d.rf, RVal(kind: RV_SEQ, instrs: [ti], id: c.id, a: c.value))
+      let v = add_val(&d.rf, RVal(kind: RV_OPT, a: call, optional: optional))
+      return VTR(v, c.place, ft, id)
+    rc_hir.Logical(op, test, ft, id, sp):
+      var cons = -1
+      var alt = -1
+      var bsp = rc_hir.nosp()
+      let tr = visit_test_block(&d, &e, test, sp, "logical", &cons, &alt, &bsp)
+      if e.failed: return bad
+      let lf = visit_value_block(&d, &e, cons, sp, ft)
+      if e.failed: return bad
+      let ti = add_instr(&d.rf, tr.id, true, tr.place, tr.value, sp)
+      let left = add_val(&d.rf, RVal(kind: RV_SEQ, instrs: [ti], id: lf.id, a: lf.value))
+      let right = visit_value_block(&d, &e, alt, sp, ft)
+      if e.failed: return bad
+      let v = add_val(&d.rf, RVal(kind: RV_LOGICAL, op: op, a: left, b: right.value))
+      return VTR(v, lf.place, ft, id)
+    rc_hir.Ternary(test, ft, id, sp):
+      var cons = -1
+      var alt = -1
+      var bsp = rc_hir.nosp()
+      let tr = visit_test_block(&d, &e, test, sp, "ternary", &cons, &alt, &bsp)
+      if e.failed: return bad
+      let c = visit_value_block(&d, &e, cons, sp, ft)
+      if e.failed: return bad
+      let a = visit_value_block(&d, &e, alt, sp, ft)
+      if e.failed: return bad
+      let v = add_val(&d.rf, RVal(kind: RV_COND, a: tr.value, b: c.value, c: a.value))
+      return VTR(v, c.place, ft, id)
+    rc_hir.MaybeThrow(_, _, _, _, _, _):
+      rc_env.throw(&e, rc_diags.invariant_unexpected_maybe_throw_visit_value_block_terminal())
+      return bad
+    rc_hir.Label(_, _, _, _, _):
+      rc_env.throw(&e, rc_diags.todo_support_labeled_statements_combined_value_blocks_not_yet_implemented())
+      return bad
+    _:
+      rc_env.throw(&e, rc_diags.invariant_unsupported_terminal_kind_value_block())
+      return bad
+  return bad
+
+fn extract_value_block_result(var d: Drv, e: Env, ins: [Int], bid: Int) -> VBR:
+  let last = ins[ins.len - 1]
+  var rem: [Int] = []
+  for i in 0..ins.len - 1: rem.push(instr_from_hir(&d, ins[i]))
+  let lid = d.hf.instructions[last].id
+  var place = d.hf.instructions[last].lvalue
+  var v = -1
+  var unnamed_store = false
+  var sv = noplace()
+  match d.hf.instructions[last].value:
+    rc_hir.StoreLocal(lv, val, _):
+      if e.identifiers[lv.place.identifier].name_kind == 0:
+        unnamed_store = true
+        sv = val
+        place = lv.place
+    _: nop()
+  if unnamed_store:
+    d.moved[last] = true
+    v = add_val(&d.rf, RVal(kind: RV_INSTR, instr: rc_hir.LoadLocal(sv, sv.sp)))
+  else: v = take_value(&d, last)
+  if rem.len == 0: return VBR(bid, place, v, lid)
+  let s = add_val(&d.rf, RVal(kind: RV_SEQ, instrs: rem, id: lid, a: v))
+  return VBR(bid, place, s, lid)
+
+fn wrap_with_sequence(var d: Drv, ins: [Int], c: VBR) -> VBR:
+  if ins.len == 0: return c
+  var all: [Int] = []
+  for iid in ins: all.push(instr_from_hir(&d, iid))
+  let v = add_val(&d.rf, RVal(kind: RV_SEQ, instrs: all, id: c.id, a: c.value))
+  return VBR(c.block, c.place, v, c.id)
+
+fn value_block_result_to_sequence(var d: Drv, r: VBR, sp: Sp) -> Int:
+  var instrs: [Int] = []
+  var inner = r.value
+  while d.rf.vals[inner].kind == RV_SEQ:
+    for x in d.rf.vals[inner].instrs: instrs.push(x)
+    inner = d.rf.vals[inner].a
+  var same = false
+  match d.rf.vals[inner].instr:
+    rc_hir.LoadLocal(p, _):
+      same = d.rf.vals[inner].kind == RV_INSTR and p.identifier == r.place.identifier
+    _: nop()
+  if not same: instrs.push(add_instr(&d.rf, r.id, true, r.place, inner, sp))
+  let u = add_val(&d.rf, RVal(kind: RV_INSTR, instr: rc_hir.Primitive(rc_hir.Prim(1, false, 0.0, ""), sp)))
+  return add_val(&d.rf, RVal(kind: RV_SEQ, instrs: instrs, id: r.id, a: u))
+
+fn visit_break(var d: Drv, var e: Env, block: Int, id: Int, sp: Sp, out: Int):
+  var target = 0
+  var kind = 0
+  if not get_break_target(d, &e, block, &target, &kind): return
+  if d.cx.scope_fallthroughs.get(target, false):
+    if kind != TK_IMPLICIT: rc_env.throw(&e, rc_diags.invariant_expected_reactive_scope_implicitly_break_fallthrough())
+    return
+  push_term_stmt(&d.rf, out, RTerm(kind: RT_BREAK, id: id, target: target, target_kind: kind, sp: sp))
+
+fn visit_continue(var d: Drv, var e: Env, block: Int, id: Int, sp: Sp, out: Int):
+  var target = 0
+  var kind = 0
+  if not get_continue_target(d, block, &target, &kind):
+    rc_env.throw(&e, rc_diags.expected_continue_target("{block}"))
+    return
+  push_term_stmt(&d.rf, out, RTerm(kind: RT_CONTINUE, id: id, target: target, target_kind: kind, sp: sp))

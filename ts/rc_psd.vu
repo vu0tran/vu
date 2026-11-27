@@ -1,0 +1,1086 @@
+# PropagateScopeDependenciesHIR (oxc_react_compiler 1.94.0, react_compiler_inference/
+# propagate_scope_dependencies_hir.rs): each reactive scope's dependencies, the minimal set of
+# values (with property paths) read inside it and declared before it, after the property loads
+# that are safe to hoist (known non-null on every path) and optional chains are accounted for.
+# Function names follow the Rust source.
+
+import rc_hir
+import rc_env
+import rc_ops
+import rc_visit
+import rc_cfg
+import rc_dce
+import rc_dom
+import rc_gdefs
+import rc_scopes
+from rc_hir import Sp, Place, HirFunction, InstrValue, Terminal, DepPathEntry, PropLit
+from rc_env import Env, SDep
+
+fn nop():
+  return
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var r = xs[0..xs.len]
+  return r
+
+fn cp_plit(p: PropLit) -> PropLit:
+  return PropLit(p.is_num, p.s + "", p.num)
+
+fn cp_entry(x: DepPathEntry) -> DepPathEntry:
+  return DepPathEntry(cp_plit(x.property), x.computed, x.optional, x.sp)
+
+fn cp_path(xs: [DepPathEntry]) -> [DepPathEntry]:
+  var r: [DepPathEntry] = []
+  for x in xs: r.push(cp_entry(x))
+  return r
+
+fn cp_dep(d: SDep) -> SDep:
+  return SDep(d.identifier, d.reactive, cp_path(d.path), d.sp)
+
+fn cp_dep_list(xs: [SDep]) -> [SDep]:
+  var out: [SDep] = []
+  for x in xs: out.push(cp_dep(x))
+  return out
+
+fn plit_eq(a: PropLit, b: PropLit) -> Bool:
+  if a.is_num != b.is_num: return false
+  if a.is_num: return a.num == b.num
+  return a.s == b.s
+
+# a property literal as a map key
+fn plit_key(p: PropLit) -> Str:
+  if p.is_num: return "n{p.num}"
+  return "s" + p.s
+
+fn plit_is(p: PropLit, s: Str) -> Bool:
+  return not p.is_num and p.s == s
+
+fn are_equal_paths(a: [DepPathEntry], b: [DepPathEntry]) -> Bool:
+  if a.len != b.len: return false
+  for i in 0..a.len:
+    if not plit_eq(a[i].property, b[i].property) or a[i].optional != b[i].optional: return false
+  return true
+
+fn or_sp(a: Sp, b: Sp) -> Sp:
+  if a.s >= 0: return a
+  return b
+
+# ---- ScopeBlockTraversal (react_compiler_hir/visitors.rs): kind 1 begin, 2 end
+
+type SBT:
+  active: [Int] = []
+  info_kind: {Int: Int} = {}
+  info_scope: {Int: Int} = {}
+  info_pruned: {Int: Bool} = {}
+
+fn record_scopes(var t: SBT, f: HirFunction, bid: Int):
+  if bid in t.info_kind:
+    if t.info_kind[bid] == 1: t.active.push(t.info_scope[bid])
+    elif t.active.len > 0: t.active.pop()
+  var sb = -1
+  var ft = -1
+  var s = -1
+  var pruned = false
+  match f.body.blocks[bid].terminal:
+    rc_hir.Scope(x, b, sc, _, _):
+      sb = b
+      ft = x
+      s = sc
+    rc_hir.PrunedScope(x, b, sc, _, _):
+      sb = b
+      ft = x
+      s = sc
+      pruned = true
+    _: nop()
+  if s >= 0:
+    t.info_kind[sb] = 1
+    t.info_scope[sb] = s
+    t.info_pruned[sb] = pruned
+    t.info_kind[ft] = 2
+    t.info_scope[ft] = s
+    t.info_pruned[ft] = pruned
+
+fn is_scope_active(t: SBT, s: Int) -> Bool:
+  for x in t.active:
+    if x == s: return true
+  return false
+
+fn current_scope(t: SBT) -> Int:
+  if t.active.len == 0: return -1
+  return t.active[t.active.len - 1]
+
+# ---- find_temporaries_used_outside_declaring_scope
+
+fn find_temporaries_used_outside_declaring_scope(f: HirFunction, e: Env) -> {Int: Bool}:
+  var decls: {Int: Int} = {}
+  var pruned: {Int: Bool} = {}
+  var t = SBT()
+  var used: {Int: Bool} = {}
+  for bid in f.body.order:
+    record_scopes(&t, f, bid)
+    if t.info_kind.get(bid, 0) == 1 and t.info_pruned.get(bid, false): pruned[t.info_scope[bid]] = true
+    for iid in f.body.blocks[bid].instructions:
+      for p in rc_ops.value_operands(f.instructions[iid].value, e): handle_place_outside(e, p.identifier, decls, t, pruned, &used)
+      let cs = current_scope(t)
+      if cs >= 0 and not pruned.get(cs, false):
+        var is_load = false
+        match f.instructions[iid].value:
+          rc_hir.LoadLocal(_, _): is_load = true
+          rc_hir.LoadContext(_, _, _): is_load = true
+          rc_hir.PropertyLoad(_, _, _, _, _): is_load = true
+          _: nop()
+        if is_load: decls[e.identifiers[f.instructions[iid].lvalue.identifier].declaration_id] = cs
+    for p in rc_ops.term_operands(f.body.blocks[bid].terminal): handle_place_outside(e, p.identifier, decls, t, pruned, &used)
+  return used
+
+fn handle_place_outside(e: Env, id: Int, decls: {Int: Int}, t: SBT, pruned: {Int: Bool}, var used: {Int: Bool}):
+  let d = e.identifiers[id].declaration_id
+  if d in decls:
+    let s = decls[d]
+    if not is_scope_active(t, s) and not pruned.get(s, false): used[d] = true
+
+# ---- collect_temporaries_sidemap
+
+fn get_property(object: Place, prop: PropLit, computed: Bool, optional: Bool, sp: Sp, psp: Sp, temps: {Int: SDep}) -> SDep:
+  let ps = or_sp(psp, sp)
+  if object.identifier in temps:
+    let r = temps[object.identifier]
+    var path = cp_path(r.path)
+    path.push(DepPathEntry(cp_plit(prop), computed, optional, ps))
+    return SDep(r.identifier, r.reactive, path, sp)
+  return SDep(object.identifier, object.reactive, [DepPathEntry(cp_plit(prop), computed, optional, ps)], sp)
+
+fn is_load_context_mutable(v: InstrValue, id: Int, e: Env) -> Bool:
+  match v:
+    rc_hir.LoadContext(p, _, _):
+      let s = e.identifiers[p.identifier].scope
+      if s >= 0: return id >= e.scopes[s].range.end
+    _: return false
+  return false
+
+fn in_context(f: HirFunction, id: Int) -> Bool:
+  for c in f.context:
+    if c.identifier == id: return true
+  return false
+
+fn collect_temporaries_sidemap_impl(f: HirFunction, e: Env, used: {Int: Bool}, var temps: {Int: SDep}, inner_ctx: Int):
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      var ord = f.instructions[iid].id
+      if inner_ctx >= 0: ord = inner_ctx
+      let lid = f.instructions[iid].lvalue.identifier
+      let uo = used.get(e.identifiers[lid].declaration_id, false)
+      match f.instructions[iid].value:
+        rc_hir.PropertyLoad(o, prop, computed, psp, sp):
+          if not uo and (inner_ctx < 0 or o.identifier in temps):
+            let d = get_property(o, prop, computed, false, sp, psp, temps)
+            temps[lid] = d
+        rc_hir.LoadLocal(p, sp):
+          if e.identifiers[lid].name_kind == 0 and e.identifiers[p.identifier].name_kind != 0 and not uo:
+            if inner_ctx < 0 or in_context(f, p.identifier): temps[lid] = SDep(p.identifier, p.reactive, [], sp)
+        rc_hir.LoadContext(p, sp, _):
+          if is_load_context_mutable(f.instructions[iid].value, ord, e) and e.identifiers[lid].name_kind == 0 and e.identifiers[p.identifier].name_kind != 0 and not uo:
+            if inner_ctx < 0 or in_context(f, p.identifier): temps[lid] = SDep(p.identifier, p.reactive, [], sp)
+        rc_hir.FunctionExpression(_, _, _, fid, _, _):
+          var c = f.instructions[iid].id
+          if inner_ctx >= 0: c = inner_ctx
+          collect_temporaries_sidemap_impl(e.functions[fid], e, used, &temps, c)
+        rc_hir.ObjectMethod(_, fid):
+          var c = f.instructions[iid].id
+          if inner_ctx >= 0: c = inner_ctx
+          collect_temporaries_sidemap_impl(e.functions[fid], e, used, &temps, c)
+        _: nop()
+
+# ---- collect_optional_chain_sidemap (processed: an instruction's lvalue id * 2, a block id * 2 + 1)
+
+type OCtx:
+  seen: {Int: Bool} = {}
+  processed: {Int: Bool} = {}
+  temps: {Int: SDep} = {}
+  hoistable: {Int: SDep} = {}
+
+fn traverse_function_optional(f: HirFunction, e: Env, var cx: OCtx):
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      let fid = rc_ops.value_func(f.instructions[iid].value)
+      if fid >= 0: traverse_function_optional(e.functions[fid], e, &cx)
+    var is_opt = false
+    match f.body.blocks[bid].terminal:
+      rc_hir.Optional(_, _, _, _, _): is_opt = true
+      _: nop()
+    if is_opt and not cx.seen.get(bid, false):
+      var r1 = -1
+      var r2 = -1
+      traverse_optional_block(bid, f, &cx, -1, &r1, &r2)
+
+type MCR:
+  ok: Bool = false
+  consequent_id: Int = 0
+  property: PropLit = PropLit(false, "", 0.0)
+  computed: Bool = false
+  property_id: Int = 0
+  store_local_lvalue_id: Int = 0
+  consequent_goto: Int = 0
+  property_load_sp: Sp = Sp(-1, -1)
+  property_sp: Sp = Sp(-1, -1)
+
+fn match_optional_test_block(t: Terminal, f: HirFunction) -> MCR:
+  var test_id = -1
+  var cons = -1
+  var alt = -1
+  match t:
+    rc_hir.Branch(tp, c, a, _, _, _):
+      test_id = tp.identifier
+      cons = c
+      alt = a
+    _: return MCR()
+  if not (cons in f.body.blocks): return MCR()
+  if f.body.blocks[cons].instructions.len != 2: return MCR()
+  let i0 = f.body.blocks[cons].instructions[0]
+  let i1 = f.body.blocks[cons].instructions[1]
+  var r = MCR()
+  var plo = -1
+  match f.instructions[i0].value:
+    rc_hir.PropertyLoad(o, prop, computed, psp, sp):
+      plo = o.identifier
+      r.property = cp_plit(prop)
+      r.computed = computed
+      r.property_load_sp = sp
+      r.property_sp = psp
+    _: return MCR()
+  var slv = -1
+  match f.instructions[i1].value:
+    rc_hir.StoreLocal(lv, v, _):
+      if v.identifier != f.instructions[i0].lvalue.identifier: return MCR()
+      slv = lv.place.identifier
+    _: return MCR()
+  if plo != test_id: return MCR()
+  match f.body.blocks[cons].terminal:
+    rc_hir.Goto(gb, variant, _, _):
+      if variant != rc_hir.GV_BREAK: return MCR()
+      if not (alt in f.body.blocks): return MCR()
+      if f.body.blocks[alt].instructions.len != 2: return MCR()
+      var ok = false
+      match f.instructions[f.body.blocks[alt].instructions[0]].value:
+        rc_hir.Primitive(_, _):
+          match f.instructions[f.body.blocks[alt].instructions[1]].value:
+            rc_hir.StoreLocal(_, _, _): ok = true
+            _: nop()
+        _: nop()
+      if not ok: return MCR()
+      r.ok = true
+      r.consequent_id = slv
+      r.property_id = f.instructions[i0].lvalue.identifier
+      r.store_local_lvalue_id = f.instructions[i1].lvalue.identifier
+      r.consequent_goto = gb
+      return r
+    _: return MCR()
+  return MCR()
+
+# returns false for None; else out_id, out_block
+fn traverse_optional_block(ob: Int, f: HirFunction, var cx: OCtx, outer_alt: Int, var out_id: Int, var out_block: Int) -> Bool:
+  cx.seen[ob] = true
+  var test_bid = -1
+  var is_optional = false
+  var ftb = -1
+  match f.body.blocks[ob].terminal:
+    rc_hir.Optional(o, t, x, _, _):
+      test_bid = t
+      is_optional = o
+      ftb = x
+    _: return false
+  if not (test_bid in f.body.blocks): return false
+  var inner_guard = -1
+  var tb = -1
+  var base = SDep(0, false, [], rc_hir.nosp())
+  var kind = 0
+  match f.body.blocks[test_bid].terminal:
+    rc_hir.Branch(_, _, _, _, _, _): kind = 1
+    rc_hir.Optional(_, _, _, _, _): kind = 2
+    _: return false
+  if kind == 1:
+    if not is_optional: return false
+    let ins = copy_ints(f.body.blocks[test_bid].instructions)
+    if ins.len == 0: return false
+    var first_place = Place(-1, 0, false, rc_hir.nosp())
+    match f.instructions[ins[0]].value:
+      rc_hir.LoadLocal(p, _): first_place = p
+      _: return false
+    var path: [DepPathEntry] = []
+    for i in 1..ins.len:
+      let prev_l = f.instructions[ins[i - 1]].lvalue.identifier
+      var good = false
+      match f.instructions[ins[i]].value:
+        rc_hir.PropertyLoad(o, prop, computed, psp, sp):
+          if o.identifier == prev_l:
+            path.push(DepPathEntry(cp_plit(prop), computed, false, or_sp(psp, sp)))
+            good = true
+        _: nop()
+      if not good: return false
+    let last_l = f.instructions[ins[ins.len - 1]].lvalue.identifier
+    var test_ident = -1
+    match f.body.blocks[test_bid].terminal:
+      rc_hir.Branch(tp, _, _, _, _, _): test_ident = tp.identifier
+      _: return false
+    if test_ident != last_l: return false
+    base = SDep(first_place.identifier, first_place.reactive, path, first_place.sp)
+    tb = test_bid
+  else:
+    var inner_ft = -1
+    match f.body.blocks[test_bid].terminal:
+      rc_hir.Optional(_, _, x, _, _): inner_ft = x
+      _: nop()
+    if not (inner_ft in f.body.blocks): return false
+    var inner_alt = -1
+    match f.body.blocks[inner_ft].terminal:
+      rc_hir.Branch(_, _, a, _, _, _): inner_alt = a
+      _: return false
+    var ioid = -1
+    var igb = -1
+    if not traverse_optional_block(test_bid, f, &cx, inner_alt, &ioid, &igb): return false
+    if not is_optional:
+      cx.processed.remove(igb * 2 + 1)
+      inner_guard = igb
+    var test_ident = -1
+    match f.body.blocks[inner_ft].terminal:
+      rc_hir.Branch(tp, _, _, _, _, _): test_ident = tp.identifier
+      _: return false
+    if test_ident != ioid: return false
+    if not is_optional:
+      if ioid in cx.temps: cx.hoistable[ob] = cp_dep(cx.temps[ioid])
+    if not (ioid in cx.temps): return false
+    base = cp_dep(cx.temps[ioid])
+    tb = inner_ft
+  if outer_alt >= 0:
+    var ta = -1
+    match f.body.blocks[tb].terminal:
+      rc_hir.Branch(_, _, a, _, _, _): ta = a
+      _: return false
+    if ta == outer_alt:
+      if f.body.blocks[ob].instructions.len > 0: return false
+  let mr = match_optional_test_block(f.body.blocks[tb].terminal, f)
+  if not mr.ok: return false
+  if mr.consequent_goto != ftb: return false
+  var p = cp_path(base.path)
+  p.push(DepPathEntry(cp_plit(mr.property), mr.computed, is_optional, or_sp(mr.property_sp, mr.property_load_sp)))
+  let load = SDep(base.identifier, base.reactive, p, mr.property_load_sp)
+  if inner_guard >= 0: cx.processed[inner_guard * 2 + 1] = true
+  cx.processed[mr.store_local_lvalue_id * 2] = true
+  cx.processed[tb * 2 + 1] = true
+  cx.temps[mr.consequent_id] = cp_dep(load)
+  cx.temps[mr.property_id] = load
+  out_id = mr.consequent_id
+  out_block = tb
+  return true
+
+# ---- the property path registry and the hoistable property loads
+
+type PNode:
+  props: {Str: Int} = {}
+  oprops: {Str: Int} = {}
+  full: SDep
+  has_optional: Bool = false
+
+type Reg:
+  nodes: [PNode] = []
+  roots: {Int: Int} = {}
+
+fn get_or_create_identifier(var r: Reg, id: Int, reactive: Bool, sp: Sp) -> Int:
+  if id in r.roots: return r.roots[id]
+  let idx = r.nodes.len
+  r.nodes.push(PNode(full: SDep(id, reactive, [], sp)))
+  r.roots[id] = idx
+  return idx
+
+fn get_or_create_property_entry(var r: Reg, parent: Int, entry: DepPathEntry) -> Int:
+  let k = plit_key(entry.property)
+  if entry.optional:
+    if k in r.nodes[parent].oprops: return r.nodes[parent].oprops[k]
+  elif k in r.nodes[parent].props: return r.nodes[parent].props[k]
+  let pho = r.nodes[parent].has_optional
+  let ident = r.nodes[parent].full.identifier
+  let reactive = r.nodes[parent].full.reactive
+  var np = cp_path(r.nodes[parent].full.path)
+  let idx = r.nodes.len
+  np.push(cp_entry(entry))
+  r.nodes.push(PNode(full: SDep(ident, reactive, np, entry.sp), has_optional: pho or entry.optional))
+  if entry.optional: r.nodes[parent].oprops[k] = idx
+  else: r.nodes[parent].props[k] = idx
+  return idx
+
+fn get_or_create_property(var r: Reg, d: SDep) -> Int:
+  var cur = get_or_create_identifier(&r, d.identifier, d.reactive, d.sp)
+  for x in d.path: cur = get_or_create_property_entry(&r, cur, x)
+  return cur
+
+fn bsearch(xs: [Int], x: Int) -> Int:
+  var lo = 0
+  var hi = xs.len
+  while lo < hi:
+    let m = (lo + hi) / 2
+    if xs[m] < x: lo = m + 1
+    else: hi = m
+  return lo
+
+fn set_has(xs: [Int], x: Int) -> Bool:
+  let i = bsearch(xs, x)
+  return i < xs.len and xs[i] == x
+
+fn set_insert(var xs: [Int], x: Int):
+  let i = bsearch(xs, x)
+  if i < xs.len and xs[i] == x: return
+  xs.push(0)
+  var j = xs.len - 1
+  while j > i:
+    xs[j] = xs[j - 1]
+    j -= 1
+  xs[i] = x
+
+fn set_remove(var xs: [Int], x: Int):
+  let i = bsearch(xs, x)
+  if i < xs.len and xs[i] == x:
+    var r: [Int] = []
+    for j in 0..xs.len:
+      if j != i: r.push(xs[j])
+    xs = r
+
+fn set_union(a: [Int], b: [Int]) -> [Int]:
+  var out: [Int] = []
+  var i = 0
+  var j = 0
+  while i < a.len and j < b.len:
+    if a[i] < b[j]:
+      out.push(a[i])
+      i += 1
+    elif b[j] < a[i]:
+      out.push(b[j])
+      j += 1
+    else:
+      out.push(a[i])
+      i += 1
+      j += 1
+  while i < a.len:
+    out.push(a[i])
+    i += 1
+  while j < b.len:
+    out.push(b[j])
+    j += 1
+  return out
+
+fn reduce_maybe_optional_chains(var nodes: [Int], var r: Reg):
+  var oc: [Int] = []
+  for x in nodes:
+    if r.nodes[x].has_optional: oc.push(x)
+  if oc.len == 0: return
+  while true:
+    var changed = false
+    let tp = copy_ints(oc)
+    for orig in tp:
+      let full = cp_dep(r.nodes[orig].full)
+      var cur = get_or_create_identifier(&r, full.identifier, full.reactive, full.sp)
+      for en in full.path:
+        if en.optional and set_has(nodes, cur): cur = get_or_create_property_entry(&r, cur, DepPathEntry(cp_plit(en.property), en.computed, false, en.sp))
+        else: cur = get_or_create_property_entry(&r, cur, en)
+      if cur != orig:
+        changed = true
+        set_remove(&oc, orig)
+        set_insert(&oc, cur)
+        set_remove(&nodes, orig)
+        set_insert(&nodes, cur)
+    if not changed: break
+
+type HCtx:
+  known_immutable: {Int: Bool} = {}
+  has_nested: Bool = false
+  nested_immutable: {Int: Bool} = {}
+  assumed_invoked: {Int: Bool} = {}
+
+fn is_immutable_at_instr(id: Int, ord: Int, e: Env, cx: HCtx) -> Bool:
+  if cx.has_nested: return cx.nested_immutable.get(id, false)
+  let r = e.identifiers[id].mutable_range
+  let s = e.identifiers[id].scope
+  var mut_at = false
+  if r.end > r.start + 1 and s >= 0:
+    let sr = e.scopes[s].range
+    mut_at = ord >= sr.start and ord < sr.end
+  return not mut_at or cx.known_immutable.get(id, false)
+
+# get_maybe_non_null_in_instruction: false for None
+fn maybe_non_null(v: InstrValue, temps: {Int: SDep}, var out: SDep) -> Bool:
+  match v:
+    rc_hir.PropertyLoad(o, _, _, _, _):
+      if o.identifier in temps: out = cp_dep(temps[o.identifier])
+      else: out = SDep(o.identifier, o.reactive, [], o.sp)
+      return true
+    rc_hir.Destructure(_, _, val, _):
+      if val.identifier in temps:
+        out = cp_dep(temps[val.identifier])
+        return true
+    rc_hir.ComputedLoad(o, _, _):
+      if o.identifier in temps:
+        out = cp_dep(temps[o.identifier])
+        return true
+    _: return false
+  return false
+
+# get_assumed_invoked_functions: temporaries map an identifier to (function, the functions it may
+# invoke)
+type AIF:
+  fid: {Int: Int} = {}
+  calls: {Int: [Int]} = {}
+  order: [Int] = []
+
+fn aif_set(var t: AIF, k: Int, fid: Int, calls: [Int]):
+  if not (k in t.fid): t.order.push(k)
+  t.fid[k] = fid
+  t.calls[k] = copy_ints(calls)
+
+fn get_assumed_invoked_functions(f: HirFunction, var e: Env) -> {Int: Bool}:
+  var t = AIF()
+  return assumed_impl(f, &e, &t)
+
+fn assumed_impl(f: HirFunction, var e: Env, var t: AIF) -> {Int: Bool}:
+  var hoistable: {Int: Bool} = {}
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      match f.instructions[iid].value:
+        rc_hir.FunctionExpression(_, _, _, fid, _, _): aif_set(&t, lid, fid, [])
+        rc_hir.StoreLocal(lv, v, _):
+          if v.identifier in t.fid:
+            let fx = t.fid[v.identifier]
+            let cs = copy_ints(t.calls[v.identifier])
+            aif_set(&t, lv.place.identifier, fx, cs)
+        rc_hir.LoadLocal(p, _):
+          if p.identifier in t.fid:
+            let fx = t.fid[p.identifier]
+            let cs = copy_ints(t.calls[p.identifier])
+            aif_set(&t, lid, fx, cs)
+        _: nop()
+  if t.fid.len == 0: return hoistable
+  let n0 = e.thrown.len
+  let failed0 = e.failed
+  let unconditional = rc_dom.compute_unconditional_blocks(f, &e, e.next_block)
+  if e.failed and not failed0:
+    e.failed = false
+    e.thrown.truncate(n0)
+  for bid in f.body.order:
+    for iid in f.body.blocks[bid].instructions:
+      let lid = f.instructions[iid].lvalue.identifier
+      match f.instructions[iid].value:
+        rc_hir.CallExpression(c, args, _):
+          if unconditional.get(bid, false):
+            if c.identifier in t.fid: hoistable[t.fid[c.identifier]] = true
+            elif rc_scopes.hook_kind_of_id(e, c.identifier) >= 0:
+              for a in args:
+                if a.kind == 0 and a.place.identifier in t.fid: hoistable[t.fid[a.place.identifier]] = true
+        rc_hir.FunctionExpression(_, _, _, fid, _, _):
+          var inner = rc_cfg.placeholder_function()
+          swap(&inner, &e.functions[fid])
+          let called = assumed_impl(inner, &e, &t)
+          swap(&inner, &e.functions[fid])
+          if lid in t.fid:
+            for k, _ in called:
+              var found = false
+              for x in t.calls[lid]:
+                if x == k: found = true
+              if not found: t.calls[lid].push(k)
+        _: nop()
+    match f.body.blocks[bid].terminal:
+      rc_hir.Return(v, _, _, _, _, _):
+        if v.identifier in t.fid: hoistable[t.fid[v.identifier]] = true
+      _: nop()
+  var changed = true
+  while changed:
+    changed = false
+    var add: [Int] = []
+    for k in t.order:
+      if hoistable.get(t.fid[k], false):
+        for c in t.calls[k]:
+          if not hoistable.get(c, false): add.push(c)
+    for x in add:
+      changed = true
+      hoistable[x] = true
+  return hoistable
+
+fn collect_non_nulls_in_blocks(f: HirFunction, var e: Env, cx: HCtx, temps: {Int: SDep}, hfo: {Int: SDep}, var r: Reg) -> {Int: [Int]}:
+  var known: [Int] = []
+  if f.fn_type == rc_hir.FN_COMPONENT and f.params.len > 0 and not f.params[0].spread:
+    let p = f.params[0].place
+    set_insert(&known, get_or_create_identifier(&r, p.identifier, true, p.sp))
+  var nodes: {Int: [Int]} = {}
+  for bid in f.body.order:
+    var assumed = copy_ints(known)
+    if bid in hfo: set_insert(&assumed, get_or_create_property(&r, hfo[bid]))
+    for iid in f.body.blocks[bid].instructions:
+      let ord = f.instructions[iid].id
+      var path = SDep(0, false, [], rc_hir.nosp())
+      if maybe_non_null(f.instructions[iid].value, temps, &path):
+        if is_immutable_at_instr(path.identifier, ord, e, cx): set_insert(&assumed, get_or_create_property(&r, path))
+      match f.instructions[iid].value:
+        rc_hir.StartMemoize(_, has_deps, deps, _, _, _, _):
+          if has_deps:
+            for d in deps:
+              if d.global: continue
+              if not is_immutable_at_instr(d.value.identifier, ord, e, cx): continue
+              for i in 0..d.path.len:
+                if d.path[i].optional: break
+                var sub: [DepPathEntry] = []
+                for j in 0..i: sub.push(cp_entry(d.path[j]))
+                set_insert(&assumed, get_or_create_property(&r, SDep(d.value.identifier, d.value.reactive, sub, d.sp)))
+        rc_hir.FunctionExpression(_, _, _, fid, _, _):
+          if cx.assumed_invoked.get(fid, false):
+            var nic = HCtx()
+            nic.has_nested = true
+            if cx.has_nested:
+              for k, _ in cx.nested_immutable: nic.nested_immutable[k] = true
+            else:
+              for p in e.functions[fid].context:
+                if is_immutable_at_instr(p.identifier, ord, e, cx): nic.nested_immutable[p.identifier] = true
+            var inner = rc_cfg.placeholder_function()
+            swap(&inner, &e.functions[fid])
+            nic.assumed_invoked = get_assumed_invoked_functions(inner, &e)
+            let inodes = collect_non_nulls_in_blocks(inner, &e, nic, temps, hfo, &r)
+            let iw = propagate_non_null(inner, inodes, &r)
+            let ie = inner.body.entry
+            swap(&inner, &e.functions[fid])
+            if ie in iw:
+              for x in iw[ie]: set_insert(&assumed, x)
+        _: nop()
+    nodes[bid] = assumed
+  return nodes
+
+type NNP:
+  ts: {Int: Int} = {}      # 1 active, 2 done
+
+fn propagate_non_null(f: HirFunction, nodes: {Int: [Int]}, var r: Reg) -> {Int: [Int]}:
+  var succ: {Int: [Int]} = {}
+  for bid in f.body.order:
+    for p in f.body.blocks[bid].preds:
+      if not (p in succ): succ[p] = []
+      set_insert(&succ[p], bid)
+  var working: {Int: [Int]} = {}
+  for k, v in nodes: working[k] = copy_ints(v)
+  let ids = copy_ints(f.body.order)
+  var rev: [Int] = []
+  var i = ids.len - 1
+  while i >= 0:
+    rev.push(ids[i])
+    i -= 1
+  for _ in 0..100:
+    var changed = false
+    var st = NNP()
+    for bid in ids:
+      if recursively_propagate_non_null(bid, true, &st, &working, f, succ, &r): changed = true
+    st = NNP()
+    for bid in rev:
+      if recursively_propagate_non_null(bid, false, &st, &working, f, succ, &r): changed = true
+    if not changed: break
+  return working
+
+fn recursively_propagate_non_null(id: Int, forward: Bool, var st: NNP, var working: {Int: [Int]}, f: HirFunction, succ: {Int: [Int]}, var r: Reg) -> Bool:
+  if id in st.ts: return false
+  st.ts[id] = 1
+  var nbrs: [Int] = []
+  if forward:
+    if id in f.body.blocks: nbrs = copy_ints(f.body.blocks[id].preds)
+  elif id in succ: nbrs = copy_ints(succ[id])
+  var changed = false
+  for n in nbrs:
+    if not (n in st.ts):
+      if recursively_propagate_non_null(n, forward, &st, &working, f, succ, &r): changed = true
+  var inter: [Int] = []
+  var has_done = false
+  for n in nbrs:
+    if st.ts.get(n, 0) != 2: continue
+    if not (n in working): continue
+    if has_done:
+      var ni: [Int] = []
+      for x in inter:
+        if set_has(working[n], x): ni.push(x)
+      inter = ni
+    else:
+      inter = copy_ints(working[n])
+      has_done = true
+  let prev = copy_ints(working[id])
+  var objs = copy_ints(prev)
+  if has_done: objs = set_union(prev, inter)
+  reduce_maybe_optional_chains(&objs, &r)
+  st.ts[id] = 2
+  if objs.len != prev.len: changed = true
+  else:
+    for j in 0..objs.len:
+      if objs[j] != prev[j]: changed = true
+  working[id] = objs
+  return changed
+
+# ---- ReactiveScopeDependencyTreeHIR: hoistable nodes (access 0 optional, 1 non-null) and
+# dependency nodes (access 0 optional access, 1 unconditional access, 2 optional dependency,
+# 3 unconditional dependency); children by property key, the dependency ones in insertion order
+
+type HNode:
+  props: {Str: Int} = {}
+  access: Int = 1
+
+type DNode:
+  keys: [Str] = []
+  props: {Str: Int} = {}
+  prop: [PropLit] = []
+  access: Int = 1
+  computed: Bool = false
+  sp: Sp = Sp(-1, -1)
+
+type Tree:
+  hn: [HNode] = []
+  hroots: {Int: Int} = {}
+  dn: [DNode] = []
+  droots: [Int] = []           # identifier ids in insertion order
+  droot: {Int: Int} = {}
+  dreactive: {Int: Bool} = {}
+
+fn is_optional_access(a: Int) -> Bool:
+  return a == 0 or a == 2
+
+fn is_dependency_access(a: Int) -> Bool:
+  return a == 2 or a == 3
+
+fn merge_access(a: Int, b: Int) -> Int:
+  let uncond = not (is_optional_access(a) and is_optional_access(b))
+  let dep = is_dependency_access(a) or is_dependency_access(b)
+  if uncond and dep: return 3
+  if uncond: return 1
+  if dep: return 2
+  return 0
+
+fn first_optional(d: SDep) -> Bool:
+  return d.path.len > 0 and d.path[0].optional
+
+fn new_tree(r: Reg, idxs: [Int]) -> Tree:
+  var t = Tree()
+  # (sorted with the deps whose first entry is optional first, stably)
+  var sorted: [Int] = []
+  for x in idxs:
+    if first_optional(r.nodes[x].full): sorted.push(x)
+  for x in idxs:
+    if not first_optional(r.nodes[x].full): sorted.push(x)
+  for x in sorted:
+    let d = r.nodes[x].full
+    if not (d.identifier in t.hroots):
+      var acc = 1
+      if first_optional(d): acc = 0
+      t.hroots[d.identifier] = t.hn.len
+      t.hn.push(HNode(access: acc))
+    var cur = t.hroots[d.identifier]
+    for i in 0..d.path.len:
+      var acc = 1
+      if i + 1 < d.path.len and d.path[i + 1].optional: acc = 0
+      let k = plit_key(d.path[i].property)
+      if not (k in t.hn[cur].props):
+        let ni = t.hn.len
+        t.hn.push(HNode(access: acc))
+        t.hn[cur].props[k] = ni
+      cur = t.hn[cur].props[k]
+  return t
+
+fn add_dependency(var t: Tree, d: SDep):
+  var hp = t.hroots.get(d.identifier, -1)
+  var plen = d.path.len
+  for idx in 0..d.path.len:
+    let entry = d.path[idx]
+    var nonnull = false
+    if hp >= 0: nonnull = t.hn[hp].access == 1
+    if not nonnull and not entry.optional:
+      plen = idx
+      var j = idx - 1
+      while j >= 0:
+        if d.path[j].optional:
+          plen = j
+          break
+        j -= 1
+      break
+    if hp >= 0: hp = t.hn[hp].props.get(plit_key(entry.property), -1)
+  if not (d.identifier in t.droot):
+    t.droot[d.identifier] = t.dn.len
+    t.droots.push(d.identifier)
+    t.dreactive[d.identifier] = d.reactive
+    t.dn.push(DNode(access: 1, computed: false, sp: d.sp))
+  var cur = t.droot[d.identifier]
+  hp = t.hroots.get(d.identifier, -1)
+  for i in 0..plen:
+    let entry = d.path[i]
+    let k = plit_key(entry.property)
+    var nh = -1
+    if hp >= 0: nh = t.hn[hp].props.get(k, -1)
+    var acc = 0
+    if hp >= 0 and t.hn[hp].access == 1: acc = 1
+    elif entry.optional: acc = 0
+    else: break
+    if not (k in t.dn[cur].props):
+      let ni = t.dn.len
+      t.dn.push(DNode(access: acc, computed: entry.computed, sp: entry.sp))
+      t.dn[cur].props[k] = ni
+      t.dn[cur].keys.push(k)
+      t.dn[cur].prop.push(cp_plit(entry.property))
+    let child = t.dn[cur].props[k]
+    t.dn[child].access = merge_access(t.dn[child].access, acc)
+    if entry.computed: t.dn[child].computed = true
+    cur = child
+    hp = nh
+  t.dn[cur].access = merge_access(t.dn[cur].access, 2)
+
+fn derive_minimal_dependencies(t: Tree) -> [SDep]:
+  var out: [SDep] = []
+  for id in t.droots: collect_minimal(t, t.droot[id], t.dreactive[id], id, [], &out)
+  return out
+
+fn collect_minimal(t: Tree, n: Int, reactive: Bool, root: Int, path: [DepPathEntry], var out: [SDep]):
+  if is_dependency_access(t.dn[n].access): out.push(SDep(root, reactive, cp_path(path), t.dn[n].sp))
+  var pc = false
+  for x in path:
+    if x.optional: pc = true
+  if not is_dependency_access(t.dn[n].access) or pc:
+    for ki in 0..t.dn[n].keys.len:
+      let c = t.dn[n].props[t.dn[n].keys[ki]]
+      if is_dependency_access(t.dn[n].access) and is_optional_access(t.dn[c].access): continue
+      var np = cp_path(path)
+      np.push(DepPathEntry(cp_plit(t.dn[n].prop[ki]), t.dn[c].computed, is_optional_access(t.dn[c].access), t.dn[c].sp))
+      collect_minimal(t, c, reactive, root, np, &out)
+
+# ---- collect_dependencies
+
+type Decl:
+  id: Int
+  stack: [Int]
+
+type DCtx:
+  decls: {Int: Decl} = {}          # by declaration id
+  reassign: {Int: Decl} = {}       # by identifier id
+  stack: [Int] = []
+  dep_stack: [[SDep]] = []
+  dep_scopes: [Int] = []           # deps: scope -> its dependencies, in insertion order
+  deps: {Int: [SDep]} = {}
+  inner_ctx: Int = -1
+
+fn cp_decl(d: Decl) -> Decl:
+  return Decl(d.id, copy_ints(d.stack))
+
+fn enter_scope(var cx: DCtx, s: Int):
+  cx.dep_stack.push([])
+  cx.stack.push(s)
+
+fn exit_scope(var cx: DCtx, s: Int, pruned: Bool, e: Env):
+  var scoped: [SDep] = []
+  if cx.dep_stack.len > 0: scoped = cx.dep_stack.pop()
+  if cx.stack.len > 0: cx.stack.pop()
+  for d in scoped:
+    if check_valid_dependency(cx, d, e) and cx.dep_stack.len > 0:
+      let n = cx.dep_stack.len
+      cx.dep_stack[n - 1].push(cp_dep(d))
+  if not pruned:
+    if not (s in cx.deps): cx.dep_scopes.push(s)
+    cx.deps[s] = scoped
+
+fn declare(var cx: DCtx, id: Int, ord: Int, e: Env):
+  if cx.inner_ctx >= 0: return
+  let d = e.identifiers[id].declaration_id
+  if not (d in cx.decls): cx.decls[d] = Decl(ord, copy_ints(cx.stack))
+  cx.reassign[id] = Decl(ord, copy_ints(cx.stack))
+
+fn has_declared(cx: DCtx, id: Int, e: Env) -> Bool:
+  return e.identifiers[id].declaration_id in cx.decls
+
+fn check_valid_dependency(cx: DCtx, d: SDep, e: Env) -> Bool:
+  if cx.stack.len == 0: return false
+  return check_valid_dependency_in_scope(cx, d, cx.stack[cx.stack.len - 1], e)
+
+fn check_valid_dependency_in_scope(cx: DCtx, d: SDep, s: Int, e: Env) -> Bool:
+  if rc_scopes.obj_shape_of(e, d.identifier) == rc_gdefs.BUILT_IN_REF_VALUE_ID: return false
+  match e.types[e.identifiers[d.identifier].type_]:
+    rc_hir.TObjectMethod: return false
+    _: nop()
+  var did = -1
+  if d.identifier in cx.reassign: did = cx.reassign[d.identifier].id
+  elif e.identifiers[d.identifier].declaration_id in cx.decls: did = cx.decls[e.identifiers[d.identifier].declaration_id].id
+  else: return false
+  return did < e.scopes[s].range.start
+
+fn visit_operand(var cx: DCtx, p: Place, temps: {Int: SDep}, var e: Env):
+  if p.identifier in temps: visit_dependency(&cx, cp_dep(temps[p.identifier]), &e)
+  else: visit_dependency(&cx, SDep(p.identifier, p.reactive, [], p.sp), &e)
+
+fn visit_operand_root(var cx: DCtx, p: Place, temps: {Int: SDep}, var e: Env):
+  if p.identifier in temps:
+    let r = temps[p.identifier]
+    visit_dependency(&cx, SDep(r.identifier, r.reactive, [], r.sp), &e)
+  else: visit_dependency(&cx, SDep(p.identifier, p.reactive, [], p.sp), &e)
+
+fn visit_dependency(var cx: DCtx, own d0: SDep, var e: Env):
+  var d = d0
+  let decl_id = e.identifiers[d.identifier].declaration_id
+  if decl_id in cx.decls and cx.decls[decl_id].stack.len > 0:
+    let os = copy_ints(cx.decls[decl_id].stack)
+    for s in os:
+      var in_stack = false
+      for x in cx.stack:
+        if x == s: in_stack = true
+      if in_stack: continue
+      var already = false
+      for x in e.scopes[s].declarations:
+        if e.identifiers[x.identifier].declaration_id == decl_id: already = true
+      if not already: e.scopes[s].declarations.push(rc_env.SDecl(d.identifier, d.identifier, os[os.len - 1]))
+  if rc_scopes.obj_shape_of(e, d.identifier) == rc_gdefs.BUILT_IN_USE_REF_ID and d.path.len > 0 and plit_is(d.path[0].property, "current"):
+    d = SDep(d.identifier, d.reactive, [], d.sp)
+  elif cx.inner_ctx >= 0:
+    var idx = -1
+    for i in 0..d.path.len:
+      if idx < 0 and plit_is(d.path[i].property, "current"): idx = i
+    if idx >= 0: d.path.truncate(idx)
+  if check_valid_dependency(cx, d, e) and cx.dep_stack.len > 0:
+    let n = cx.dep_stack.len
+    cx.dep_stack[n - 1].push(d)
+
+fn visit_reassignment(var cx: DCtx, p: Place, var e: Env):
+  let d = SDep(p.identifier, p.reactive, [], p.sp)
+  let decl_id = e.identifiers[p.identifier].declaration_id
+  for s in copy_ints(cx.stack):
+    var already = false
+    for x in e.scopes[s].reassignments:
+      if e.identifiers[x].declaration_id == decl_id: already = true
+    if not already and check_valid_dependency_in_scope(cx, d, s, e): e.scopes[s].reassignments.push(p.identifier)
+
+fn is_deferred_instr(lid: Int, temps: {Int: SDep}, processed: {Int: Bool}) -> Bool:
+  return processed.get(lid * 2, false) or lid in temps
+
+fn is_hoisted_kind(k: Int) -> Bool:
+  return k == rc_hir.IK_HOISTED_LET or k == rc_hir.IK_HOISTED_CONST or k == rc_hir.IK_HOISTED_FUNCTION
+
+fn handle_instruction(f: HirFunction, iid: Int, semantic_only: Bool, var cx: DCtx, temps: {Int: SDep}, processed: {Int: Bool}, var e: Env):
+  let ord = f.instructions[iid].id
+  let lid = f.instructions[iid].lvalue.identifier
+  declare(&cx, lid, ord, e)
+  if semantic_only:
+    for p in rc_ops.value_operands(f.instructions[iid].value, e): visit_operand_root(&cx, p, temps, &e)
+    return
+  if is_deferred_instr(lid, temps, processed): return
+  match f.instructions[iid].value:
+    rc_hir.PropertyLoad(o, prop, computed, psp, sp): visit_dependency(&cx, get_property(o, prop, computed, false, sp, psp, temps), &e)
+    rc_hir.StoreLocal(lv, v, _):
+      visit_operand(&cx, v, temps, &e)
+      if lv.kind == rc_hir.IK_REASSIGN: visit_reassignment(&cx, lv.place, &e)
+      declare(&cx, lv.place.identifier, ord, e)
+    rc_hir.DeclareLocal(lv, _):
+      if not is_hoisted_kind(lv.kind): declare(&cx, lv.place.identifier, ord, e)
+    rc_hir.DeclareContext(lv, _):
+      if not is_hoisted_kind(lv.kind): declare(&cx, lv.place.identifier, ord, e)
+    rc_hir.Destructure(pat, kind, v, _):
+      visit_operand(&cx, v, temps, &e)
+      for p in rc_ops.pattern_operands(pat):
+        if kind == rc_hir.IK_REASSIGN: visit_reassignment(&cx, p, &e)
+        declare(&cx, p.identifier, ord, e)
+    rc_hir.StoreContext(lv, v, _):
+      if not has_declared(cx, lv.place.identifier, e) or lv.kind != rc_hir.IK_REASSIGN: declare(&cx, lv.place.identifier, ord, e)
+      visit_operand(&cx, lv.place, temps, &e)
+      visit_operand(&cx, v, temps, &e)
+    _:
+      for p in rc_ops.value_operands(f.instructions[iid].value, e): visit_operand(&cx, p, temps, &e)
+
+# find_semantic_only_caught_instructions (dead_code_elimination.rs): instruction id -> true
+fn find_semantic_only_caught_instructions(f: HirFunction, e: Env) -> {Int: Bool}:
+  var cands: [Int] = []
+  for bid in f.body.order:
+    var caught = false
+    match f.body.blocks[bid].terminal:
+      rc_hir.MaybeThrow(_, h, _, _, _, _): caught = h >= 0
+      _: nop()
+    if not caught: continue
+    for iid in f.body.blocks[bid].instructions:
+      if rc_cfg.value_may_throw(f.instructions[iid].value): cands.push(iid)
+  var out: {Int: Bool} = {}
+  if cands.len == 0: return out
+  let s = rc_dce.find_referenced_identifiers(f, e, false)
+  for iid in cands:
+    if not rc_dce.used(s, e, f.instructions[iid].lvalue.identifier): out[iid] = true
+  return out
+
+fn visit_inner_function_blocks(fid: Int, var cx: DCtx, temps: {Int: SDep}, processed: {Int: Bool}, var e: Env):
+  var inner = rc_cfg.placeholder_function()
+  swap(&inner, &e.functions[fid])
+  let so = find_semantic_only_caught_instructions(inner, e)
+  for bid in inner.body.order:
+    for ph in inner.body.blocks[bid].phis:
+      for op in ph.ops:
+        if op.identifier in temps: visit_dependency(&cx, cp_dep(temps[op.identifier]), &e)
+    for iid in inner.body.blocks[bid].instructions:
+      let nf = rc_ops.value_func(inner.instructions[iid].value)
+      if nf >= 0:
+        declare(&cx, inner.instructions[iid].lvalue.identifier, inner.instructions[iid].id, e)
+        visit_inner_function_blocks(nf, &cx, temps, processed, &e)
+      else: handle_instruction(inner, iid, so.get(iid, false), &cx, temps, processed, &e)
+    if not processed.get(bid * 2 + 1, false):
+      for op in rc_ops.term_operands(inner.body.blocks[bid].terminal): visit_operand(&cx, op, temps, &e)
+  swap(&inner, &e.functions[fid])
+
+fn collect_dependencies(f: HirFunction, var e: Env, temps: {Int: SDep}, processed: {Int: Bool}) -> DCtx:
+  let so = find_semantic_only_caught_instructions(f, e)
+  var cx = DCtx()
+  for p in f.params: declare(&cx, p.place.identifier, 0, e)
+  var t = SBT()
+  for bid in f.body.order:
+    record_scopes(&t, f, bid)
+    let k = t.info_kind.get(bid, 0)
+    if k == 1: enter_scope(&cx, t.info_scope[bid])
+    elif k == 2: exit_scope(&cx, t.info_scope[bid], t.info_pruned[bid], e)
+    for ph in f.body.blocks[bid].phis:
+      for op in ph.ops:
+        if op.identifier in temps: visit_dependency(&cx, cp_dep(temps[op.identifier]), &e)
+    for iid in f.body.blocks[bid].instructions:
+      let fid = rc_ops.value_func(f.instructions[iid].value)
+      if fid >= 0:
+        declare(&cx, f.instructions[iid].lvalue.identifier, f.instructions[iid].id, e)
+        let prev = cx.inner_ctx
+        if cx.inner_ctx < 0: cx.inner_ctx = f.instructions[iid].id
+        visit_inner_function_blocks(fid, &cx, temps, processed, &e)
+        cx.inner_ctx = prev
+      else: handle_instruction(f, iid, so.get(iid, false), &cx, temps, processed, &e)
+    if not processed.get(bid * 2 + 1, false):
+      for op in rc_ops.term_operands(f.body.blocks[bid].terminal): visit_operand(&cx, op, temps, &e)
+  return cx
+
+# ---- the pass
+
+fn propagate_scope_dependencies_hir(var f: HirFunction, var e: Env):
+  let used = find_temporaries_used_outside_declaring_scope(f, e)
+  var temps: {Int: SDep} = {}
+  collect_temporaries_sidemap_impl(f, e, used, &temps, -1)
+  var ocx = OCtx()
+  traverse_function_optional(f, e, &ocx)
+  # hoistable property loads, per scope
+  var r = Reg()
+  var hcx = HCtx()
+  hcx.assumed_invoked = get_assumed_invoked_functions(f, &e)
+  if f.fn_type == rc_hir.FN_COMPONENT or f.fn_type == rc_hir.FN_HOOK:
+    for p in f.params:
+      if not p.spread: hcx.known_immutable[p.place.identifier] = true
+  let nodes = collect_non_nulls_in_blocks(f, &e, hcx, temps, ocx.hoistable, &r)
+  let working = propagate_non_null(f, nodes, &r)
+  var keyed: {Int: [Int]} = {}
+  for bid in f.body.order:
+    match f.body.blocks[bid].terminal:
+      rc_hir.Scope(_, b, s, _, _):
+        if b in working: keyed[s] = copy_ints(working[b])
+      _: nop()
+  for k, v in ocx.temps: temps[k] = cp_dep(v)
+  let cx = collect_dependencies(f, &e, temps, ocx.processed)
+  for s in cx.dep_scopes:
+    let deps = cx.deps[s]
+    if deps.len == 0: continue
+    var hs: [Int] = []
+    if s in keyed: hs = copy_ints(keyed[s])
+    var t = new_tree(r, hs)
+    for d in deps: add_dependency(&t, d)
+    let cands = derive_minimal_dependencies(t)
+    for c in cands:
+      var exists = false
+      for x in e.scopes[s].dependencies:
+        if e.identifiers[x.identifier].declaration_id == e.identifiers[c.identifier].declaration_id and are_equal_paths(x.path, c.path): exists = true
+      if not exists: e.scopes[s].dependencies.push(cp_dep(c))

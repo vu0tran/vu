@@ -1,0 +1,1055 @@
+# The React Compiler's passes over the reactive function (oxc_react_compiler 1.94.0,
+# react_compiler_reactive_scopes/): prune_unused_labels, assert_scope_instructions_within_scopes,
+# prune_non_escaping_scopes, prune_non_reactive_dependencies, prune_unused_scopes,
+# prune_always_invalidating_scopes, propagate_early_returns, prune_unused_lvalues,
+# extract_scope_declarations_from_destructuring and prune_hoisted_contexts, each named as its Rust
+# file. (merge_reactive_scopes_that_invalidate_together, promote_used_temporaries and
+# rename_variables are in rc_rpass2.vu.)
+
+import rc_hir
+import rc_env
+import rc_diags
+import rc_ops
+import rc_rf
+import rc_rvisit
+import rc_scopes
+import rc_psd
+import rc_gdefs
+from rc_hir import Sp, Place, InstrValue
+from rc_env import Env, SDecl
+from rc_rf import RF, RTerm, RVal
+from rc_rvisit import Ev
+
+fn nop():
+  return
+
+fn copy_ints(xs: [Int]) -> [Int]:
+  var r = xs[0..xs.len]
+  return r
+
+fn nosp() -> Sp:
+  return Sp(-1, -1)
+
+# ---- prune_unused_labels
+
+fn prune_unused_labels(var rf: RF):
+  var labels: {Int: Bool} = {}
+  pul_block(&rf, rf.body, &labels)
+
+fn pul_block(var rf: RF, b: Int, var labels: {Int: Bool}):
+  let old = copy_ints(rf.blocks[b])
+  var out: [Int] = []
+  for s in old:
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_SCOPE or k == rc_rf.ST_PRUNED:
+      pul_block(&rf, rf.stmts[s].block, &labels)
+      out.push(s)
+    elif k == rc_rf.ST_TERM:
+      let ti = rf.stmts[s].x
+      for cb in rc_rvisit.term_blocks(rf.terms[ti]): pul_block(&rf, cb, &labels)
+      let tk = rf.terms[ti].kind
+      if (tk == rc_rf.RT_BREAK or tk == rc_rf.RT_CONTINUE) and rf.terms[ti].target_kind == rc_rf.TK_LABELED: labels[rf.terms[ti].target] = true
+      let reachable = rf.terms[ti].has_label and labels.get(rf.terms[ti].label, false)
+      if tk == rc_rf.RT_LABEL and not reachable:
+        for x in copy_ints(rf.blocks[rf.terms[ti].b1]): out.push(x)
+        continue
+      if not reachable and rf.terms[ti].has_label: rf.terms[ti].implicit = true
+      out.push(s)
+    else: out.push(s)
+  rf.blocks[b] = out
+
+# ---- assert_scope_instructions_within_scopes
+
+fn assert_scope_instructions_within_scopes(rf: RF, var e: Env):
+  let ev = rc_rvisit.events(rf, e, false, false)
+  var existing: {Int: Bool} = {}
+  for i in 0..ev.k.len:
+    if ev.k[i] == rc_rvisit.EV_SCOPE_END: existing[ev.a[i]] = true
+  var active: {Int: Bool} = {}
+  var err = -1
+  var err_id = 0
+  for i in 0..ev.k.len:
+    let k = ev.k[i]
+    if k == rc_rvisit.EV_SCOPE_BEGIN: active[ev.a[i]] = true
+    elif k == rc_rvisit.EV_SCOPE_END: active.remove(ev.a[i])
+    elif k == rc_rvisit.EV_PLACE:
+      let id = ev.a[i]
+      let s = e.identifiers[ev.p[i].identifier].scope
+      if s >= 0:
+        let r = e.scopes[s].range
+        if id >= r.start and id < r.end and existing.get(s, false) and not active.get(s, false):
+          err = s
+          err_id = id
+  if err >= 0: rc_env.throw(&e, rc_env.with_help(rc_env.diag(rc_env.EC_INVARIANT, "Encountered an instruction that should be part of a scope, but where that scope has already completed"), "Instruction [{err_id}] is part of scope @{err}, but that scope has already completed"))
+
+# ---- prune_non_escaping_scopes
+
+# MemoizationLevel
+const ML_MEMOIZED = 0
+const ML_CONDITIONAL = 1
+const ML_UNMEMOIZED = 2
+const ML_NEVER = 3
+
+fn join_aliases(a: Int, b: Int) -> Int:
+  if a == ML_MEMOIZED or b == ML_MEMOIZED: return ML_MEMOIZED
+  if a == ML_CONDITIONAL or b == ML_CONDITIONAL: return ML_CONDITIONAL
+  if a == ML_UNMEMOIZED or b == ML_UNMEMOIZED: return ML_UNMEMOIZED
+  return ML_NEVER
+
+type INode:
+  level: Int = 3
+  memoized: Bool = false
+  deps: [Int] = []          # declaration ids (an insertion-ordered set)
+  scopes: [Int] = []
+  seen: Bool = false
+
+type SNode:
+  deps: [Int] = []
+  seen: Bool = false
+
+type CS:
+  definitions: {Int: Int} = {}
+  ids: {Int: INode} = {}
+  scopes: {Int: SNode} = {}
+  escaping: [Int] = []
+  escaping_set: {Int: Bool} = {}
+  stack: [Int] = []
+
+fn add_set(var xs: [Int], x: Int):
+  for y in xs:
+    if y == x: return
+  xs.push(x)
+
+fn cs_declare(var st: CS, d: Int):
+  st.ids[d] = INode()
+
+fn cs_resolve(st: CS, d: Int) -> Int:
+  return st.definitions.get(d, d)
+
+fn cs_escape(var st: CS, d: Int):
+  if not (d in st.escaping_set):
+    st.escaping_set[d] = true
+    st.escaping.push(d)
+
+fn get_place_scope(e: Env, id: Int, iden: Int) -> Int:
+  let s = e.identifiers[iden].scope
+  if s < 0: return -1
+  if rc_hir.range_contains(e.scopes[s].range, id): return s
+  return -1
+
+fn cs_visit_operand(var st: CS, e: Env, id: Int, iden: Int, decl: Int):
+  let s = get_place_scope(e, id, iden)
+  if s < 0: return
+  if not (s in st.scopes):
+    var deps: [Int] = []
+    for d in e.scopes[s].dependencies: deps.push(e.identifiers[d.identifier].declaration_id)
+    st.scopes[s] = SNode(deps)
+  if not (decl in st.ids): st.ids[decl] = INode()
+  add_set(&st.ids[decl].scopes, s)
+
+fn is_mutable_effect(ef: Int) -> Bool:
+  return rc_hir.effect_mutable(ef)
+
+# compute_memoization_inputs: lvalues (identifier, level) and rvalues (identifiers)
+type MI:
+  lv: [Int] = []
+  ll: [Int] = []
+  rv: [Int] = []
+
+fn mi_lv(var m: MI, id: Int, level: Int):
+  m.lv.push(id)
+  m.ll.push(level)
+
+fn memo_inputs(rf: RF, e: Env, id: Int, x: Int, lvalue: Int, var st: CS) -> MI:
+  var m = MI()
+  let k = rf.vals[x].kind
+  if k == rc_rf.RV_COND:
+    let a = memo_inputs(rf, e, id, rf.vals[x].b, -1, &st)
+    let b = memo_inputs(rf, e, id, rf.vals[x].c, -1, &st)
+    for r in a.rv: m.rv.push(r)
+    for r in b.rv: m.rv.push(r)
+    if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+    return m
+  if k == rc_rf.RV_LOGICAL:
+    let a = memo_inputs(rf, e, id, rf.vals[x].a, -1, &st)
+    let b = memo_inputs(rf, e, id, rf.vals[x].b, -1, &st)
+    for r in a.rv: m.rv.push(r)
+    for r in b.rv: m.rv.push(r)
+    if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+    return m
+  if k == rc_rf.RV_SEQ:
+    for ri in rf.vals[x].instrs:
+      var lv = -1
+      if rf.instrs[ri].has_lvalue: lv = rf.instrs[ri].lvalue.identifier
+      visit_value_for_memoization(rf, e, rf.instrs[ri].id, rf.instrs[ri].value, lv, &st)
+    let a = memo_inputs(rf, e, id, rf.vals[x].a, -1, &st)
+    for r in a.rv: m.rv.push(r)
+    if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+    return m
+  if k == rc_rf.RV_OPT:
+    let a = memo_inputs(rf, e, id, rf.vals[x].a, -1, &st)
+    for r in a.rv: m.rv.push(r)
+    if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+    return m
+  return instr_memo_inputs(e, rf.vals[x].instr, lvalue)
+
+fn call_like_inputs(e: Env, v: InstrValue, callee: Int, lvalue: Int) -> MI:
+  var m = MI()
+  if lvalue >= 0: mi_lv(&m, lvalue, ML_MEMOIZED)
+  if rc_scopes.has_no_alias_signature(e, callee): return m
+  let ops = rc_ops.value_operands(v, e)
+  for op in ops:
+    if is_mutable_effect(op.effect): mi_lv(&m, op.identifier, ML_MEMOIZED)
+  for op in ops: m.rv.push(op.identifier)
+  return m
+
+fn alloc_inputs(e: Env, v: InstrValue, lvalue: Int) -> MI:
+  var m = MI()
+  let ops = rc_ops.value_operands(v, e)
+  for op in ops:
+    if is_mutable_effect(op.effect): mi_lv(&m, op.identifier, ML_MEMOIZED)
+  if lvalue >= 0: mi_lv(&m, lvalue, ML_MEMOIZED)
+  for op in ops: m.rv.push(op.identifier)
+  return m
+
+fn instr_memo_inputs(e: Env, v: InstrValue, lvalue: Int) -> MI:
+  var m = MI()
+  match v:
+    rc_hir.JsxExpression(builtin, _, tag, props, has_children, children, _, _, _, _, _):
+      if not builtin: m.rv.push(tag.identifier)
+      for p in props: m.rv.push(p.place.identifier)
+      if has_children:
+        for c in children: m.rv.push(c.identifier)
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_MEMOIZED)
+    rc_hir.JsxFragment(children, _, _, _):
+      for c in children: m.rv.push(c.identifier)
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_MEMOIZED)
+    rc_hir.TSEnumDeclaration(_, _):
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_NEVER)
+    rc_hir.NextPropertyOf(_, _): return prim_inputs(e, v, lvalue)
+    rc_hir.StartMemoize(_, _, _, _, _, _, _): return prim_inputs(e, v, lvalue)
+    rc_hir.FinishMemoize(_, _, _, _): return prim_inputs(e, v, lvalue)
+    rc_hir.Debugger(_): return prim_inputs(e, v, lvalue)
+    rc_hir.ComputedDelete(_, _, _): return prim_inputs(e, v, lvalue)
+    rc_hir.PropertyDelete(_, _, _, _): return prim_inputs(e, v, lvalue)
+    rc_hir.LoadGlobal(_, _): return prim_inputs(e, v, lvalue)
+    rc_hir.MetaProperty(_, _, _): return prim_inputs(e, v, lvalue)
+    rc_hir.TemplateLiteral(_, _, _): return prim_inputs(e, v, lvalue)
+    rc_hir.Primitive(_, _): return prim_inputs(e, v, lvalue)
+    rc_hir.JSXText(_, _): return prim_inputs(e, v, lvalue)
+    rc_hir.BinaryExpression(_, _, _, _): return prim_inputs(e, v, lvalue)
+    rc_hir.UnaryExpression(_, _, _): return prim_inputs(e, v, lvalue)
+    rc_hir.Await(x, _):
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+      m.rv.push(x.identifier)
+    rc_hir.TypeCastExpression(x, _, _, _):
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+      m.rv.push(x.identifier)
+    rc_hir.IteratorNext(it, col, _):
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+      m.rv.push(it.identifier)
+      m.rv.push(col.identifier)
+    rc_hir.GetIterator(col, _):
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+      m.rv.push(col.identifier)
+    rc_hir.LoadLocal(p, _):
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+      m.rv.push(p.identifier)
+    rc_hir.LoadContext(p, _, _):
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+      m.rv.push(p.identifier)
+    rc_hir.DeclareContext(lv, _):
+      mi_lv(&m, lv.place.identifier, ML_MEMOIZED)
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_UNMEMOIZED)
+    rc_hir.DeclareLocal(lv, _):
+      mi_lv(&m, lv.place.identifier, ML_UNMEMOIZED)
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_UNMEMOIZED)
+    rc_hir.PrefixUpdate(lv, _, val, _):
+      mi_lv(&m, lv.identifier, ML_CONDITIONAL)
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+      m.rv.push(val.identifier)
+    rc_hir.PostfixUpdate(lv, _, val, _):
+      mi_lv(&m, lv.identifier, ML_CONDITIONAL)
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+      m.rv.push(val.identifier)
+    rc_hir.StoreLocal(lv, val, _):
+      mi_lv(&m, lv.place.identifier, ML_CONDITIONAL)
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+      m.rv.push(val.identifier)
+    rc_hir.StoreContext(lv, val, _):
+      mi_lv(&m, lv.place.identifier, ML_MEMOIZED)
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+      m.rv.push(val.identifier)
+    rc_hir.StoreGlobal(_, val, _):
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_UNMEMOIZED)
+      m.rv.push(val.identifier)
+    rc_hir.Destructure(pat, _, val, _):
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+      if pat.is_object:
+        for p in pat.props:
+          if p.spread: mi_lv(&m, p.place.identifier, ML_MEMOIZED)
+          else: mi_lv(&m, p.place.identifier, ML_CONDITIONAL)
+      else:
+        for x in pat.items:
+          if x.kind == 0: mi_lv(&m, x.place.identifier, ML_CONDITIONAL)
+          elif x.kind == 1: mi_lv(&m, x.place.identifier, ML_MEMOIZED)
+      m.rv.push(val.identifier)
+    rc_hir.ComputedLoad(o, _, _):
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+      m.rv.push(o.identifier)
+    rc_hir.PropertyLoad(o, _, _, _, _):
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+      m.rv.push(o.identifier)
+    rc_hir.ComputedStore(o, _, val, _):
+      mi_lv(&m, o.identifier, ML_CONDITIONAL)
+      if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+      m.rv.push(val.identifier)
+    rc_hir.TaggedTemplateExpression(tag, _, _, _, _): return call_like_inputs(e, v, tag.identifier, lvalue)
+    rc_hir.CallExpression(c, _, _): return call_like_inputs(e, v, c.identifier, lvalue)
+    rc_hir.MethodCall(_, p, _, _): return call_like_inputs(e, v, p.identifier, lvalue)
+    _: return alloc_inputs(e, v, lvalue)
+  return m
+
+fn prim_inputs(e: Env, v: InstrValue, lvalue: Int) -> MI:
+  # (enablePreserveExistingMemoizationGuarantees is on: force_memoize_primitives)
+  var m = MI()
+  if lvalue >= 0: mi_lv(&m, lvalue, ML_CONDITIONAL)
+  for p in rc_ops.value_operands(v, e): m.rv.push(p.identifier)
+  return m
+
+fn is_set_state_id(e: Env, id: Int) -> Bool:
+  return rc_scopes.fn_shape_of(e, id) == rc_gdefs.BUILT_IN_SET_STATE_ID
+
+fn escape_args(var st: CS, e: Env, args: [rc_hir.Elem]):
+  for a in args:
+    if a.kind != 2: cs_escape(&st, e.identifiers[a.place.identifier].declaration_id)
+
+fn visit_value_for_memoization(rf: RF, e: Env, id: Int, x: Int, lvalue: Int, var st: CS):
+  let m = memo_inputs(rf, e, id, x, lvalue, &st)
+  var rdecl: [Int] = []
+  for r in m.rv: rdecl.push(cs_resolve(st, e.identifiers[r].declaration_id))
+  for i in 0..m.rv.len: cs_visit_operand(&st, e, id, m.rv[i], rdecl[i])
+  for i in 0..m.lv.len:
+    let lid = cs_resolve(st, e.identifiers[m.lv[i]].declaration_id)
+    if not (lid in st.ids): st.ids[lid] = INode()
+    st.ids[lid].level = join_aliases(st.ids[lid].level, m.ll[i])
+    for o in rdecl:
+      if o == lid: continue
+      add_set(&st.ids[lid].deps, o)
+    cs_visit_operand(&st, e, id, m.lv[i], lid)
+  if rf.vals[x].kind != rc_rf.RV_INSTR: return
+  match rf.vals[x].instr:
+    rc_hir.LoadLocal(p, _):
+      if lvalue >= 0: st.definitions[e.identifiers[lvalue].declaration_id] = e.identifiers[p.identifier].declaration_id
+    rc_hir.CallExpression(c, args, _):
+      if is_set_state_id(e, c.identifier): escape_args(&st, e, args)
+      elif rc_scopes.hook_kind_of_id(e, c.identifier) >= 0:
+        if not rc_scopes.has_no_alias_signature(e, c.identifier): escape_args(&st, e, args)
+    rc_hir.MethodCall(_, p, args, _):
+      if rc_scopes.hook_kind_of_id(e, p.identifier) >= 0:
+        if not rc_scopes.has_no_alias_signature(e, p.identifier): escape_args(&st, e, args)
+    _: nop()
+
+# the collecting visitor: an instruction is visited for memoization without its parts; a terminal's
+# values give their sequences' instructions to visit_instruction
+fn pne_block(rf: RF, e: Env, b: Int, var st: CS):
+  for s in rf.blocks[b]:
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_INSTR:
+      let ri = rf.stmts[s].x
+      var lv = -1
+      if rf.instrs[ri].has_lvalue: lv = rf.instrs[ri].lvalue.identifier
+      visit_value_for_memoization(rf, e, rf.instrs[ri].id, rf.instrs[ri].value, lv, &st)
+    elif k == rc_rf.ST_SCOPE:
+      let sid = rf.stmts[s].x
+      for r in e.scopes[sid].reassignments:
+        let d = e.identifiers[r].declaration_id
+        if not (d in st.ids): st.ids[d] = INode()
+        for x in copy_ints(st.stack): add_set(&st.ids[d].scopes, x)
+        add_set(&st.ids[d].scopes, sid)
+      st.stack.push(sid)
+      pne_block(rf, e, rf.stmts[s].block, &st)
+      st.stack.pop()
+    elif k == rc_rf.ST_PRUNED: pne_block(rf, e, rf.stmts[s].block, &st)
+    else:
+      let ti = rf.stmts[s].x
+      let t = rf.terms[ti]
+      var ks: [Int] = []
+      var xs: [Int] = []
+      visitor_parts(t, &ks, &xs)
+      for i in 0..ks.len:
+        if ks[i] == 1: pne_block(rf, e, xs[i], &st)
+        else: pne_value(rf, e, xs[i], &st)
+      if t.kind == rc_rf.RT_RETURN:
+        let d = e.identifiers[t.value.identifier].declaration_id
+        cs_escape(&st, d)
+        if not (d in st.ids): st.ids[d] = INode()
+        for x in copy_ints(st.stack): add_set(&st.ids[d].scopes, x)
+
+# a terminal's parts in the visitor's order (for: body before update)
+fn visitor_parts(t: RTerm, var ks: [Int], var xs: [Int]):
+  if t.kind == rc_rf.RT_FOR:
+    ks.push(0)
+    xs.push(t.v1)
+    ks.push(0)
+    xs.push(t.v2)
+    ks.push(1)
+    xs.push(t.b1)
+    if t.v3 >= 0:
+      ks.push(0)
+      xs.push(t.v3)
+    return
+  rc_rvisit.term_parts(t, &ks, &xs)
+
+fn pne_value(rf: RF, e: Env, x: Int, var st: CS):
+  let k = rf.vals[x].kind
+  if k == rc_rf.RV_OPT: pne_value(rf, e, rf.vals[x].a, &st)
+  elif k == rc_rf.RV_LOGICAL:
+    pne_value(rf, e, rf.vals[x].a, &st)
+    pne_value(rf, e, rf.vals[x].b, &st)
+  elif k == rc_rf.RV_COND:
+    pne_value(rf, e, rf.vals[x].a, &st)
+    pne_value(rf, e, rf.vals[x].b, &st)
+    pne_value(rf, e, rf.vals[x].c, &st)
+  elif k == rc_rf.RV_SEQ:
+    for ri in rf.vals[x].instrs:
+      var lv = -1
+      if rf.instrs[ri].has_lvalue: lv = rf.instrs[ri].lvalue.identifier
+      visit_value_for_memoization(rf, e, rf.instrs[ri].id, rf.instrs[ri].value, lv, &st)
+    pne_value(rf, e, rf.vals[x].a, &st)
+
+fn cmi_visit(id: Int, force: Bool, var st: CS, var memo: {Int: Bool}, var e: Env) -> Bool:
+  if not (id in st.ids):
+    rc_env.throw(&e, rc_diags.invariant_expected_node_all_identifiers(id))
+    return false
+  if st.ids[id].seen: return st.ids[id].memoized
+  st.ids[id].seen = true
+  st.ids[id].memoized = false
+  let deps = copy_ints(st.ids[id].deps)
+  var hmd = false
+  for d in deps:
+    let r = cmi_visit(d, false, &st, &memo, &e)
+    if e.failed: return false
+    if r: hmd = true
+  let level = st.ids[id].level
+  if level == ML_MEMOIZED or (level == ML_CONDITIONAL and (hmd or force)) or (level == ML_UNMEMOIZED and force):
+    st.ids[id].memoized = true
+    memo[id] = true
+    for s in copy_ints(st.ids[id].scopes):
+      force_memoize_scope_dependencies(s, &st, &memo, &e)
+      if e.failed: return false
+  return st.ids[id].memoized
+
+fn force_memoize_scope_dependencies(s: Int, var st: CS, var memo: {Int: Bool}, var e: Env):
+  if not (s in st.scopes):
+    rc_env.throw(&e, rc_diags.invariant_expected_node_all_scopes())
+    return
+  if st.scopes[s].seen: return
+  st.scopes[s].seen = true
+  for d in copy_ints(st.scopes[s].deps):
+    cmi_visit(d, true, &st, &memo, &e)
+    if e.failed: return
+
+type PST:
+  pruned: {Int: Bool} = {}
+  reassign: {Int: [Int]} = {}
+
+fn prune_non_escaping_scopes(var rf: RF, var e: Env):
+  var st = CS()
+  if rf.has_self: cs_declare(&st, e.identifiers[rf.self_binding.identifier].declaration_id)
+  for p in rf.params: cs_declare(&st, e.identifiers[p.place.identifier].declaration_id)
+  pne_block(rf, e, rf.body, &st)
+  var memo: {Int: Bool} = {}
+  for d in copy_ints(st.escaping):
+    cmi_visit(d, false, &st, &memo, &e)
+    if e.failed: return
+  var ps = PST()
+  pst_block(&rf, rf.body, &e, memo, &ps)
+
+fn pst_block(var rf: RF, b: Int, var e: Env, memo: {Int: Bool}, var ps: PST):
+  let old = copy_ints(rf.blocks[b])
+  var out: [Int] = []
+  for s in old:
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_SCOPE:
+      pst_block(&rf, rf.stmts[s].block, &e, memo, &ps)
+      let sid = rf.stmts[s].x
+      if (e.scopes[sid].declarations.len == 0 and e.scopes[sid].reassignments.len == 0) or e.scopes[sid].has_early_return:
+        out.push(s)
+        continue
+      var has = false
+      for d in e.scopes[sid].declarations:
+        if memo.get(e.identifiers[d.identifier].declaration_id, false): has = true
+      for r in e.scopes[sid].reassignments:
+        if memo.get(e.identifiers[r].declaration_id, false): has = true
+      if has: out.push(s)
+      else:
+        ps.pruned[sid] = true
+        for x in copy_ints(rf.blocks[rf.stmts[s].block]): out.push(x)
+    elif k == rc_rf.ST_PRUNED:
+      pst_block(&rf, rf.stmts[s].block, &e, memo, &ps)
+      out.push(s)
+    elif k == rc_rf.ST_TERM:
+      for cb in rc_rvisit.term_blocks(rf.terms[rf.stmts[s].x]): pst_block(&rf, cb, &e, memo, &ps)
+      out.push(s)
+    else:
+      pst_instr(&rf, rf.stmts[s].x, &e, &ps)
+      out.push(s)
+  rf.blocks[b] = out
+
+fn pst_add(var ps: PST, d: Int, id: Int):
+  if not (d in ps.reassign): ps.reassign[d] = []
+  add_set(&ps.reassign[d], id)
+
+fn pst_instr(var rf: RF, ri: Int, var e: Env, var ps: PST):
+  let x = rf.instrs[ri].value
+  if rf.vals[x].kind != rc_rf.RV_INSTR: return
+  var set_pruned = false
+  match rf.vals[x].instr:
+    rc_hir.StoreLocal(lv, v, _):
+      if lv.kind == rc_hir.IK_REASSIGN: pst_add(&ps, e.identifiers[lv.place.identifier].declaration_id, v.identifier)
+    rc_hir.LoadLocal(p, _):
+      if rf.instrs[ri].has_lvalue:
+        let l = rf.instrs[ri].lvalue.identifier
+        if e.identifiers[p.identifier].scope >= 0 and e.identifiers[l].scope < 0: pst_add(&ps, e.identifiers[l].declaration_id, p.identifier)
+    rc_hir.FinishMemoize(_, decl, _, _):
+      if e.identifiers[decl.identifier].scope < 0:
+        let d = e.identifiers[decl.identifier].declaration_id
+        var ds = [decl.identifier]
+        if d in ps.reassign: ds = copy_ints(ps.reassign[d])
+        var all = true
+        for i in ds:
+          let s = e.identifiers[i].scope
+          if not (s < 0 or ps.pruned.get(s, false)): all = false
+        if all: set_pruned = true
+      else:
+        let s = e.identifiers[decl.identifier].scope
+        if ps.pruned.get(s, false): set_pruned = true
+    _: nop()
+  if set_pruned:
+    match var rf.vals[x].instr:
+      rc_hir.FinishMemoize(_, _, pruned, _): pruned = true
+      _: nop()
+
+# ---- prune_non_reactive_dependencies
+
+fn is_stable_type(e: Env, id: Int) -> Bool:
+  let f = rc_scopes.fn_shape_of(e, id)
+  if f == rc_gdefs.BUILT_IN_SET_STATE_ID or f == "BuiltInSetActionState" or f == "BuiltInDispatch" or f == "BuiltInStartTransition" or f == "BuiltInSetOptimistic": return true
+  return rc_scopes.obj_shape_of(e, id) == rc_gdefs.BUILT_IN_USE_REF_ID
+
+fn prune_non_reactive_dependencies(var rf: RF, var e: Env):
+  let ev = rc_rvisit.events(rf, e, false, false)
+  var reactive: {Int: Bool} = {}
+  for i in 0..ev.k.len:
+    let k = ev.k[i]
+    if k == rc_rvisit.EV_PLACE or k == rc_rvisit.EV_LVALUE:
+      if ev.p[i].reactive: reactive[ev.p[i].identifier] = true
+    elif k == rc_rvisit.EV_PRUNED_END:
+      let s = ev.a[i]
+      for d in e.scopes[s].declarations:
+        let id = d.identifier
+        let prim = rc_scopes.is_prim_id(e, id)
+        let stable_ref = rc_scopes.obj_shape_of(e, id) == rc_gdefs.BUILT_IN_USE_REF_ID and not reactive.get(id, false)
+        if not prim and not stable_ref: reactive[d.key] = true
+  # the transform: an instruction after its parts, a scope after its block
+  let ev2 = rc_rvisit.events(rf, e, true, false)
+  for i in 0..ev2.k.len:
+    let k = ev2.k[i]
+    if k == rc_rvisit.EV_INSTR_END: pnrd_instr(rf, ev2.a[i], e, &reactive)
+    elif k == rc_rvisit.EV_SCOPE_END:
+      let s = ev2.a[i]
+      var keep: [rc_env.SDep] = []
+      for d in e.scopes[s].dependencies:
+        if reactive.get(d.identifier, false): keep.push(rc_psd.cp_dep(d))
+      e.scopes[s].dependencies = keep
+      if e.scopes[s].dependencies.len > 0:
+        for d in e.scopes[s].declarations: reactive[d.identifier] = true
+        for r in e.scopes[s].reassignments: reactive[r] = true
+
+fn pnrd_instr(rf: RF, ri: Int, e: Env, var st: {Int: Bool}):
+  let x = rf.instrs[ri].value
+  if rf.vals[x].kind != rc_rf.RV_INSTR: return
+  let has = rf.instrs[ri].has_lvalue
+  let lv = rf.instrs[ri].lvalue.identifier
+  match rf.vals[x].instr:
+    rc_hir.LoadLocal(p, _):
+      if has and st.get(p.identifier, false): st[lv] = true
+    rc_hir.StoreLocal(l, v, _):
+      if st.get(v.identifier, false):
+        st[l.place.identifier] = true
+        if has: st[lv] = true
+    rc_hir.Destructure(pat, _, v, _):
+      if st.get(v.identifier, false):
+        for o in rc_ops.pattern_operands(pat):
+          if is_stable_type(e, o.identifier): continue
+          st[o.identifier] = true
+        if has: st[lv] = true
+    rc_hir.PropertyLoad(o, _, _, _, _):
+      if has and st.get(o.identifier, false) and not is_stable_type(e, lv): st[lv] = true
+    rc_hir.ComputedLoad(o, p, _):
+      if has and (st.get(o.identifier, false) or st.get(p.identifier, false)): st[lv] = true
+    _: nop()
+
+# ---- prune_unused_scopes
+
+fn prune_unused_scopes(var rf: RF, e: Env):
+  var hr = false
+  pus_block(&rf, rf.body, e, &hr)
+
+fn pus_block(var rf: RF, b: Int, e: Env, var hr: Bool):
+  for s in copy_ints(rf.blocks[b]):
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_SCOPE:
+      var inner = false
+      pus_block(&rf, rf.stmts[s].block, e, &inner)
+      let sid = rf.stmts[s].x
+      var own = false
+      for d in e.scopes[sid].declarations:
+        if d.scope == sid: own = true
+      if not inner and e.scopes[sid].reassignments.len == 0 and (e.scopes[sid].declarations.len == 0 or not own): rf.stmts[s].kind = rc_rf.ST_PRUNED
+    elif k == rc_rf.ST_PRUNED: pus_block(&rf, rf.stmts[s].block, e, &hr)
+    elif k == rc_rf.ST_TERM:
+      let ti = rf.stmts[s].x
+      for cb in rc_rvisit.term_blocks(rf.terms[ti]): pus_block(&rf, cb, e, &hr)
+      if rf.terms[ti].kind == rc_rf.RT_RETURN: hr = true
+
+# ---- prune_always_invalidating_scopes
+
+type PAI:
+  always: {Int: Bool} = {}
+  unmemo: {Int: Bool} = {}
+
+fn prune_always_invalidating_scopes(var rf: RF, e: Env):
+  var st = PAI()
+  pai_block(&rf, rf.body, e, false, &st)
+
+fn pai_block(var rf: RF, b: Int, e: Env, within: Bool, var st: PAI):
+  for s in copy_ints(rf.blocks[b]):
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_INSTR: pai_instr(rf, rf.stmts[s].x, within, &st)
+    elif k == rc_rf.ST_SCOPE:
+      pai_block(&rf, rf.stmts[s].block, e, true, &st)
+      let sid = rf.stmts[s].x
+      for d in e.scopes[sid].dependencies:
+        if st.unmemo.get(d.identifier, false):
+          for x in e.scopes[sid].declarations:
+            if st.always.get(x.identifier, false): st.unmemo[x.identifier] = true
+          for r in e.scopes[sid].reassignments:
+            if st.always.get(r, false): st.unmemo[r] = true
+          rf.stmts[s].kind = rc_rf.ST_PRUNED
+          break
+    elif k == rc_rf.ST_PRUNED: pai_block(&rf, rf.stmts[s].block, e, within, &st)
+    else:
+      for cb in rc_rvisit.term_blocks(rf.terms[rf.stmts[s].x]): pai_block(&rf, cb, e, within, &st)
+
+fn pai_instr(rf: RF, ri: Int, within: Bool, var st: PAI):
+  let x = rf.instrs[ri].value
+  if rf.vals[x].kind != rc_rf.RV_INSTR: return
+  let has = rf.instrs[ri].has_lvalue
+  let lv = rf.instrs[ri].lvalue.identifier
+  var alloc = false
+  match rf.vals[x].instr:
+    rc_hir.ArrayExpression(_, _): alloc = true
+    rc_hir.ObjectExpression(_, _): alloc = true
+    rc_hir.JsxExpression(_, _, _, _, _, _, _, _, _, _, _): alloc = true
+    rc_hir.JsxFragment(_, _, _, _): alloc = true
+    rc_hir.NewExpression(_, _, _): alloc = true
+    rc_hir.StoreLocal(l, v, _):
+      if st.always.get(v.identifier, false): st.always[l.place.identifier] = true
+      if st.unmemo.get(v.identifier, false): st.unmemo[l.place.identifier] = true
+    rc_hir.LoadLocal(p, _):
+      if has:
+        if st.always.get(p.identifier, false): st.always[lv] = true
+        if st.unmemo.get(p.identifier, false): st.unmemo[lv] = true
+    _: nop()
+  if alloc and has:
+    st.always[lv] = true
+    if not within: st.unmemo[lv] = true
+
+# ---- propagate_early_returns
+
+type PER:
+  within: Bool = false
+  has: Bool = false
+  value: Int = -1
+  sp: Sp = Sp(-1, -1)
+  label: Int = -1
+
+fn propagate_early_returns(var rf: RF, var e: Env):
+  var st = PER()
+  per_block(&rf, rf.body, &e, &st)
+
+fn promote_temporary(var e: Env, id: Int):
+  e.identifiers[id].name_kind = 2
+  e.identifiers[id].name = "#t{e.identifiers[id].declaration_id}"
+
+fn tplace(id: Int, effect: Int, reactive: Bool, sp: Sp) -> Place:
+  return Place(id, effect, reactive, sp)
+
+fn per_block(var rf: RF, b: Int, var e: Env, var st: PER):
+  let old = copy_ints(rf.blocks[b])
+  var out: [Int] = []
+  for s in old:
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_SCOPE:
+      let sid = rf.stmts[s].x
+      if e.scopes[sid].has_early_return:
+        out.push(s)
+        continue
+      var inner = PER(true, st.has, st.value, st.sp, st.label)
+      per_block(&rf, rf.stmts[s].block, &e, &inner)
+      if inner.has:
+        if not st.within: apply_early_return_to_scope(&rf, s, &e, inner)
+        else:
+          st.has = true
+          st.value = inner.value
+          st.sp = inner.sp
+          st.label = inner.label
+      out.push(s)
+    elif k == rc_rf.ST_PRUNED:
+      per_block(&rf, rf.stmts[s].block, &e, &st)
+      out.push(s)
+    elif k == rc_rf.ST_TERM:
+      let ti = rf.stmts[s].x
+      if st.within and rf.terms[ti].kind == rc_rf.RT_RETURN:
+        let v = rf.terms[ti].value
+        let sp = v.sp
+        if not st.has:
+          let id = rc_env.next_identifier_id(&e)
+          promote_temporary(&e, id)
+          let label = rc_env.next_block_id(&e)
+          st.has = true
+          st.value = id
+          st.sp = sp
+          st.label = label
+        let sv = rc_rf.add_val(&rf, RVal(kind: rc_rf.RV_INSTR, instr: rc_hir.StoreLocal(rc_hir.LValue(tplace(st.value, rc_hir.EF_CAPTURE, true, sp), rc_hir.IK_REASSIGN), v, sp)))
+        let ri = rc_rf.add_instr(&rf, 0, false, rc_rf.noplace(), sv, sp)
+        let si = rc_rf.add_stmt(&rf, rc_rf.ST_INSTR, ri, -1)
+        out.push(si)
+        var bsp = sp
+        if bsp.s < 0: bsp = Sp(0, 0)
+        let bt = rc_rf.add_term(&rf, RTerm(kind: rc_rf.RT_BREAK, target: st.label, target_kind: rc_rf.TK_LABELED, sp: bsp))
+        let sb = rc_rf.add_stmt(&rf, rc_rf.ST_TERM, bt, -1)
+        out.push(sb)
+        continue
+      for cb in rc_rvisit.term_blocks(rf.terms[ti]): per_block(&rf, cb, &e, &st)
+      out.push(s)
+    else: out.push(s)
+  rf.blocks[b] = out
+
+fn apply_early_return_to_scope(var rf: RF, s: Int, var e: Env, er: PER):
+  let sid = rf.stmts[s].x
+  e.scopes[sid].has_early_return = true
+  e.scopes[sid].er_value = er.value
+  e.scopes[sid].er_sp = er.sp
+  e.scopes[sid].er_label = er.label
+  e.scopes[sid].declarations.push(SDecl(er.value, er.value, sid))
+  let sentinel = rc_env.next_identifier_id(&e)
+  let sym = rc_env.next_identifier_id(&e)
+  let for_t = rc_env.next_identifier_id(&e)
+  let arg = rc_env.next_identifier_id(&e)
+  let orig = rf.stmts[s].block
+  let nb = rc_rf.new_block(&rf)
+  let u = rc_hir.EF_UNKNOWN
+  let v1 = rc_rf.add_val(&rf, RVal(kind: rc_rf.RV_INSTR, instr: rc_hir.LoadGlobal(rc_hir.NonLocal(rc_hir.NL_GLOBAL, "Symbol", "", ""), nosp())))
+  let r_1045 = rc_rf.add_instr(&rf, 0, true, tplace(sym, u, false, nosp()), v1, nosp())
+  rc_rf.push_instr_stmt(&rf, nb, r_1045)
+  let v2 = rc_rf.add_val(&rf, RVal(kind: rc_rf.RV_INSTR, instr: rc_hir.PropertyLoad(tplace(sym, u, false, nosp()), rc_hir.PropLit(false, "for", 0.0), false, nosp(), nosp())))
+  let r_5440 = rc_rf.add_instr(&rf, 0, true, tplace(for_t, u, false, nosp()), v2, nosp())
+  rc_rf.push_instr_stmt(&rf, nb, r_5440)
+  let v3 = rc_rf.add_val(&rf, RVal(kind: rc_rf.RV_INSTR, instr: rc_hir.Primitive(rc_hir.Prim(4, false, 0.0, "react.early_return_sentinel"), nosp())))
+  let r_5761 = rc_rf.add_instr(&rf, 0, true, tplace(arg, u, false, nosp()), v3, nosp())
+  rc_rf.push_instr_stmt(&rf, nb, r_5761)
+  let v4 = rc_rf.add_val(&rf, RVal(kind: rc_rf.RV_INSTR, instr: rc_hir.MethodCall(tplace(sym, u, false, nosp()), tplace(for_t, u, false, nosp()), [rc_hir.Elem(0, tplace(arg, u, false, nosp()), nosp())], nosp())))
+  let r_5309 = rc_rf.add_instr(&rf, 0, true, tplace(sentinel, u, false, nosp()), v4, nosp())
+  rc_rf.push_instr_stmt(&rf, nb, r_5309)
+  let v5 = rc_rf.add_val(&rf, RVal(kind: rc_rf.RV_INSTR, instr: rc_hir.StoreLocal(rc_hir.LValue(tplace(er.value, rc_hir.EF_COND_MUTATE, true, nosp()), rc_hir.IK_LET), tplace(sentinel, u, false, nosp()), nosp())))
+  let r_6760 = rc_rf.add_instr(&rf, 0, false, rc_rf.noplace(), v5, nosp())
+  rc_rf.push_instr_stmt(&rf, nb, r_6760)
+  rc_rf.push_term_stmt(&rf, nb, RTerm(kind: rc_rf.RT_LABEL, b1: orig, has_label: true, label: er.label, sp: Sp(0, 0)))
+  rf.stmts[s].block = nb
+
+# ---- prune_unused_lvalues
+
+fn prune_unused_lvalues(var rf: RF, e: Env):
+  let ev = rc_rvisit.events(rf, e, false, false)
+  var lv: {Int: Bool} = {}
+  for i in 0..ev.k.len:
+    let k = ev.k[i]
+    if k == rc_rvisit.EV_PLACE: lv.remove(e.identifiers[ev.p[i].identifier].declaration_id)
+    elif k == rc_rvisit.EV_INSTR_END:
+      let ri = ev.a[i]
+      if rf.instrs[ri].has_lvalue:
+        let id = rf.instrs[ri].lvalue.identifier
+        if e.identifiers[id].name_kind == 0: lv[e.identifiers[id].declaration_id] = true
+  if lv.len == 0: return
+  nul_block(&rf, rf.body, e, lv)
+
+fn nul_block(var rf: RF, b: Int, e: Env, unused: {Int: Bool}):
+  for s in copy_ints(rf.blocks[b]):
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_INSTR: nul_instr(&rf, rf.stmts[s].x, e, unused)
+    elif k == rc_rf.ST_SCOPE or k == rc_rf.ST_PRUNED: nul_block(&rf, rf.stmts[s].block, e, unused)
+    else:
+      let t = rf.stmts[s].x
+      var ks: [Int] = []
+      var xs: [Int] = []
+      visitor_parts(rf.terms[t], &ks, &xs)
+      for i in 0..ks.len:
+        if ks[i] == 1: nul_block(&rf, xs[i], e, unused)
+        else: nul_value(&rf, xs[i], e, unused)
+
+fn nul_instr(var rf: RF, ri: Int, e: Env, unused: {Int: Bool}):
+  if rf.instrs[ri].has_lvalue and unused.get(e.identifiers[rf.instrs[ri].lvalue.identifier].declaration_id, false): rf.instrs[ri].has_lvalue = false
+  nul_value(&rf, rf.instrs[ri].value, e, unused)
+
+fn nul_value(var rf: RF, x: Int, e: Env, unused: {Int: Bool}):
+  let k = rf.vals[x].kind
+  if k == rc_rf.RV_SEQ:
+    for ri in copy_ints(rf.vals[x].instrs): nul_instr(&rf, ri, e, unused)
+    nul_value(&rf, rf.vals[x].a, e, unused)
+  elif k == rc_rf.RV_LOGICAL:
+    nul_value(&rf, rf.vals[x].a, e, unused)
+    nul_value(&rf, rf.vals[x].b, e, unused)
+  elif k == rc_rf.RV_COND:
+    nul_value(&rf, rf.vals[x].a, e, unused)
+    nul_value(&rf, rf.vals[x].b, e, unused)
+    nul_value(&rf, rf.vals[x].c, e, unused)
+  elif k == rc_rf.RV_OPT: nul_value(&rf, rf.vals[x].a, e, unused)
+
+# ---- extract_scope_declarations_from_destructuring
+
+fn extract_scope_declarations_from_destructuring(var rf: RF, var e: Env):
+  var declared: {Int: Bool} = {}
+  for p in rf.params: declared[e.identifiers[p.place.identifier].declaration_id] = true
+  esd_block(&rf, rf.body, &e, &declared)
+
+fn esd_block(var rf: RF, b: Int, var e: Env, var declared: {Int: Bool}):
+  let old = copy_ints(rf.blocks[b])
+  var out: [Int] = []
+  for s in old:
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_SCOPE:
+      let sid = rf.stmts[s].x
+      for d in e.scopes[sid].declarations: declared[e.identifiers[d.identifier].declaration_id] = true
+      esd_block(&rf, rf.stmts[s].block, &e, &declared)
+      out.push(s)
+    elif k == rc_rf.ST_PRUNED:
+      esd_block(&rf, rf.stmts[s].block, &e, &declared)
+      out.push(s)
+    elif k == rc_rf.ST_TERM:
+      for cb in rc_rvisit.term_blocks(rf.terms[rf.stmts[s].x]): esd_block(&rf, cb, &e, &declared)
+      out.push(s)
+    else:
+      out.push(s)
+      let extra = esd_instr(&rf, rf.stmts[s].x, &e, &declared)
+      for x in extra: out.push(x)
+  rf.blocks[b] = out
+
+fn esd_instr(var rf: RF, ri: Int, var e: Env, var declared: {Int: Bool}) -> [Int]:
+  var extra: [Int] = []
+  let x = rf.instrs[ri].value
+  if rf.vals[x].kind == rc_rf.RV_INSTR:
+    var is_d = false
+    var ops: [Place] = []
+    var dsp = nosp()
+    match rf.vals[x].instr:
+      rc_hir.Destructure(pat, _, _, sp):
+        is_d = true
+        ops = rc_ops.pattern_operands(pat)
+        dsp = sp
+      _: nop()
+    if is_d:
+      var reassigned: {Int: Bool} = {}
+      var has_decl = false
+      for p in ops:
+        if declared.get(e.identifiers[p.identifier].declaration_id, false): reassigned[p.identifier] = true
+        else: has_decl = true
+      if not has_decl:
+        match var rf.vals[x].instr:
+          rc_hir.Destructure(_, kind, _, _): kind = rc_hir.IK_REASSIGN
+          _: nop()
+      elif reassigned.len > 0:
+        var nops: [Place] = []
+        var orig: [Place] = []
+        var temps: [Place] = []
+        for p in ops:
+          if not reassigned.get(p.identifier, false):
+            nops.push(p)
+            continue
+          let t = rc_env.next_identifier_id(&e)
+          let d = e.identifiers[t].declaration_id
+          e.identifiers[t].type_ = e.identifiers[p.identifier].type_
+          e.identifiers[t].sp = p.sp
+          e.identifiers[t].name_kind = 2
+          e.identifiers[t].name = "#t{d}"
+          let tp = Place(t, p.effect, p.reactive, nosp())
+          orig.push(p)
+          temps.push(tp)
+          nops.push(tp)
+        match var rf.vals[x].instr:
+          rc_hir.Destructure(pat, _, _, _):
+            var i = 0
+            rc_ops.set_pattern_operands(&pat, nops, &i)
+          _: nop()
+        let isp = rf.instrs[ri].sp
+        let iid = rf.instrs[ri].id
+        for j in 0..orig.len:
+          let v = rc_rf.add_val(&rf, RVal(kind: rc_rf.RV_INSTR, instr: rc_hir.StoreLocal(rc_hir.LValue(orig[j], rc_hir.IK_REASSIGN), temps[j], dsp)))
+          let nri = rc_rf.add_instr(&rf, iid, false, rc_rf.noplace(), v, isp)
+          let ns = rc_rf.add_stmt(&rf, rc_rf.ST_INSTR, nri, -1)
+          extra.push(ns)
+  update_declared(rf, ri, e, &declared)
+  for s in extra: update_declared(rf, rf.stmts[s].x, e, &declared)
+  return extra
+
+fn update_declared(rf: RF, ri: Int, e: Env, var declared: {Int: Bool}):
+  let x = rf.instrs[ri].value
+  if rf.vals[x].kind != rc_rf.RV_INSTR: return
+  match rf.vals[x].instr:
+    rc_hir.DeclareContext(lv, _):
+      if lv.kind != rc_hir.IK_REASSIGN: declared[e.identifiers[lv.place.identifier].declaration_id] = true
+    rc_hir.StoreContext(lv, _, _):
+      if lv.kind != rc_hir.IK_REASSIGN: declared[e.identifiers[lv.place.identifier].declaration_id] = true
+    rc_hir.DeclareLocal(lv, _):
+      if lv.kind != rc_hir.IK_REASSIGN: declared[e.identifiers[lv.place.identifier].declaration_id] = true
+    rc_hir.StoreLocal(lv, _, _):
+      if lv.kind != rc_hir.IK_REASSIGN: declared[e.identifiers[lv.place.identifier].declaration_id] = true
+    rc_hir.Destructure(pat, kind, _, _):
+      if kind != rc_hir.IK_REASSIGN:
+        for p in rc_ops.pattern_operands(pat): declared[e.identifiers[p.identifier].declaration_id] = true
+    _: nop()
+
+# ---- prune_hoisted_contexts: uninitialized: identifier -> 1 unknown kind, 2 a function (not yet
+# defined)
+
+type PHC:
+  active: [{Int: Bool}] = []
+  uninit: {Int: Int} = {}
+
+fn prune_hoisted_contexts(var rf: RF, var e: Env):
+  var st = PHC()
+  phc_block(&rf, rf.body, &e, &st)
+
+fn phc_place(p: Place, st: PHC, var e: Env):
+  if st.uninit.get(p.identifier, 0) == 2:
+    rc_env.throw(&e, rc_env.with_label_plain(rc_env.diag(rc_env.EC_TODO, "[PruneHoistedContexts] Rewrite hoisted function references"), p.sp))
+
+fn phc_block(var rf: RF, b: Int, var e: Env, var st: PHC):
+  let old = copy_ints(rf.blocks[b])
+  var out: [Int] = []
+  for s in old:
+    if e.failed: return
+    let k = rf.stmts[s].kind
+    if k == rc_rf.ST_SCOPE:
+      let sid = rf.stmts[s].x
+      var ids: {Int: Bool} = {}
+      for d in e.scopes[sid].declarations: ids[d.key] = true
+      for d in e.scopes[sid].declarations: st.uninit[d.identifier] = 1
+      st.active.push(ids)
+      phc_block(&rf, rf.stmts[s].block, &e, &st)
+      st.active.pop()
+      for d in e.scopes[sid].declarations: st.uninit.remove(d.identifier)
+      out.push(s)
+    elif k == rc_rf.ST_PRUNED:
+      phc_block(&rf, rf.stmts[s].block, &e, &st)
+      out.push(s)
+    elif k == rc_rf.ST_TERM:
+      let ti = rf.stmts[s].x
+      var ks: [Int] = []
+      var xs: [Int] = []
+      rc_rvisit.term_parts(rf.terms[ti], &ks, &xs)
+      let tk = rf.terms[ti].kind
+      let tv = rf.terms[ti].value
+      let thb = rf.terms[ti].has_binding
+      # (the transform's traverse_terminal: places, values and blocks in order)
+      if tk == rc_rf.RT_RETURN or tk == rc_rf.RT_THROW or tk == rc_rf.RT_IF or tk == rc_rf.RT_SWITCH: phc_place(tv, st, &e)
+      if tk == rc_rf.RT_SWITCH:
+        var cts: [Bool] = []
+        var ctp: [Place] = []
+        var cbs: [Int] = []
+        for c in rf.terms[ti].cases:
+          cts.push(c.has_test)
+          ctp.push(c.test)
+          cbs.push(c.block)
+        for ci in 0..cts.len:
+          if e.failed: return
+          if cts[ci]: phc_place(ctp[ci], st, &e)
+          if cbs[ci] >= 0: phc_block(&rf, cbs[ci], &e, &st)
+        out.push(s)
+        continue
+      for i in 0..ks.len:
+        if e.failed: return
+        if tk == rc_rf.RT_TRY and i == 1 and thb: phc_place(tv, st, &e)
+        if ks[i] == 1: phc_block(&rf, xs[i], &e, &st)
+        else: phc_value(rf, xs[i], &e, st)
+      out.push(s)
+    else:
+      if phc_instr(&rf, rf.stmts[s].x, &e, &st): out.push(s)
+  rf.blocks[b] = out
+
+fn phc_value(rf: RF, x: Int, var e: Env, st: PHC):
+  let k = rf.vals[x].kind
+  if k == rc_rf.RV_INSTR:
+    for p in rc_ops.value_operands(rf.vals[x].instr, e): phc_place(p, st, &e)
+  elif k == rc_rf.RV_SEQ:
+    for ri in rf.vals[x].instrs: phc_value(rf, rf.instrs[ri].value, &e, st)
+    phc_value(rf, rf.vals[x].a, &e, st)
+  elif k == rc_rf.RV_OPT: phc_value(rf, rf.vals[x].a, &e, st)
+  elif k == rc_rf.RV_LOGICAL:
+    phc_value(rf, rf.vals[x].a, &e, st)
+    phc_value(rf, rf.vals[x].b, &e, st)
+  elif k == rc_rf.RV_COND:
+    phc_value(rf, rf.vals[x].a, &e, st)
+    phc_value(rf, rf.vals[x].b, &e, st)
+    phc_value(rf, rf.vals[x].c, &e, st)
+
+fn hoisted_to(k: Int) -> Int:
+  if k == rc_hir.IK_HOISTED_LET: return rc_hir.IK_LET
+  if k == rc_hir.IK_HOISTED_CONST: return rc_hir.IK_CONST
+  if k == rc_hir.IK_HOISTED_FUNCTION: return rc_hir.IK_FUNCTION
+  return -1
+
+# false: the instruction is removed
+fn phc_instr(var rf: RF, ri: Int, var e: Env, var st: PHC) -> Bool:
+  let x = rf.instrs[ri].value
+  if rf.vals[x].kind == rc_rf.RV_INSTR:
+    var dc = -1
+    var dcid = -1
+    var sc = -1
+    var scid = -1
+    match rf.vals[x].instr:
+      rc_hir.DeclareContext(lv, _):
+        dc = lv.kind
+        dcid = lv.place.identifier
+      rc_hir.StoreContext(lv, _, _):
+        sc = lv.kind
+        scid = lv.place.identifier
+      _: nop()
+    if dc >= 0:
+      let nh = hoisted_to(dc)
+      if nh >= 0:
+        if nh == rc_hir.IK_FUNCTION and dcid in st.uninit: st.uninit[dcid] = 2
+        return false
+    if sc >= 0 and sc != rc_hir.IK_REASSIGN:
+      var declared = false
+      for a in st.active:
+        if a.get(scid, false): declared = true
+      if declared:
+        if sc == rc_hir.IK_LET or sc == rc_hir.IK_CONST:
+          match var rf.vals[x].instr:
+            rc_hir.StoreContext(lv, _, _): lv.kind = rc_hir.IK_REASSIGN
+            _: nop()
+        elif sc == rc_hir.IK_FUNCTION:
+          if scid in st.uninit:
+            if st.uninit[scid] != 2:
+              rc_env.throw(&e, rc_env.with_label_plain(rc_env.diag(rc_env.EC_INVARIANT, "[PruneHoistedContexts] Unexpected hoisted function"), rf.instrs[ri].sp))
+              return true
+            st.uninit.remove(scid)
+        else:
+          rc_env.throw(&e, rc_env.with_label_plain(rc_env.diag(rc_env.EC_TODO, "[PruneHoistedContexts] Unexpected kind"), rf.instrs[ri].sp))
+          return true
+  # visit_instruction: its places
+  phc_value(rf, x, &e, st)
+  return true

@@ -26,6 +26,15 @@ import rc_imar
 import rc_dce
 import rc_rik
 import rc_irp
+import rc_scopes
+import rc_psd
+import rc_rf
+import rc_rvisit
+import rc_rpass
+import rc_rpass2
+import rc_rdump
+import rc_vpmm
+import rc_rsv
 import rc_ved
 import scan
 from scan import T_ASSIGN, T_COMMA, T_AND, T_OR, T_QQ, T_INC, T_DEC
@@ -550,6 +559,35 @@ fn walk_jsx_children(c: Ctx, var w: Walker, lst: Int):
     if k == ast.N_JSXELEM: walk_jsx_element(c, &w, ch)
     elif k == ast.N_JSXEXPR or k == ast.N_JSXSPREAD: walk_expression(c, &w, c.t.nd[ch].a)
 
+# may_contain_react_code (oxc_linter utils/react_compiler.rs, from eslint-plugin-react-hooks'
+# mayContainReactCode): a file is compiled only when a top-level statement declares a function
+# named like a component or hook (a declaration, or a variable initialized with an arrow or
+# function expression), or default-exports an anonymous function or a function expression
+fn is_component_or_hook_name(s: Str) -> Bool:
+  return (s.len > 0 and s[0] >= 'A' and s[0] <= 'Z') or is_hook_name(s)
+
+fn may_contain_react_code(c: Ctx, root: Int) -> Bool:
+  for s in items(c, root):
+    let k = nk(c, s)
+    let nd = c.t.nd[s]
+    if k == ast.N_FUNC:
+      if nd.d <= 0: continue
+      if nd.s < 0:
+        if (nd.f & ast.M_DEFAULT) != 0: return true
+        continue
+      if is_component_or_hook_name(nm(c, s)): return true
+    elif k == ast.N_VAR:
+      for d in items(c, nd.a):
+        let id = c.t.nd[d].a
+        let init = c.t.nd[d].c
+        if nk(c, id) == ast.N_ID and is_component_or_hook_name(nm(c, id)) and init > 0:
+          let x = rc_lower.without_parens(c, init)
+          if nk(c, x) == ast.N_FUNCEXPR or nk(c, x) == ast.N_ARROW: return true
+    elif k == ast.N_EXPORTDEFAULT:
+      let x = rc_lower.without_parens(c, nd.a)
+      if nk(c, x) == ast.N_FUNCEXPR or nk(c, x) == ast.N_ARROW: return true
+  return false
+
 # Whether find_functions_to_compile can find any function, without c.m (the semantic model):
 # taking each function by its node instead of its scope finds every function it finds (a scope
 # already taken or missing only rejects more, and a function taken stops the walk only below it),
@@ -710,19 +748,53 @@ fn take_invariant_errors(var e: Env) -> [Diag]:
       out.push(d)
   return out
 
-fn compile_fn(c: Ctx, src: Source, var reg: rc_shapes.Registry) -> Result:
+fn compile_fn(c: Ctx, src: Source, var reg: rc_shapes.Registry, full: Bool) -> Result:
   var e = rc_env.new_env(src.fn_type)
   swap(&e.reg, &reg)
-  var r = compile_in(c, src, &e)
+  var r = compile_in(c, src, &e, full)
   swap(&e.reg, &reg)
   return r
 
-fn compile_in(c: Ctx, src: Source, var e: Env) -> Result:
+# hir_has_start_memoize
+fn has_start_memoize(f: rc_hir.HirFunction) -> Bool:
+  for ins in f.instructions:
+    match ins.value:
+      rc_hir.StartMemoize(_, _, _, _, _, _, _): return true
+      _: nop()
+  return false
+
+# calls_effect_hook: a call of an effect hook, by type, in the function itself
+fn calls_effect_hook(f: rc_hir.HirFunction, e: Env) -> Bool:
+  for ins in f.instructions:
+    var callee = -1
+    match ins.value:
+      rc_hir.CallExpression(c, _, _): callee = c.identifier
+      rc_hir.MethodCall(_, p, _, _): callee = p.identifier
+      _: nop()
+    if callee >= 0:
+      let sh = rc_scopes.fn_shape_of(e, callee)
+      if sh == "BuiltInUseEffectHook" or sh == "BuiltInUseLayoutEffectHook" or sh == "BuiltInUseInsertionEffectHook": return true
+  return false
+
+# (debugging: dump the ranges and the reactive function on stderr, rc_rdump.vu)
+const DBG = false
+
+fn nop():
+  return
+
+fn finish(var e: Env, own events: [Diag]) -> Result:
+  if e.errors.len > 0: return Result(false, take_errors(&e), events)
+  return Result(true, [], events)
+
+# full: react/todo or react/invariant is on (oxlint's report_todo_and_invariant); else
+# lint_skip_reactive_scope_passes: a function without useMemo/useCallback skips the reactive scope
+# passes, which only report those
+fn compile_in(c: Ctx, src: Source, var e: Env, full: Bool) -> Result:
   var events: [Diag] = []
   var f = rc_lower.lower(c, &e, src.node)
   if e.failed: return Result(false, take_thrown(&e), events)
   if has_invariant_errors(e): return Result(false, take_invariant_errors(&e), events)
-  if e.skip_compilation: return Result(true, [], events)
+  # (lint mode compiles a function lowering flagged as not to be rewritten: skip_compilation)
   rc_ssa.prune_maybe_throws(&f, &e)
   if e.failed: return Result(false, take_thrown(&e), events)
   rc_pass1.validate_context_variable_lvalues(f, &e)
@@ -761,7 +833,7 @@ fn compile_in(c: Ctx, src: Source, var e: Env) -> Result:
   rc_imar.infer_mutation_aliasing_ranges(&f, &e, false)
   if e.failed: return Result(false, take_thrown(&e), events)
   # (oxlint 1.94 reports no impure call in an async component)
-  if f.is_async: drop_purity(&e)
+  if f.is_async and e.fn_type == rc_hir.FN_COMPONENT: drop_purity(&e)
   rc_valid1.validate_locals_not_reassigned_after_render(f, &e)
   rc_vref.validate_no_ref_access_in_render(f, &e)
   rc_valid1.validate_no_set_state_in_render(f, &e)
@@ -780,9 +852,22 @@ fn compile_in(c: Ctx, src: Source, var e: Env) -> Result:
     swap(&d, &jt[i])
     events.push(d)
   rc_valid1.validate_no_freezing_known_mutable_functions(f, &e)
+  if not full and not has_start_memoize(f):
+    var sc0 = rc_valid2.validate_static_components(f, e)
+    for i in 0..sc0.len:
+      var d = rc_env.diag(0, "")
+      swap(&d, &sc0[i])
+      events.push(d)
+    if calls_effect_hook(f, e):
+      rc_irp.infer_reactive_places(&f, &e)
+      if e.failed: return Result(false, take_thrown(&e), events)
+      rc_ved.validate_exhaustive_dependencies(&f, &e)
+      if e.failed: return Result(false, take_thrown(&e), events)
+    return finish(&e, events)
   rc_irp.infer_reactive_places(&f, &e)
   if e.failed: return Result(false, take_thrown(&e), events)
   rc_ved.validate_exhaustive_dependencies(&f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
   rc_rik.rewrite_instruction_kinds(&f, &e)
   if e.failed: return Result(false, take_thrown(&e), events)
   var sc = rc_valid2.validate_static_components(f, e)
@@ -790,9 +875,55 @@ fn compile_in(c: Ctx, src: Source, var e: Env) -> Result:
     var d = rc_env.diag(0, "")
     swap(&d, &sc[i])
     events.push(d)
-  # (the reactive scope passes are ported next)
-  if e.errors.len > 0: return Result(false, take_errors(&e), events)
-  return Result(true, [], events)
+  # the reactive scopes (rc_scopes.vu, rc_psd.vu), then the reactive function (rc_rf.vu,
+  # rc_rpass.vu, rc_rpass2.vu) and the validation (rc_vpmm.vu)
+  if DBG: rc_rdump.dump_ranges(f, e)
+  rc_rsv.infer_reactive_scope_variables(f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  let fbt = rc_scopes.memoize_fbt_and_macro_operands_in_same_scope(f, &e)
+  rc_scopes.outline_functions(&f, &e, fbt)
+  rc_scopes.align_method_call_scopes(&f, &e)
+  rc_scopes.align_object_method_scopes(&f, &e)
+  rc_scopes.prune_unused_labels_hir(&f)
+  rc_scopes.align_reactive_scopes_to_block_scopes_hir(&f, &e)
+  rc_scopes.merge_overlapping_reactive_scopes_hir(&f, &e)
+  rc_scopes.assert_valid_block_nesting(f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_scopes.build_reactive_scope_terminals_hir(&f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_scopes.assert_valid_block_nesting(f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_scopes.flatten_reactive_loops_hir(&f)
+  rc_scopes.flatten_scopes_with_hooks_or_use_hir(&f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_scopes.assert_terminal_successors_exist(f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_scopes.assert_terminal_preds_exist(f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_psd.propagate_scope_dependencies_hir(&f, &e)
+  var rf = rc_rf.build_reactive_function(f, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_rpass.prune_unused_labels(&rf)
+  rc_rpass.assert_scope_instructions_within_scopes(rf, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_rpass.prune_non_escaping_scopes(&rf, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_rpass.prune_non_reactive_dependencies(&rf, &e)
+  rc_rpass.prune_unused_scopes(&rf, e)
+  rc_rpass2.merge_reactive_scopes_that_invalidate_together(&rf, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  rc_rpass.prune_always_invalidating_scopes(&rf, e)
+  rc_rpass.propagate_early_returns(&rf, &e)
+  rc_rpass.prune_unused_lvalues(&rf, e)
+  rc_rpass2.promote_used_temporaries(rf, &e)
+  rc_rpass.extract_scope_declarations_from_destructuring(&rf, &e)
+  # (stabilize_block_ids only renumbers the labels)
+  rc_rpass2.rename_variables(rf, &e)
+  rc_rpass.prune_hoisted_contexts(&rf, &e)
+  if e.failed: return Result(false, take_thrown(&e), events)
+  if DBG: rc_rdump.dump(rf, e, "before validation")
+  rc_vpmm.validate_preserved_manual_memoization(rf, &e)
+  return finish(&e, events)
 
 # with_fallback_label: a diagnostic without a label gets one at the function; else its first label
 # is primary when none is
@@ -821,7 +952,7 @@ fn log_error(own errs: [Diag], fsp: Sp, var out: [Diag]):
 # aren't looked for (eslint-plugin-react-hooks 7.1.1: with validateExhaustiveMemoizationDependencies
 # and validateHooksUsage on, as its lint has them, findProgramSuppressions gets no rule names), 1
 # both: the suppression's diagnostic marked only 1, the function's compile only 2
-fn process_fn(c: Ctx, src: Source, sups: [Supp], var reg: rc_shapes.Registry, var out: [Diag], supp: Int):
+fn process_fn(c: Ctx, src: Source, sups: [Supp], var reg: rc_shapes.Registry, var out: [Diag], supp: Int, full: Bool):
   let fsp = rc_lower.function_diag_span(c, src.node)
   let nd = c.t.nd[src.node]
   var only = 0
@@ -834,7 +965,7 @@ fn process_fn(c: Ctx, src: Source, sups: [Supp], var reg: rc_shapes.Registry, va
       for i in n0..out.len: out[i].only = 1
       only = 2
   let n1 = out.len
-  var r = compile_fn(c, src, &reg)
+  var r = compile_fn(c, src, &reg, full)
   for i in 0..r.events.len:
     var d = rc_env.diag(0, "")
     swap(&d, &r.events[i])
@@ -848,14 +979,14 @@ fn process_fn(c: Ctx, src: Source, sups: [Supp], var reg: rc_shapes.Registry, va
 
 # compile_program in lint mode: the diagnostics of the file
 # (rcb: the shared base registry; one is built for the file when it isn't)
-fn lint(c: Ctx, root: Int, comments: [Int], rcb: [Shared[rc_shapes.Base]], supp: Int) -> [Diag]:
+fn lint(c: Ctx, root: Int, comments: [Int], rcb: [Shared[rc_shapes.Base]], supp: Int, full: Bool) -> [Diag]:
   var out: [Diag] = []
   if has_memo_cache_function_import(c, root): return out
   let queue = find_functions_to_compile(c, root)
   if queue.len == 0: return out
   let sups = find_program_suppressions(c.src, comments)
   var reg = rc_shapes.file_registry(rcb)
-  for s in queue: process_fn(c, s, sups, &reg, &out, supp)
+  for s in queue: process_fn(c, s, sups, &reg, &out, supp, full)
   return out
 
 # every comment's span (start, end pairs), outside literals (rjest.all_comments over a tree)
