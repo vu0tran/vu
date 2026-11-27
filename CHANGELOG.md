@@ -3455,3 +3455,38 @@ pattern (176 outputs, 2 at a time) the outputs are identical and the job's peak 
 vlint's process: max RSS 3.78 -> 3.25 GB, instructions 150.75 -> 150.95 G (the stores' checks). The
 next largest: 3.66 -> 3.15 GB, 2.77 -> 2.29 GB, 87.50 -> 88.02 G. vtsc's probes and vtests are
 unchanged (one measurement each, on a loaded machine).
+
+**vlint: react(preserve-manual-memoization), the last React Compiler rule (2026-11-27).** The
+validation runs on the reactive function at the end of oxc_react_compiler 1.94.0's pipeline, so the
+rest of the pipeline after `infer_reactive_places` is ported from 1.94.0: scope inference and
+alignment, merging overlapping scopes, the scope terminals, flattening loops and hooks,
+`propagate_scope_dependencies_hir`, `build_reactive_function` and the twelve passes over the
+reactive function, then the validation (`ts/rc_scopes.vu`, `rc_psd.vu`, `rc_rf.vu`, `rc_rvisit.vu`,
+`rc_rpass.vu`, `rc_rpass2.vu`, `rc_vpmm.vu`; `ts/NOTES.md` maps each pass and says why three are
+skipped: block renumbering, a Rust assert, codegen). As oxlint does, a function without
+useMemo/useCallback skips these passes unless `react/todo` or `react/invariant` is on, and a file is
+compiled only when a top-level declaration looks like a component or hook (`may_contain_react_code`,
+new in 1.94.0's linter). The port of the earlier passes had been made from 1.90.0; the 1.94.0
+behaviours these passes need came with them (an IIFE's label had its fallthrough and id swapped,
+hoisted function initializers, binary operators no longer typing their operands, reactive control
+through controlling blocks' frontiers, try/catch phis, member chains of 500, 1.94.0's globals with
+array callbacks applied, IMAR's `may_call`, an unreachable-code Todo).
+Checked against oxlint 1.94.0 with `-f json`, every React Compiler rule on (todo and invariant too,
+so every function runs every pass) and with them off: oxc's 2,148 compiler fixtures give the same
+preserve-manual-memoization diagnostics, and the other rules differ by 12 diagnostics from 1.94.0
+validation changes not ported (listed in `ts/NOTES.md`); a React monorepo's 38,391 files give the
+same 1,325 and 293 diagnostics. Its CI job's 88 invocations print oxlint 1.94.0's React output; 58
+lines changed from the build before, every one toward oxlint. Cost, instructions retired of vlint's
+process alone, one run each without type-aware rules: the job's largest invocation 111.5 -> 121.7 G
+(+9.1%; a profile puts the new passes at 6.9% of its samples, propagate_scope_dependencies_hir the
+largest at 2.5%), the React Compiler package 17.9 -> 19.0 G (+6.3%), three others 18.1 -> 17.6,
+7.36 -> 7.07 and 2.29 -> 2.26 G (files without a top-level component or hook are no longer
+compiled).
+Attack rounds: invented probes of useMemo/useCallback with optional chains, loops, labels,
+switch, try/catch/finally, async callbacks, hoisted functions, destructuring, early returns, nested
+components and context variables (four rounds, about 50 functions, with JSON compared) found
+nothing; the monorepo run found one difference (the unreachable-code Todo looked at visited blocks,
+not the built ones, and used 1.90.0's span), fixed. Still different from 1.94.0 and not needed by
+this rule: the locals-reassigned and ref-access validations' rewrites, ambient bindings, BigInt
+literals; and infer_types without 1.94.0's memoized resolution, so oxc's fixture
+`try-catch-continue-copied-locals-in-loop.js` still takes vlint over 20 GB (as it did before).

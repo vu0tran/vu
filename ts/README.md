@@ -181,7 +181,9 @@ names them on stderr, and they report nothing.
   vtsc types, 64 are missing and 51 are extra. 81 files vtsc can't fully type hold the other 174,
   and vlint names those files on stderr.
 - The other rules: the same output except 9 diagnostics of
-  `react/preserve-manual-memoization`, which vlint doesn't implement.
+  `react/preserve-manual-memoization`, which vlint didn't implement then. **Later** (2026-11-27): it
+  does (below, "The React Compiler rules"); the repository's CI job, 88 invocations, now prints
+  oxlint 1.94.0's React output.
 - Wall time, cold (no cache), on a 10-core Mac: vlint 33.6 to 37.1 s, oxlint 1.94.0 57.2 to 63.1 s,
   and the oxlint 1.79.0 the repository pins 77.0 to 86.3 s. Warm, with `--cache` and nothing changed,
   vlint takes 2.6 s (7.6 s of CPU). The cold run is about 280 s of CPU, 220 of them in the type-aware
@@ -488,7 +490,14 @@ and hooks and the suppression comments, lowering vlint's syntax tree to the comp
 constant propagation, type inference with oxc's shapes and globals (`rc_gdefs.vu` is generated from
 `globals.rs` by `rc_gen/gen_shapes.py`), the mutation and aliasing analysis (effects, then ranges),
 reactive places and scope variables, and every validation up to `ValidateStaticComponents`. 21 of
-the 22 rules are on in `limpl.vu`.
+the 22 rules are on in `limpl.vu`. **Later** (2026-11-27): all 22. The reactive scope passes after
+those (about 30, `rc_scopes.vu`, `rc_psd.vu`, `rc_rf.vu`, `rc_rpass*.vu`, read beside 1.94.0) and
+`validate_preserved_manual_memoization` (`rc_vpmm.vu`) are ported, with the 1.94.0 behaviours of the
+earlier passes they depend on. Against oxlint 1.94.0, every React Compiler rule on (so every
+function runs every pass), message, help and labels compared: oxc's 2,148 compiler fixtures give the
+same `preserve-manual-memoization` diagnostics and differ by 12 diagnostics of other rules (1.94.0
+changes to validations not ported, listed in `NOTES.md`); a React monorepo's 38,391 files (the two configurations, todo and invariant on and off)
+give the same 1,325 and 293 diagnostics.
 
 Compared with oxlint 1.90.0, every React Compiler rule on, diagnostics compared with message, help,
 note and every label:

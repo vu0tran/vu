@@ -2942,3 +2942,98 @@ two either way, so CPU and instructions are the numbers to compare):
 Not done: a run's own cwd (every run is in the batch's); a run's process.argv for its plugins (the
 batch's); the type-aware check of a run's larger programs in a process of their own, for its
 memory, which the shared memo can't reach (VLINT_BATCH_SHARE=0 does that, without the sharing).
+
+### react(preserve-manual-memoization): the reactive scope passes (2026-11-27)
+
+The 22nd React Compiler rule. Its validation runs at the end of oxc_react_compiler 1.94.0's
+pipeline (`pipeline.rs`), on the reactive function, so the whole rest of the pipeline after
+`infer_reactive_places` is ported, from 1.94.0's Rust (fetched with `gh api
+repos/oxc-project/oxc/contents/crates/oxc_react_compiler/src/PATH?ref=oxlint_v1.94.0`). In
+`rc_prog.compile_in`, in pipeline order:
+
+| pass (Rust file) | Vu |
+|---|---|
+| infer_reactive_scope_variables | `rc_rsv.vu` (already there, for inner functions) |
+| memoize_fbt_and_macro_operands_in_same_scope, outline_functions, align_method_call_scopes, align_object_method_scopes, prune_unused_labels_hir, align_reactive_scopes_to_block_scopes_hir, merge_overlapping_reactive_scopes_hir, assert_valid_block_nesting (and recursively_traverse_items), build_reactive_scope_terminals_hir, flatten_reactive_loops_hir, flatten_scopes_with_hooks_or_use_hir, assert_terminal_successors_exist / preds_exist | `rc_scopes.vu` |
+| propagate_scope_dependencies_hir (ScopeBlockTraversal, the optional chain sidemap, the property path registry, the dependency tree) | `rc_psd.vu` |
+| ReactiveFunction, build_reactive_function | `rc_rf.vu`: the tree in tables (`RF`: blocks are lists of statement indices; values, instructions and terminals by index). The HIR's instruction values are moved into it (each is emitted once). |
+| ReactiveFunctionVisitor | `rc_rvisit.vu`: the visitor's walk as a list of events (places, lvalues, instruction ends, scope / block / terminal starts and ends, `hir` for visit_hir_function), folded by the read-only passes; the transforms walk the tree themselves |
+| prune_unused_labels, assert_scope_instructions_within_scopes, prune_non_escaping_scopes, prune_non_reactive_dependencies, prune_unused_scopes, prune_always_invalidating_scopes, propagate_early_returns, prune_unused_lvalues, extract_scope_declarations_from_destructuring, prune_hoisted_contexts | `rc_rpass.vu` |
+| merge_reactive_scopes_that_invalidate_together, promote_used_temporaries, rename_variables | `rc_rpass2.vu` |
+| validate_preserved_manual_memoization | `rc_vpmm.vu` |
+
+The scope fields the passes fill (dependencies, declarations, reassignments, the early return,
+merged) are on `rc_env.Scope`. A scope's range and the identifiers that share it are tied by
+`MutableRange.id`, as the Rust port ties them (TS shares the object).
+
+Skipped, and why each can't change a diagnostic:
+- stabilize_block_ids: renumbers the labels' block ids; nothing after it reads a block id.
+- assert_well_formed_break_targets: a Rust `assert!` (a panic), no diagnostic.
+- codegen, optimize_for_ssr (SSR only), outline_jsx and name_anonymous_functions (off in oxlint's
+  configuration).
+- outline_functions' generated names: an outlined function becomes a LoadGlobal of a name no local
+  can have (`"\0outlined1"`); 1.94's `_temp` names avoid every binding of the file, so the only
+  reader, rename_variables' globals, sees the same collisions (none).
+
+oxlint's lint shortcut (`lint_skip_reactive_scope_passes`, oxc_linter `utils/react_compiler.rs`):
+true unless `react/todo` or `react/invariant` is on for the file (`report_todo_and_invariant`). Then
+a function without a StartMemoize (no useMemo/useCallback) stops after the validations:
+`validate_static_components`, and infer_reactive_places + validate_exhaustive_dependencies only when
+it calls an effect hook. `rmore10.file_end` passes `full` (todo or invariant on natively, or as an
+eslint-plugin-react-hooks alias) to `rc_prog.lint`. So on the CI job only functions with
+useMemo/useCallback pay for the passes.
+
+Also from 1.94's pipeline and linter, not ported before: lint mode compiles a function lowering
+flagged `skip_compilation`; the async purity exemption is for components only; a file is compiled
+only when `may_contain_react_code` (a top-level component or hook declaration, or an anonymous or
+function-expression default export: `rc_prog.may_contain_react_code`) says so, which drops files
+whose components are all wrapped (`memo(function X() {...})`, `forwardRef(...)`).
+
+1.94 behaviours of passes already ported that these passes depend on, ported with them (the port was
+made from 1.90.0): inline_iifes' Label had its fallthrough and id swapped; a hoisted function
+declaration is a hoisted context declaration whose initializing StoreContext keeps its Mutate
+(`hoisted_init`); a coercing binary operator doesn't type its operands; reactive control through
+the controlling blocks' frontiers; phi operands of pruned edges; member chains of 500 or more
+(a Todo, and lowered without recursion); globals regenerated from 1.94's `globals.rs` (map/flatMap
+apply their callback on read-only arrays, arrays' forEach; `gen_shapes.py` follows const tables
+named in others); IMAR's `called` / `may_call` (a closure's errors only when a mutation that may
+call it reaches it); the immutability help's Ref hint; capitalized-calls skips ALL-CAPS properties;
+the unreachable-function-expression Todo checks the built function's blocks (used or used
+fallthrough) with 1.94's diagnostic span.
+
+1.94 changes still not ported (found by diffing 1.90.0 against 1.94.0, none needed by this rule's
+passes as far as the fixtures and the monorepo show): validate_locals_not_reassigned_after_render's
+rewrite (parameters as context variables, flow-sensitive context values, async callables),
+validate_no_ref_access_in_render's `??=` lazy initialization and its convergence, ambient (`declare`)
+bindings in lowering, BigInt primitives, the member-update and logical-assignment HIR shapes,
+PrefixUpdate/PostfixUpdate's Local/Context split (the port lowers a context `x++` as a load, a
+binary and a StoreContext: equivalent for inference except that 1.94 types `x` primitive), and
+infer_types' memoized resolution (oxc's fixture `try-catch-continue-copied-locals-in-loop.js` takes
+the port over 20 GB in seconds, before and after this work). On oxc's 2,148 compiler fixtures with
+every React rule on, the differences left are these: 2 refs, 3 immutability, 2 todo (ambient), 1
+syntax, 1 set-state-in-effect, 3 invariants (ref convergence), all vlint-only; none in
+preserve-manual-memoization, whose diagnostics (message, help, labels) are identical.
+
+How it was checked:
+- oxc's fixtures (`crates/oxc_react_compiler/fixtures/`, 2,148 files), every React Compiler rule
+  on (todo and invariant too, so every function runs every pass) and with todo and invariant off:
+  `-f json` compared diagnostic by diagnostic, as above. (Two fixtures are run apart: the 520-member
+  chain overflowed a worker thread's stack before this work, now a Todo, and the type-inference one.)
+- The monorepo's packages and plugins (every file oxlint lints), with each of those two
+  configurations (38,391 files): `-f json` identical, 1,325 and 293 diagnostics.
+- The CI job's 88 invocations against oxlint 1.94.0: the React rules' output identical (the
+  package where oxlint's tsgolint crashes compared with a do-nothing tsgolint); against the build
+  before, 58 lines changed, every one toward oxlint 1.94.0 (the rule's 8 diagnostics, unused
+  directives that now match, purity in files may_contain_react_code no longer compiles).
+- Probes: `probes/rc-pmm-deps`, `probes/rc-pmm-scopes-todo`, `probes/rc-file-gate`.
+
+Cost (instructions retired of vlint's process, `scratchpad/vl/m8/ins.sh`, one run each, no
+type-aware rules): the job's largest invocation 111.48 -> 121.65 G (+9.1%), the React Compiler
+package (idx 31) 17.89 -> 19.01 G, idx 86 18.08 -> 17.58, idx 16 7.36 -> 7.07, idx 23 2.29 -> 2.26
+(may_contain_react_code drops files). `--profile` on the largest: the new passes 777 of 11,249
+samples (6.9%): propagate_scope_dependencies_hir 278 (its collect_dependencies and
+get_assumed_invoked_functions about 55 each), rc_rpass 151, rc_scopes 154, rc_rpass2 138, the
+event lists of rc_rvisit about 120 of those.
+
+Debugging: `rc_prog.DBG` prints the ranges before infer_reactive_scope_variables and the reactive
+function before the validation (`rc_rdump.vu`) on stderr.
