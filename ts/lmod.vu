@@ -57,6 +57,8 @@ type Rec:
   le_s: [Int]
   le_e: [Int]
   ind_t: [Bool]       # each indirect export entry: type-only
+  part: Bool = false  # a dependency's record whose requests other than re-exports aren't resolved
+                      # yet (rq_path ""): place loads only what dep_follow says, unless it's followed whole
 
 fn new_rec(path: Str) -> Rec:
   return Rec(path, false, false, [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], false, [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [], [])
@@ -69,10 +71,58 @@ type Graph:
   cwd: Str
   scc: [[Int]]        # no-cycle: each record's strongly connected component (ignoreTypes false, true),
   cyc: [[Bool]]       # and whether that component holds a cycle
-  full: Bool          # follow everything a dependency in node_modules imports (no-barrel-file counts it)
+  full: Bool          # no-barrel-file is on: what it counts is followed whole (fullv)
+  fullv: [Bool] = []  # each record: everything it imports is followed, a dependency's too (it is
+                      # reachable from what a linted file re-exports whole, which no-barrel-file counts)
+  placed: [Bool] = [] # each record: parsed and placed
+  root: [Bool] = []   # each record: a linted file (or one of its sections)
 
 fn new_graph() -> Graph:
   return Graph(false, [], {}, {}, "", [], [], false)
+
+fn add_rec(var g: Graph, path: Str) -> Int:
+  let i = g.recs.len
+  g.recs.push(new_rec(path))
+  g.fullv.push(false)
+  g.placed.push(false)
+  g.root.push(false)
+  return i
+
+# the requests of a linted file's record that no-barrel-file counts the modules of: `export * from`,
+# `export * as ns from`, and a namespace import exported again (`import * as ns`, `export { ns }`)
+fn nb_seeds(r: Rec) -> [Bool]:
+  var out = [false] * r.rq.len
+  for x in r.star_rq: out[x] = true
+  for e in 0..r.ind_rq.len:
+    if r.ind_rq[e] >= 0 and (r.ind_ik[e] == 1 or r.ind_ik[e] == 2): out[r.ind_rq[e]] = true
+  for e in 0..r.ie_n.len:
+    if r.ie_k[e] == 1 and r.ie_n[e] >= 0:
+      for ln in r.le_ln:
+        if ln == r.ie_local[e]: out[r.ie_n[e]] = true
+  return out
+
+# record x and all it reaches followed whole (no-barrel-file counts them): a dependency placed
+# before gets the requests it didn't follow then
+fn mark_full(fs: Fs, ffi: Ffi, var mrs: Rs, var g: Graph, x: Int, var todo: [Job]):
+  var st: [Int] = [x]
+  while st.len > 0:
+    let y = st.pop()
+    if g.fullv[y]: continue
+    g.fullv[y] = true
+    if not g.placed[y]: continue
+    if g.recs[y].part: resolve_rest(fs, ffi, &mrs, &g.recs[y])
+    for j in 0..g.recs[y].rq.len:
+      let target = g.recs[y].rq_path[j] + ""
+      if target == "" or not valid_ext(target): continue
+      var ti = g.recs[y].rq_res[j]
+      if ti < 0:
+        if target in g.at: ti = g.at[target]
+        else:
+          ti = add_rec(&g, target)
+          g.at[target] = ti
+          todo.push(Job(ti, target + ""))
+        g.recs[y].rq_res[j] = ti
+      if not g.fullv[ti]: st.push(ti)
 
 # oxc's VALID_EXTENSIONS
 fn js_ext(p: Str) -> Bool:
@@ -334,6 +384,13 @@ fn build_record(t: ast.Ast, src: Str, root: Int, path: Str) -> Rec:
 
 # ---- the graph
 
+# an identifier, string or specifier the parser found missing (its name -1)
+fn unnamed(t: ast.Ast) -> Bool:
+  for x in 1..t.nd.len:
+    let k = t.nd[x].k
+    if t.nd[x].s < 0 and (k == ast.N_ID or k == ast.N_STR or k == ast.N_SPEC): return true
+  return false
+
 fn find_root(t: ast.Ast) -> Int:
   var root = -1
   for x in 1..t.nd.len:
@@ -341,6 +398,15 @@ fn find_root(t: ast.Ast) -> Int:
   return root
 
 fn parse_text(own src0: Str, path: Str, kind: Str, var kw: {Str: Int}, var t: ast.Ast) -> Rec:
+  var none = ""
+  return parse_text_k(src0, path, kind, &kw, &t, false, &none)
+
+# (keep: the text given back in back)
+fn parse_text_k(own src0: Str, path: Str, kind: Str, var kw: {Str: Int}, var t: ast.Ast, keep: Bool, var back: Str) -> Rec:
+  return parse_text_j(src0, path, kind, &kw, &t, keep, &back, true)
+
+# (jl: function bodies in JavaScript and TSX skipped too, their JSX read byte by byte)
+fn parse_text_j(own src0: Str, path: Str, kind: Str, var kw: {Str: Int}, var t: ast.Ast, keep: Bool, var back: Str, jl: Bool) -> Rec:
   var src = src0
   ast.clear_nodes(&t)
   let jsx = not (kind.endswith(".ts") or kind.endswith(".mts") or kind.endswith(".cts"))
@@ -349,26 +415,41 @@ fn parse_text(own src0: Str, path: Str, kind: Str, var kw: {Str: Int}, var t: as
   t.lite = 0
   if kind.endswith(".ts") or kind.endswith(".mts") or kind.endswith(".cts"): t.lite = 1
   elif path.find("/node_modules/") >= 0 and (kind.endswith(".js") or kind.endswith(".mjs") or kind.endswith(".cjs")): t.lite = 1
-  let _ = parse.parse_file_v(&t, &src, 1, &kw, true, jsx)
-  let meta = t.lite == 2
+  elif jl and js_ext(kind): t.lite = 5
+  let lj = t.lite == 5
+  var d = parse.parse_file_v(&t, &src, 1, &kw, true, jsx)
+  # (JSX read byte by byte: a file it doesn't parse cleanly with is parsed whole, as before)
+  if lj and d.len > 0:
+    ast.clear_nodes(&t)
+    t.lite = 0
+    d = parse.parse_file_v(&t, &src, 1, &kw, true, jsx)
+  let meta = (t.lite & 2) != 0
   t.lite = 0
+  if keep: swap(&back, &src)
   let root = find_root(t)
   if root < 0: return new_rec(path)
-  var r = build_record(t, src, root, path)
+  # (a file that doesn't parse, with a name or a module missing (`import` at its end): no record, as
+  # oxlint has none for a file with syntax errors)
+  if d.len > 0 and unnamed(t): return new_rec(path)
+  var r = build_record(t, "", root, path)
   if meta: r.msyn = true
   return r
 
-fn parse_record(fs: Fs, path: Str, var kw: {Str: Int}, var t: ast.Ast) -> Rec:
+fn parse_record(fs: Fs, path: Str, var kw: {Str: Int}, var t: ast.Ast, keep: Bool, var back: Str, var has: Bool) -> Rec:
   var src0 = fs.read(path) else return new_rec(path)
-  return parse_text(src0, path, path, &kw, &t)
+  has = keep
+  return parse_text_k(src0, path, path, &kw, &t, keep, &back)
 
 # A .vue, .astro or .svelte file: one record per script section, in order (sec gets each one's start)
-fn parse_sections(fs: Fs, path: Str, var kw: {Str: Int}, var t: ast.Ast, var sec: [Int]) -> [Rec]:
+fn parse_sections(fs: Fs, path: Str, var kw: {Str: Int}, var t: ast.Ast, var sec: [Int], keep: Bool, var back: Str, var has: Bool) -> [Rec]:
   var out: [Rec] = []
-  let src0 = fs.read(path) else return out
+  var src0 = fs.read(path) else return out
   for x in lpart.sections(path, src0):
     out.push(parse_text(lpart.blank(src0, x.start, x.end), path, "x" + x.ext, &kw, &t))
     sec.push(x.start)
+  if keep:
+    swap(&back, &src0)
+    has = true
   return out
 
 type GRes:
@@ -376,6 +457,105 @@ type GRes:
   rec: Rec
   more: [Rec]           # a partial file: its other sections (rec is the last), and each one's start
   sec: [Int]
+  croot: Str = ""       # (the record cache) a record parsed now that belongs in it: its package's
+  cline: Str = ""       # root and its line (state, then the record before resolution, as JSON)
+  src: Str = ""         # a linted file's text, read for its record (has_src)
+  has_src: Bool = false
+
+# ---- the record cache: a dependency's records (files under node_modules) kept between runs, in
+# $XDG_CACHE_HOME/vlint/modrec-VERSION/HASH (one file per package root, a line a file: path, its
+# stat_any, the record's JSON before its requests are resolved). A record is used when the file's
+# state is the same; one whose file changed in the 2 s before it was read isn't kept. Every package
+# a CI job lints walks much of the same node_modules (no-barrel-file follows all of it): the second
+# package on reads the records instead of the files.
+type PkgC:
+  ok: Bool = false
+  lines: {Str: Str} = {}    # path -> "state\tjson"
+
+fn pkg_root(p: Str) -> Str:
+  var i = -1
+  var at = p.find("/node_modules/")
+  while at >= 0:
+    i = at
+    at = p.find("/node_modules/", at + 1)
+  if i < 0: return ""
+  var j = i + 14
+  var k = p.find("/", j)
+  if k < 0: return ""
+  if p[j] == '@':
+    k = p.find("/", k + 1)
+    if k < 0: return ""
+  return p[0..k]
+
+fn lconf_slash(p: Str) -> Int:
+  var i = p.len - 1
+  while i > 0 and p[i] != '/': i -= 1
+  return i
+
+fn cache_file(cdir: Str, root: Str) -> Str:
+  return cdir + "/" + lcache.hex16(lcache.hash64(root))
+
+fn load_pkgc(fs: Fs, cdir: Str, root: Str) -> PkgC:
+  var pc = PkgC(ok: true)
+  let txt = fs.read(cache_file(cdir, root)) else ""
+  if txt == "": return pc
+  for l in txt.split("\n"):
+    let a = l.find("\t")
+    if a <= 0: continue
+    pc.lines[l[0..a]] = l[a + 1..l.len]
+  return pc
+
+# A dependency's record from the cache ("" ok false when it has none for the file as it is now)
+fn cached_rec(ffi: Ffi, pcm: Memo[Str, PkgC], fs: Fs, cdir: Str, root: Str, path: Str, var ok: Bool) -> Rec:
+  ok = false
+  let v = pcm.get(root, fn(k) => load_pkgc(fs, cdir, k))
+  let line = v.value.lines.get(path, "")
+  if line == "": return new_rec(path)
+  let b = line.find("\t")
+  if b <= 0: return new_rec(path)
+  let st = int(line[0..b]) else 0
+  if st == 0 or st != lcache.stat_any(ffi, path): return new_rec(path)
+  let r = from_json(line[b + 1..line.len], Rec) else return new_rec(path)
+  ok = true
+  return r
+
+# parse_one through the record cache (cdir "": none)
+fn parse_cached(fs: Fs, ffi: Ffi, path: Str, i: Int, var kw: {Str: Int}, var t: ast.Ast, cdir: Str, pcm: Memo[Str, PkgC], keep: Bool) -> GRes:
+  if cdir == "" or lpart.is_partial(path): return parse_one(fs, path, i, &kw, &t, keep)
+  let root = pkg_root(path)
+  if root == "": return parse_one(fs, path, i, &kw, &t, keep)
+  var hit = false
+  var r = cached_rec(ffi, pcm, fs, cdir, root, path, &hit)
+  if hit: return GRes(i, r, [], [])
+  let st = lcache.stat_any(ffi, path)
+  let t0 = lcache.now_ns(ffi)
+  var g = parse_one(fs, path, i, &kw, &t, keep)
+  if st != 0 and g.rec.ok and not lcache.changed_since(ffi, path, t0 - 2000000000) and lcache.stat_any(ffi, path) == st:
+    g.croot = root
+    g.cline = "{st}\t" + to_json(g.rec)
+  return g
+
+# The records parsed now written to their packages' cache files, with the ones read (each file
+# written to a temporary name and renamed)
+fn save_cache(fs: Fs, ffi: Ffi, cdir: Str, pcm: Memo[Str, PkgC], fresh: {Str: [Str]}):
+  if cdir == "" or fresh.len == 0: return
+  let up = cdir[0..lconf_slash(cdir)]
+  fs.mkdir(up) else 0
+  fs.mkdir(cdir) else 0
+  for root, ls in fresh:
+    let v = pcm.get(root, fn(k) => load_pkgc(fs, cdir, k))
+    var lines: {Str: Str} = {}
+    for k, x in v.value.lines: lines[k + ""] = x + ""
+    for l in ls:
+      let a = l.find("\t")
+      if a > 0: lines[l[0..a]] = l[a + 1..l.len]
+    var out: [Str] = []
+    for k, x in lines: out.push(k + "\t" + x)
+    out.sort()
+    let f = cache_file(cdir, root)
+    let tmp = f + ".tmp{lcache.now_ns(ffi)}"
+    fs.write(tmp, "\n".join(out) + "\n") else continue
+    fs.rename(tmp, f) else 0
 
 # What each request of a record resolves to (its real path, "" none), into rq_path
 type Rs:
@@ -387,11 +567,53 @@ fn new_rs() -> Rs:
   return Rs(lresolve.new_rv(), {}, {})
 
 fn resolve_all(fs: Fs, ffi: Ffi, var rs: Rs, var r: Rec, p: Str):
+  # (a dependency in node_modules: what place loads of it; the rest when it's followed whole,
+  # resolve_rest)
+  var only: [Bool] = []
+  if p.find("/node_modules/") >= 0:
+    only = dep_follow(r)
+    for q in only:
+      if not q: r.part = true
   for j in 0..r.rq.len:
+    if only.len > 0 and not only[j]: continue
     var target = lresolve.resolve(&rs.rv, fs, p, r.rq[j])
     if target != "":
       if not (target in rs.real):
-        var rp = lcache.realpath_memo(ffi, &rs.rdirs, target)
+        var rp = lcache.realpath_memo_l(ffi, &rs.rdirs, target, rs.rv.lk.len > 0)
+        if rp == "": rp = target + ""
+        rs.real[target] = rp
+      target = rs.real[target] + ""
+    r.rq_path[j] = target
+
+# The requests of a dependency in node_modules that are loaded (unless no-barrel-file follows it
+# whole): what the import rules read of a dependency's dependencies, its star exports (their
+# names, rimport.star_names) and its namespace re-exports (`export * as ns from`, and `export { ns }`
+# of `import * as ns`: rimport.module_request_name). A named re-export (`export { a } from`) adds
+# its name to the record's own bindings, and no rule reads the module it names: a package's index
+# of 10,000 icons re-exported by name loaded every icon's file.
+fn dep_follow(r: Rec) -> [Bool]:
+  var out = [false] * r.rq.len
+  for q in r.star_rq: out[q] = true
+  for e in 0..r.ind_rq.len:
+    let q = r.ind_rq[e]
+    if q < 0: continue
+    if r.ind_ik[e] != 0: out[q] = true
+    else:
+      for j in 0..r.ie_k.len:
+        if r.ie_k[j] == 1 and r.ie_local[j] == r.ind_in[e]: out[q] = true
+  return out
+
+# the requests resolve_all left of a dependency's record
+fn resolve_rest(fs: Fs, ffi: Ffi, var rs: Rs, var r: Rec):
+  if not r.part: return
+  r.part = false
+  let only = dep_follow(r)
+  for j in 0..r.rq.len:
+    if only[j]: continue
+    var target = lresolve.resolve(&rs.rv, fs, r.path, r.rq[j])
+    if target != "":
+      if not (target in rs.real):
+        var rp = lcache.realpath_memo_l(ffi, &rs.rdirs, target, rs.rv.lk.len > 0)
         if rp == "": rp = target + ""
         rs.real[target] = rp
       target = rs.real[target] + ""
@@ -404,27 +626,41 @@ fn resolve_res(fs: Fs, ffi: Ffi, var rs: Rs, var g: GRes, p: Str):
 type Job:
   idx: Int
   path: Str
+  keep: Bool = false    # a linted file: its text goes back with the record (lint reads it from there)
+  bidx: [Int] = []      # (idx -1) a batch of linted files from one folder, for one worker: its
+  bpath: [Str] = []     # resolver's caches answer their requests, much the same
 
-fn gworker(fs: Fs, ffi: Ffi, own jobs: Chan[Job], own res: Chan[GRes], own kms: [Memo[Str, Int]]):
+fn gworker(fs: Fs, ffi: Ffi, own jobs: Chan[Job], own res: Chan[GRes], own kms: [Memo[Str, Int]], own cdir: Str, own pcm: Memo[Str, PkgC]):
   var kw = scan.keywords()
   var t = new_tree()
   var rs = new_rs()
   swap(&rs.rv.km, &kms)
+  rs.rv.lk.push(own fn(p: Str) -> Int => lcache.listed_kind(ffi, p))
   while true:
     let j = jobs.recv() else return
-    var g = parse_one(fs, j.path, j.idx, &kw, &t)
+    if j.idx < 0:
+      for b in 0..j.bidx.len:
+        var g = parse_cached(fs, ffi, j.bpath[b], j.bidx[b], &kw, &t, cdir, pcm, true)
+        resolve_res(fs, ffi, &rs, &g, j.bpath[b])
+        res.send(g)
+      continue
+    var g = parse_cached(fs, ffi, j.path, j.idx, &kw, &t, cdir, pcm, j.keep)
     resolve_res(fs, ffi, &rs, &g, j.path)
     res.send(g)
 
-fn parse_one(fs: Fs, path: Str, i: Int, var kw: {Str: Int}, var t: ast.Ast) -> GRes:
-  if not lpart.is_partial(path): return GRes(i, parse_record(fs, path, &kw, &t), [], [])
+fn parse_one(fs: Fs, path: Str, i: Int, var kw: {Str: Int}, var t: ast.Ast, keep: Bool) -> GRes:
+  var src = ""
+  var has = false
+  if not lpart.is_partial(path):
+    let r = parse_record(fs, path, &kw, &t, keep, &src, &has)
+    return GRes(idx: i, rec: r, more: [], sec: [], src: src, has_src: has)
   var sec: [Int] = []
-  var rs = parse_sections(fs, path, &kw, &t, &sec)
-  if rs.len == 0: return GRes(i, new_rec(path), [], [])
+  var rs = parse_sections(fs, path, &kw, &t, &sec, keep, &src, &has)
+  if rs.len == 0: return GRes(idx: i, rec: new_rec(path), more: [], sec: [], src: src, has_src: has)
   var last = new_rec("")
   swap(&last, &rs[rs.len - 1])
   rs.truncate(rs.len - 1)
-  return GRes(i, last, rs, sec)
+  return GRes(idx: i, rec: last, more: rs, sec: sec, src: src, has_src: has)
 
 fn new_tree() -> ast.Ast:
   var t = ast.new_ast()
@@ -432,13 +668,15 @@ fn new_tree() -> ast.Ast:
 
 # A parsed record into the graph at its slot (a partial file's earlier sections get slots of their
 # own): its requests' targets get records, new ones queued in `todo`
-fn place(var g: Graph, var gr: GRes, pshown: {Str: Str}, var todo: [Job]):
+fn place(fs: Fs, ffi: Ffi, var mrs: Rs, var g: Graph, var gr: GRes, pshown: {Str: Str}, var todo: [Job]):
   let p = g.recs[gr.idx].path + ""
   var slots: [Int] = []
   for mi in 0..gr.more.len:
-    slots.push(g.recs.len)
-    g.recs.push(new_rec(p))
+    let si = add_rec(&g, p)
+    g.root[si] = g.root[gr.idx]
+    slots.push(si)
   slots.push(gr.idx)
+  var marks: [Int] = []
   if p in pshown:
     let sh = pshown[p]
     for si in 0..gr.sec.len: g.shown["{sh}#{gr.sec[si]}"] = slots[si]
@@ -447,26 +685,37 @@ fn place(var g: Graph, var gr: GRes, pshown: {Str: Str}, var todo: [Job]):
     if si < gr.more.len: swap(&r, &gr.more[si])
     else: swap(&r, &gr.rec)
     if r.path == "": r.path = p + ""
-    # (a dependency in node_modules: only what it re-exports is loaded further; what else it
-    # imports can't lead back to the linted files, and no rule reads it)
-    let dep = not g.full and p.find("/node_modules/") >= 0
+    # (a dependency in node_modules: only what the rules read of it is loaded further, dep_follow;
+    # what else it imports can't lead back to the linted files (no-cycle doesn't go through
+    # node_modules), and no rule reads it, unless no-barrel-file counts it: then it is followed whole
+    # (fullv). oxlint follows every import of every dependency; the counts are the same)
+    let x = slots[si]
+    let dep = p.find("/node_modules/") >= 0 and not (g.full and g.fullv[x])
     var follow: [Bool] = []
-    if dep:
-      follow = [false] * r.rq.len
-      for x in r.star_rq: follow[x] = true
-      for x in r.ind_rq: follow[x] = true
+    if dep: follow = dep_follow(r)
+    elif r.part: resolve_rest(fs, ffi, &mrs, &r)
+    var seeds: [Bool] = []
+    if g.full and g.root[x]: seeds = nb_seeds(r)
+    let whole = g.full and g.fullv[x]
     for j in 0..r.rq.len:
       let target = r.rq_path[j] + ""
       if target != "" and valid_ext(target):
         if dep and not follow[j]: continue
         if not (target in g.at):
-          g.at[target] = g.recs.len
-          g.recs.push(new_rec(target))
-          todo.push(Job(g.at[target], target + ""))
+          let ti = add_rec(&g, target)
+          g.at[target] = ti
+          todo.push(Job(ti, target + ""))
         r.rq_res[j] = g.at[target]
-    swap(&g.recs[slots[si]], &r)
+        if whole or (seeds.len > 0 and seeds[j]): marks.push(r.rq_res[j])
+    swap(&g.recs[x], &r)
+    g.placed[x] = true
+  for y in marks: mark_full(fs, ffi, &mrs, &g, y, &todo)
 
-fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool, var kw: {Str: Int}, var t: ast.Ast) -> Graph:
+# (texts: each linted file's text as read for its record, has: whether it was; the linter reads
+# those from here instead of opening the file again)
+fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool, var kw: {Str: Int}, var t: ast.Ast, cdir: Str, var texts: [Str], var has: [Bool]) -> Graph:
+  let pcm: Memo[Str, PkgC] = memo()
+  var fresh: {Str: [Str]} = {}
   var g = new_graph()
   g.on = true
   g.full = full
@@ -475,12 +724,18 @@ fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool,
   # a partial linted file's shown name (its sections are keyed "shown#start")
   var pshown: {Str: Str} = {}
   var todo: [Job] = []
+  texts = []
+  for _i in 0..files.len: texts.push("")
+  has = [false] * files.len
+  var fi_of: {Int: Int} = {}
   for i in 0..files.len:
     if not valid_ext(files[i]): continue
     if not (files[i] in g.at):
-      g.at[files[i]] = g.recs.len
-      g.recs.push(new_rec(files[i]))
-      todo.push(Job(g.at[files[i]], files[i] + ""))
+      let ri = add_rec(&g, files[i])
+      g.at[files[i]] = ri
+      g.root[ri] = true
+      fi_of[ri] = i
+      todo.push(Job(ri, files[i] + "", true))
     if lpart.is_partial(files[i]): pshown[files[i]] = shown[i] + ""
     else: g.shown[shown[i]] = g.at[files[i]]
   if threads <= 1 or todo.len < 8:
@@ -490,9 +745,12 @@ fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool,
       let ji = todo[k].idx
       let jp = todo[k].path + ""
       k += 1
-      var gr = parse_one(fs, jp, ji, &kw, &t)
+      var gr = parse_cached(fs, ffi, jp, ji, &kw, &t, cdir, pcm, todo[k - 1].keep)
+      if gr.croot != "": note_fresh(&fresh, gr)
+      take_text(&gr, fi_of, &texts, &has)
       resolve_res(fs, ffi, &rs, &gr, jp)
-      place(&g, &gr, pshown, &todo)
+      place(fs, ffi, &rs, &g, &gr, pshown, &todo)
+    save_cache(fs, ffi, cdir, pcm, fresh)
     return g
   # workers that stay for the whole graph (their resolvers' caches with them); a record's new
   # requests are queued as soon as it's placed
@@ -508,23 +766,51 @@ fn build(fs: Fs, ffi: Ffi, files: [Str], shown: [Str], threads: Int, full: Bool,
   for w in 0..threads:
     var mine: [Memo[Str, Int]] = []
     for m in kms: mine.push(m.share())
-    spawn gworker(fs, ffi, jc, rc, mine)
+    spawn gworker(fs, ffi, jc, rc, mine, cdir + "", pcm.share())
   var pending = 0
   var sent = 0
+  # (the main task's resolver: a dependency's other requests when it turns out to be followed whole)
+  var mrs = new_rs()
+  mrs.rv.lk.push(own fn(p: Str) -> Int => lcache.listed_kind(ffi, p))
+  # (the linted files in batches of up to 32 from one folder)
+  while sent < todo.len and todo[sent].keep:
+    var bi: [Int] = []
+    var bp: [Str] = []
+    let d = lresolve.dirname(todo[sent].path)
+    while sent < todo.len and todo[sent].keep and bi.len < 32 and lresolve.dirname(todo[sent].path) == d:
+      bi.push(todo[sent].idx)
+      bp.push(todo[sent].path + "")
+      sent += 1
+    pending += bi.len
+    jc.send(Job(-1, "", true, bi, bp))
   while sent < todo.len:
-    jc.send(Job(todo[sent].idx, todo[sent].path + ""))
+    jc.send(Job(todo[sent].idx, todo[sent].path + "", todo[sent].keep))
     sent += 1
     pending += 1
   while pending > 0:
     var gr = rc.recv() else break
     pending -= 1
-    place(&g, &gr, pshown, &todo)
+    if gr.croot != "": note_fresh(&fresh, gr)
+    take_text(&gr, fi_of, &texts, &has)
+    place(fs, ffi, &mrs, &g, &gr, pshown, &todo)
     while sent < todo.len:
-      jc.send(Job(todo[sent].idx, todo[sent].path + ""))
+      jc.send(Job(todo[sent].idx, todo[sent].path + "", todo[sent].keep))
       sent += 1
       pending += 1
   jc.close()
+  save_cache(fs, ffi, cdir, pcm, fresh)
   return g
+
+fn take_text(var gr: GRes, fi_of: {Int: Int}, var texts: [Str], var has: [Bool]):
+  if not gr.has_src: return
+  let fi = fi_of.get(gr.idx, -1)
+  if fi < 0: return
+  swap(&texts[fi], &gr.src)
+  has[fi] = true
+
+fn note_fresh(var fresh: {Str: [Str]}, gr: GRes):
+  if not (gr.croot in fresh): fresh[gr.croot + ""] = []
+  fresh[gr.croot].push(gr.rec.path + "\t" + gr.cline)
 
 # the record a request of record ri loads (-1 none, or not read)
 fn loaded(g: Graph, ri: Int, name: Str) -> Int:

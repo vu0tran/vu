@@ -458,6 +458,53 @@ fn memo_method(var g: G, e: Node) -> CT:
   let inner = bw_end(&g, e.kids[1].kids[0], kb, code, st)
   return bw_end(&g, ce, b, inner.code, inner.ty)
 
+# shared_map(): a new SharedMap; its type comes from where it goes.
+fn b_smap(var g: G, e: Node, expect0: Str) -> CT:
+  var expect = expect0 + ""
+  if expect != "" and tkind(g, expect) == "opt": expect = inner_of(expect)
+  if expect == "" or tkind(g, expect) != "smap":
+    err(g, e.line, "shared_map() makes a SharedMap; say its key and value types where it goes: let m: SharedMap[Int, Int] = shared_map()")
+  nargs(g, e, 0, "shared_map")
+  g.uses_smap = true
+  return CT("vu_smap_new()", expect)
+
+# A SharedMap's key as the runtime takes it: an Int's bits, or a pointer to a Str
+fn smap_key(g: G, kb: Bw, key: Str) -> Str:
+  if key == "Str": return key_ptr(g, kb, key)
+  return "(int64_t)(" + kb.code + ")"
+
+# m.get(key, default): key's value, or default when it has none (yet: a value another thread is adding
+# may not be seen). m.add(key, value): adds value unless key has one, and returns the value key has
+# (value, or what another thread added first). m.len(), m.share(): its size, another handle to it.
+fn smap_method(var g: G, e: Node) -> CT:
+  let name = e.kids[0].name
+  let ce = e.kids[0].kids[0]
+  if any_named(e): err(g, e.line, "." + name + "() takes positional arguments")
+  if name == "share" or name == "len":
+    if nargs_of(e) != 0: err(g, e.line, "." + name + "() takes no arguments")
+    let sb = bw_begin(&g, ce, "")
+    if name == "len": return bw_end(&g, ce, sb, "vu_smap_len(" + sb.code + ")", "Int")
+    return bw_end(&g, ce, sb, "vu_smap_share(" + sb.code + ")", sb.ty)
+  if nargs_of(e) != 2:
+    if name == "get": err(g, e.line, "m.get(key, default) takes a key and the value to give when it has none")
+    err(g, e.line, "m.add(key, value) takes a key and the value to add when it has none")
+  g.uses_smap = true
+  let b = bw_begin(&g, ce, "")
+  let mi = inner_of(b.ty)
+  let key = map_key(mi)
+  let val = map_val(mi)
+  let kb = key_begin(&g, e.kids[1].kids[0], key)
+  let vr = value(&g, e.kids[2].kids[0], val)
+  var vin = "(int64_t)(" + vr.code + ")"
+  if val == "Float": vin = "vu_sm_fbits(" + vr.code + ")"
+  var sfx = "i"
+  if key == "Str": sfx = "s"
+  var call = "vu_smap_" + name + "_" + sfx + "(" + b.code + ", " + smap_key(g, kb, key) + ", " + vin + ")"
+  if val == "Float": call = "vu_sm_bitsf(" + call + ")"
+  elif val != "Int": call = "(" + ct(g, val) + ")(" + call + ")"
+  let inner = bw_end(&g, e.kids[1].kids[0], kb, call, val)
+  return bw_end(&g, ce, b, inner.code, inner.ty)
+
 fn reserve(var g: G, e: Node) -> CT:
   if nargs_of(e) != 1 or e.kids[1].flag: err(g, e.line, ".reserve takes one count: s.reserve(n)")
   let p = place(&g, e.kids[0].kids[0])
@@ -685,6 +732,7 @@ fn call_args(var g: G, e: Node, params: [Param], croot: Int, cline: Int) -> Args
           elif tkind(g, pt) == "chan": c = "vu_chan_share(" + r.p.code + ")"   # both keep using the channel
           elif tkind(g, pt) == "shared": c = "VU_SHUP(" + r.p.code + ")"   # another handle to the same value
           elif tkind(g, pt) == "memo": c = "vu_memo_share(" + r.p.code + ")"   # another handle to the same Memo
+          elif tkind(g, pt) == "smap": c = "vu_smap_share(" + r.p.code + ")"   # another handle to the same SharedMap
           elif pt == "Str" and keep < 0: c = "vu_str_dup(&" + r.p.code + ")"
           else:
             def_idx.push(codes.len)
@@ -703,6 +751,7 @@ fn call_args(var g: G, e: Node, params: [Param], croot: Int, cline: Int) -> Args
       if not p.ok and a.op == "method": err(g, a.line, pdesc(pn) + " is 'var', so x." + disp(e.kids[0].name) + "() changes x, and x must be a variable, field, or list element (not a value computed on the spot)")
       elif not p.ok: err(g, a.line, "'&' needs a variable, field, or list element")
       write_check(&g, p, a.line, false)
+      if p.n32 != "": err(g, a.line, n32_ref_msg(p.n32, pdesc(pn) + " is 'var'"))
       if p.ty != pt: err(g, a.line, "expected " + tn(pt) + ", found " + tn(p.ty))
       root_v.push(p.root)
       root_mut.push(true)
@@ -859,6 +908,14 @@ fn call_user_or_spawn(var g: G, e: Node, name: Str, allow_throw: Bool, spawn_lin
       g.vf_fns.push(name + "")
     codes.push(g.spec_flag + "")
     return wrap(&g, pre, "fn_" + name + "__vf(" + join(codes, ", ") + ")", post, ret)
+  if name in g.extern_fns:
+    # (C can't be called inside a par loop. Whether a frame runs inside one doesn't change while it
+    # runs, so a function asks once, at its start (VU_FFI_ENTRY, added by ffi_entry), and each call
+    # tests the answer; a call in a par loop's own body asks each time)
+    var ck = "VU_FFI_CK("
+    if g.par_on: ck = "vu_ffi_here("
+    else: g.ffi_ck += 1
+    return wrap(&g, pre, "(" + ck + g.extern_where[name] + "), fn_" + name + "(" + join(codes, ", ") + "))", post, ret)
   return wrap(&g, pre, "fn_" + name + "(" + join(codes, ", ") + ")", post, ret)
 
 # ---- built-ins
@@ -996,6 +1053,7 @@ fn builtin(var g: G, e: Node, n: Str, expect: Str) -> CT:
   if n == "print": return b_print(&g, e)
   if n == "chan": return b_chan(&g, e, expect)
   if n == "memo": return b_memo(&g, e, expect)
+  if n == "shared_map": return b_smap(&g, e, expect)
   if n == "to_json": return b_to_json(&g, e)
   if n == "from_json": return b_from_json(&g, e, false)
   if n == "write":
@@ -1034,7 +1092,7 @@ fn builtin(var g: G, e: Node, n: Str, expect: Str) -> CT:
     if b.ty != "Str": err(g, e.line, "bytes() copies a Str into a [Byte] list, not a " + tn(b.ty))
     let tv = tmp(&g)
     let c = b.code
-    return bw_end(&g, a, b, "({{ L_Byte " + tv + " = {{0}}; if ((" + c + ").len) {{ " + tv + ".data = (uint8_t *)vu_malloc((size_t)(" + c + ").len); memcpy(" + tv + ".data, (" + c + ").data, (size_t)(" + c + ").len); " + tv + ".len = " + tv + ".cap = (" + c + ").len; }} " + tv + "; }})", lt)
+    return bw_end(&g, a, b, "({{ L_Byte " + tv + " = {{0}}; if ((" + c + ").len) {{ " + tv + ".data = (uint8_t *)vu_lalloc((size_t)(" + c + ").len); memcpy(" + tv + ".data, (" + c + ").data, (size_t)(" + c + ").len); " + tv + ".len = " + tv + ".cap = (" + c + ").len; }} " + tv + "; }})", lt)
   if n == "byte":
     nargs(g, e, 1, "byte")
     let c = value(&g, e.kids[1].kids[0], "")
@@ -1163,6 +1221,9 @@ fn b_panic(var g: G, e: Node) -> CT:
   # The message's bytes go to the reporter as they are (printf's %s would stop at a zero byte).
   return bw_end(&g, a, b, "vu_panic({e.line}, (const char *)(" + c + ").data, (" + c + ").len)", "~void")
 
+fn n32_ref_msg(what: Str, why: Str) -> Str:
+  return why + ", but " + what + " is an Int32 field (4 bytes, not an Int's 8), so it can't be passed with '&'; copy it into a var, pass that, and store it back (" + what + " = x checks the range)"
+
 # swap(&a, &b): exchange two values of the same type. Both need write access, and they must be
 # different variables (two parts of one variable could overlap).
 fn b_swap(var g: G, e: Node) -> CT:
@@ -1174,6 +1235,7 @@ fn b_swap(var g: G, e: Node) -> CT:
     let p = place(&g, a.kids[0])
     if not p.ok: err(g, a.line, "'&' needs a variable, field, or list element")
     write_check(&g, p, a.line, false)
+    if p.n32 != "": err(g, a.line, n32_ref_msg(p.n32, "swap() changes both values"))
     ps.push(p)
   if ps[0].root == ps[1].root or base_of(g, ps[0].root) == base_of(g, ps[1].root):
     err(g, e.line, "swap() needs two different variables; both of these are part of '" + g.vars[ps[0].root].name + "'")
@@ -1677,7 +1739,7 @@ fn jenc(g: G, t: Str) -> Str:
   if k == "opt":
     return head + "if (!*v) vu_jcat(o, \"null\", 4); else vu_jenc_" + mg(g, inner_of(t)) + "(o, *v); }}"
   if k == "struct":
-    return head + jenc_fields(g, g.structs[t].fields, "v->") + " }}"
+    return head + jenc_fields(g, t, g.structs[t].fields, "v->") + " }}"
   var cases: [Str] = []
   let vs = g.enums[t].variants
   for kk in 0..vs.len:
@@ -1685,16 +1747,18 @@ fn jenc(g: G, t: Str) -> Str:
     if vs[kk].fields.len == 0:
       cases.push("case {kk}: vu_jcat(o, " + jlit(json_str(name)) + "); break;")
     else:
-      cases.push("case {kk}: vu_jcat(o, " + jlit("{{" + json_str(name) + ":") + "); " + jenc_fields(g, vs[kk].fields, payload(g, t, kk, "v")) + " vu_jcat(o, \"}}\", 1); break;")
+      cases.push("case {kk}: vu_jcat(o, " + jlit("{{" + json_str(name) + ":") + "); " + jenc_fields(g, "", vs[kk].fields, payload(g, t, kk, "v")) + " vu_jcat(o, \"}}\", 1); break;")
   return head + "switch (v->tag) {{ " + join(cases, " ") + " default: break; }} }}"
 
-fn jenc_fields(g: G, fs: [Fld], ptr: Str) -> Str:
+fn jenc_fields(g: G, sn: Str, fs: [Fld], ptr: Str) -> Str:
   var parts: [Str] = []
   for i in 0..fs.len:
     var lit = ","
     if i == 0: lit = "{{"
     lit += json_str(fs[i].name) + ":"
-    parts.push("vu_jcat(o, " + jlit(lit) + "); vu_jenc_" + mg(g, fs[i].ty) + "(o, &" + ptr + cf(fs[i].name) + ");")
+    var at = "&" + ptr + cf(fs[i].name)
+    if sn != "" and is_n32(g, sn, fs[i].name): at = "&(int64_t){{" + ptr + cf(fs[i].name) + "}}"
+    parts.push("vu_jcat(o, " + jlit(lit) + "); vu_jenc_" + mg(g, fs[i].ty) + "(o, " + at + ");")
   if fs.len == 0: parts.push("vu_jcat(o, \"{{\", 1);")
   parts.push("vu_jcat(o, \"}}\", 1);")
   return join(parts, " ")
@@ -1720,7 +1784,7 @@ fn jdec(g: G, t: Str) -> Str:
     return head + "if (vu_jnull(j)) {{ *out = NULL; return true; }} " + ct(g, it) + " x = {{0}}; if (!vu_jdec_" + mg(g, it) + "(j, &x)) return false; *out = vu_box_" + box_name(g, it) + "(x); return true; }}"
   if k == "struct":
     let fs = g.structs[t].fields
-    return head + jdec_fields(g, fs, "*out = (T_" + t + "){{" + vlist(fs.len) + "}};") + " }}"
+    return head + jdec_fields(g, t, fs, "*out = (T_" + t + "){{" + vlist(fs.len) + "}};") + " }}"
   let vs = g.enums[t].variants
   var plain: [Str] = []
   var names: [Str] = []
@@ -1753,7 +1817,7 @@ fn jdec(g: G, t: Str) -> Str:
       build = "*out = (T_" + t + "){{.tag = {kk}, .u.b{kk} = vu_box_{kk}_" + t + "((T_{kk}_" + t + "){{" + vlist(fs.len) + "}})}};"
     else:
       build = "*out = (T_" + t + "){{.tag = {kk}, .u.v{kk} = {{" + vlist(fs.len) + "}}}};"
-    helpers += "static bool vu_jdec_" + m + "_{kk}(vu_jp *j, " + c + " *out) {{ " + jdec_fields(g, fs, build) + " }}\n"
+    helpers += "static bool vu_jdec_" + m + "_{kk}(vu_jp *j, " + c + " *out) {{ " + jdec_fields(g, "", fs, build) + " }}\n"
     var dr = ""
     if not is_copy(g, t): dr = drop_code(g, t, "(*out)")
     body += "if (vu_jkey(&key, " + jlit(name) + ")) {{ drop_Str(&key); bool ok = vu_jdec_" + m + "_{kk}(j, out); if (!ok) {{ vu_jpath(j, " + jlit(name) + ", 0); return false; }} vu_str k2 = {{0}}; int e = vu_jobj_next(j, false, &k2); if (e != 0) {{ if (e > 0) {{ drop_Str(&k2); vu_jfail(j, \"expected one variant\"); }} " + dr + " *out = (T_" + t + "){{0}}; return false; }} return true; }} "
@@ -1764,7 +1828,7 @@ fn jdec(g: G, t: Str) -> Str:
 
 # Reads an object into one local per field (v0, v1...), then runs build. Missing fields are errors,
 # except optionals (nil); unknown fields are skipped; a repeated field keeps its last value.
-fn jdec_fields(g: G, fs: [Fld], build: Str) -> Str:
+fn jdec_fields(g: G, sn: Str, fs: [Fld], build: Str) -> Str:
   var decl: [Str] = []
   var drops: [Str] = []
   var arms: [Str] = []
@@ -1777,7 +1841,9 @@ fn jdec_fields(g: G, fs: [Fld], build: Str) -> Str:
     if not is_copy(g, ft):
       drops.push(drop_code(g, ft, "v{i}"))
       again = "if (s{i}) {{ " + drop_code(g, ft, "v{i}") + " v{i} = (" + ct(g, ft) + "){{0}}; }} "
-    arms.push("if (vu_jkey(&key, " + jlit(f) + ")) {{ " + again + "if (!vu_jdec_" + mg(g, ft) + "(j, &v{i})) {{ vu_jpath(j, " + jlit(f) + ", 0); drop_Str(&key); goto fail; }} s{i} = true; }}")
+    var dec = "vu_jdec_" + mg(g, ft)
+    if sn != "" and is_n32(g, sn, f): dec = "vu_jdec_I32"   # (into an Int, checked to fit in 32 bits)
+    arms.push("if (vu_jkey(&key, " + jlit(f) + ")) {{ " + again + "if (!" + dec + "(j, &v{i})) {{ vu_jpath(j, " + jlit(f) + ", 0); drop_Str(&key); goto fail; }} s{i} = true; }}")
     if tkind(g, ft) != "opt": need.push("if (!s{i}) {{ vu_jfail(j, " + cstr("missing field '" + f + "'") + "); goto fail; }}")
   arms.push("if (!vu_jskip(j)) {{ drop_Str(&key); goto fail; }}")
   return join(decl, " ") + " if (!vu_jobj_begin(j)) goto fail; for (bool first = true;; first = false) {{ vu_str key = {{0}}; int k = vu_jobj_next(j, first, &key); if (k == 0) break; if (k < 0) goto fail; " + join(arms, " else ") + " drop_Str(&key); }} " + join(need, " ") + " " + build + " return true; fail: " + join(drops, " ") + " return false;"

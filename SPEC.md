@@ -44,6 +44,7 @@ fn main():
 | `Float` | 64-bit IEEE float |
 | `Bool` | `true` / `false` |
 | `Byte` | 0..255, one byte in memory. Literals: `65`, `0x41` or `'A'`. Overflow stops the program. |
+| `Int32` | a struct field's type only: an `Int` kept in 4 bytes (see below) |
 | `Str` | an owned string of bytes: `s.len`, `s[i]` (a Byte), `s[a..b]` (a new Str), `+`, `+=`, `== <`, `s.reserve(n)` |
 | `[T]` | growable list: `xs.len`, `xs.push(v)`, `xs.pop()` (removes and returns the last element; stops the program if empty), `xs.truncate(n)` (keeps the first n), `xs.copy_within(to, from, n)` (as memmove; plain values only), `xs[i]` (bounds-checked), `xs[a..b]` (a slice, below), `xs.reserve(n)` |
 | `T?` | optional: either a `T` or `nil` (`Int?`, `Str?`, `[T]?`, a struct or enum...; not a capability or another optional). Recursive types must use it (or a list or map). Read it with `if x = opt:` or `opt else default` (see Errors). |
@@ -68,6 +69,24 @@ type Opts:
 
 let a = Opts(name: "a")          # limit 10, tags [] (each construction gets its own list)
 let b = Opts("b", 20)            # positional: fields with defaults can be left off the end
+```
+
+A struct field declared `Int32` holds an `Int` from -2147483648 to 2147483647 in 4 bytes instead of
+8, for structs kept by the million. Reading it gives an `Int`; storing into it (construction, `=`,
+`+=` and the rest, `from_json`) checks the range and stops the program when the value doesn't fit,
+in release builds too, as a Byte's range is checked (an out-of-range literal is a compile error, and
+`from_json` fails instead). It can't be passed with `&` (to a `var` parameter or `swap`), since it
+isn't an Int's 8 bytes: copy it into a variable and store it back. `Int32` is only a struct field's
+type: not a variable's, parameter's, list element's or enum variant's.
+
+```
+type Node:
+  k, pos, end: Int32               # 12 bytes, not 24
+  name: Str
+
+var n = Node(1, 0, 10, "x")
+n.end += 5                         # read as an Int, the sum checked to fit as it's stored
+let len = n.end - n.pos            # an Int
 ```
 
 A default is a constant: a literal, a const, `[]`, `{}`, `nil`, a list or map of those, or a struct
@@ -775,6 +794,10 @@ let h = share(own fn(req: Request) => answer(req, base))   # closures too: h.val
   bindings and moves out of it are compile errors), so readers never see it change and need no
   locks. It's freed when its last handle goes. A channel inside is still a channel: tasks send and
   receive through it (a pool of connections in a `Chan[pg.Db]` inside a `Shared` value works).
+- `s.unique` is the value too, but writable (`s.unique.nodes.push(n)`, `grow(&s.unique)`), for
+  building a value in place before tasks see it: using it while another handle exists (another
+  `s.share()`, a task's) stops the program. A value read by tasks and filled by one owner first
+  can then be one `Shared` field from the start.
 - Passing a `Shared` value to an `own` parameter (or `spawn`) gives the callee another handle, as
   for channels; `s.share()` makes one to store. `let t = s` moves the handle.
 - A `Shared` value can't hold a connection, a listener or a C handle (using one from several tasks
@@ -811,6 +834,32 @@ spawn worker(m, "b")
 - A computation can't wait on anything else: a task waiting for its value holds its thread, so a
   `recv`, `send` that would wait, `os.sleep`, a select or a network call inside one stops the program
   (`spawn` is fine). It can run `par` loops; their threads can't ask for the key being computed.
+
+### SharedMap: one table several threads add to
+
+```
+type Tables:
+  ids: SharedMap[Str, Int] = shared_map()      # a field default makes a new one per value
+
+fn worker(own t: Tables, own names: [Str]):
+  for n in names:
+    let id = t.ids.add(n, fresh_id(n))         # the id n has: this one, or one another task added first
+    let old = t.ids.get(n + "!", -1)           # -1: no value (yet)
+
+let t = Tables()
+spawn worker(Tables(t.ids.share()), ["a", "b"])
+spawn worker(Tables(t.ids.share()), ["b", "c"])
+```
+
+- `m.add(key, value)` gives key `value` if it has none, and returns the value key has: `value`, or
+  the one another task (or `par` loop thread) added first. An entry never changes or goes once added,
+  so two tasks interning the same key get the same value. `m.get(key, default)` reads one, without
+  locks; a read racing another thread's add of that key may give the default.
+- Keys are Int, Byte, Bool or Str; values Int, Float, Bool or Byte (plain data: nothing another thread
+  would count references to). Share anything bigger as an Int id into a table only its owner writes.
+- `m.len()`, `m.share()` (another handle; passing one to an `own` parameter or `spawn` makes one too).
+  It's freed with its last handle. It can sit in a `Shared` value and still be added to through
+  `.value`. No iteration, `m[k]` or `in`: what a table several threads fill holds depends on timing.
 
 ### Signals and stopping
 
@@ -867,7 +916,12 @@ fn main(ffi: Ffi) throws:
   Vu code can't make one (only extern functions return them), copy one, or compare two. An
   `own` parameter gives the handle to C, which must free it.
 - An extern function can't be called inside a `par` loop (the program stops): C libraries
-  aren't known to be thread-safe.
+  aren't known to be thread-safe. The check costs nothing in functions no par loop can reach (by
+  calls, or as a function value).
+- A glue header (`extern "cols.h":`) is C with no state of its own: a big program built in parts
+  includes it in every part, so its functions (`static inline`) are inlined into the Vu code that
+  calls them, as cheap as reading a list. A `.c` glue file is compiled once, so its calls stay
+  calls. Use a header for small, hot functions over memory the handles own.
 - `vu check` checks the Vu side; the C file is compiled by `vu build` and `vu run`.
 
 The C side. The glue file is included after Vu's runtime, so it can use these:

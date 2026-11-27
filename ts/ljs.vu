@@ -15,10 +15,18 @@ extern "ljs_glue.c":
   fn vl_node_setup(ffi: Ffi, script: Str, args: Str, slots: Int)
   fn vl_node_prelude(ffi: Ffi, lines: Str)
   fn vl_node_call(ffi: Ffi, req: Str) -> Str
+  fn vl_node_expect(ffi: Ffi, n: Int)
   fn vl_node_stop(ffi: Ffi)
+  fn vl_node_release(ffi: Ffi)
   fn vl_proc_start(ffi: Ffi, exe: Str, pin: Str, pout: Str, perr: Str) -> Int
   fn vl_proc_wait(ffi: Ffi, pid: Int) -> Int
   fn vl_tsgo_assign(ffi: Ffi, exe: Str, pin: Str) -> Str
+  fn vl_snap_node(ffi: Ffi, host: Str) -> Str
+  fn vl_snap_write(ffi: Ffi, path: Str) -> Int
+  fn vl_node_snapshot(ffi: Ffi, path: Str)
+  fn vl_node_pcall(ffi: Ffi, req: Str) -> Str
+  fn vl_node_batch(ffi: Ffi)
+  fn vl_node_expect_add(ffi: Ffi, n: Int)
 
 # The run's JS plugins: the requests each node process is sent first (plugin loads, the options),
 # and the plugin files registered.
@@ -29,9 +37,125 @@ type Js:
   opts: [Str]         # options by id (0: none), as JSON arrays
   orule: [Int]        # and the rule each is for
   oid: {Str: Int}     # "rule\toptions" -> id
+  nhost: Int = 0      # the rules the host has registered (a rule's host id: lmeta.Meta.xhost)
+  deferred: [Str] = []  # plugins whose rules run natively, not loaded in node (yet): "path\tload request\tfirst rule id\tkind" (try_defer)
+  # (a batch's run: the plugin loads, the options' ids and the setup go to the batch's registry,
+  # reg_serve, which the runs share with their node processes; oid then memoizes its ids)
+  bat: Bool
+  rq: Chan[RegReq]
 
 fn new_js() -> Js:
-  return Js(false, [], {}, ["[]"], [0], {})
+  return Js(on: false, prelude: [], paths: {}, opts: ["[]"], orule: [0], oid: {}, bat: false, rq: chan(1))
+
+# ---- a batch (vlint --batch): one registry of the JS plugins and options for all its runs
+
+# A request to the registry: 1 a plugin's load (key: the load request; the answer "BASE\tNAME\tANSWER":
+# the plugin's first host id, the name the run gives it when the host knows it by another (""
+# otherwise), and the host's answer), 2 an options id (key: "HOSTID\tOPTIONS"; the id),
+# 3 the setup (key: the folder; the host's answer)
+type RegReq:
+  kind: Int
+  key: Str
+  reply: Chan[Str]
+
+fn batch_js(rq: Chan[RegReq]) -> Js:
+  var js = new_js()
+  js.bat = true
+  js.rq = rq.share()
+  return js
+
+fn reg_ask(js: Js, kind: Int, key: Str) -> Str:
+  let reply: Chan[Str] = chan(1)
+  js.rq.send(RegReq(kind, key + "", reply.share()))
+  return reply.recv() else "!"
+
+# The registry: the host started once (slots: the linting threads' count), each load sent once
+# (vl_node_pcall: every process gets it), the options' ids the batch's, the setup sent again when
+# there are new options. Ends when rq closes.
+fn reg_serve(fs: Fs, os: Os, ffi: Ffi, own rq: Chan[RegReq], slots: Int):
+  vl_node_batch(ffi)
+  var js = new_js()
+  var loaded: {Str: Str} = {}
+  var nset = -1
+  var lastset = ""
+  var renames = 0
+  while true:
+    let r = rq.recv() else return
+    if r.kind == 1:
+      if r.key in loaded:
+        r.reply.send(loaded[r.key] + "")
+        continue
+      var res = start(fs, os, ffi, &js, slots)
+      if res != "":
+        r.reply.send("-1\t\t!")
+        continue
+      var ans = vl_node_pcall(ffi, r.key)
+      # (another file under the same name, which another run loaded (two copies of a plugin in a
+      # monorepo): loaded under a name of its own, the run still calling it by its own)
+      var own = ""
+      let taken = taken_name(ans)
+      if taken != "":
+        let rq0 = lconf.parse_json(r.key)
+        let ui = lconf.get(rq0, 0, "url")
+        if ui >= 0:
+          renames += 1
+          let alt = "{taken}~{renames}"
+          let req2 = "{{\"op\":\"load\",\"url\":\"" + lout.json_esc(rq0.v[ui].s) + "\",\"name\":\"" + lout.json_esc(alt) + "\",\"alias\":true}}"
+          ans = vl_node_pcall(ffi, req2)
+          own = taken + ""
+      let base = js.nhost
+      let n = load_rule_count(ans)
+      if n >= 0: js.nhost += n
+      let v = "{base}\t{own}\t{ans}"
+      if n >= 0: loaded[r.key] = v + ""
+      r.reply.send(v)
+    elif r.kind == 2:
+      let tab = r.key.find("\t")
+      let host = int(r.key[0..tab]) else 0
+      let opts = r.key[tab + 1..r.key.len]
+      r.reply.send("{options_id(&js, host, opts)}")
+    elif r.kind == 3:
+      # (the options' table as setup sends it, the host ids as they are)
+      if nset == js.opts.len:
+        r.reply.send(lastset + "")
+        continue
+      var ids: [Str] = []
+      for k in 0..js.orule.len: ids.push("{js.orule[k]}")
+      let body = "{{\"cwd\":\"" + lout.json_esc(r.key) + "\",\"workspaceUri\":null,\"ruleIds\":[" + ",".join(ids) + "],\"options\":[" + ",".join(js.opts) + "]}}"
+      let req = "{{\"op\":\"setup\",\"json\":\"" + lout.json_esc(body) + "\"}}"
+      let ans = vl_node_pcall(ffi, req)
+      if ans != "!" and ans != "":
+        nset = js.opts.len
+        lastset = ans + ""
+      r.reply.send(ans)
+
+# The name a load's answer says another plugin has ("" for any other answer)
+fn taken_name(ans: Str) -> Str:
+  var outer = lconf.parse_json(ans)
+  if outer.err != "" or outer.v.len == 0 or outer.v[0].k != lconf.J_STR: return ""
+  let res = lconf.parse_json(outer.v[0].s)
+  let f = lconf.get(res, 0, "Failure")
+  if f < 0 or res.v[f].k != lconf.J_STR: return ""
+  let msg = res.v[f].s
+  let pre = "Plugin name '"
+  let at = msg.find(pre)
+  if at < 0 or msg.find("' is already registered") < 0: return ""
+  let rest = msg[at + pre.len..msg.len]
+  let q = rest.find("'")
+  if q <= 0: return ""
+  return rest[0..q]
+
+# How many rules a load's answer registers (-1: it failed)
+fn load_rule_count(ans: Str) -> Int:
+  if ans == "!" or ans == "": return -1
+  var outer = lconf.parse_json(ans)
+  if outer.err != "" or outer.v.len == 0 or outer.v[0].k != lconf.J_STR: return -1
+  let res = lconf.parse_json(outer.v[0].s)
+  let ok = lconf.get(res, 0, "Success")
+  if ok < 0: return -1
+  let rn = lconf.get(res, ok, "ruleNames")
+  if rn < 0: return -1
+  return res.v[rn].kids.len
 
 # Where the host script is: written once to the user's cache folder (or the temporary one).
 fn host_path(fs: Fs, os: Os) -> Str:
@@ -54,11 +178,30 @@ fn host_path(fs: Fs, os: Os) -> Str:
     return f
   return ""
 
+# The host's startup snapshot, when vlint carries one for this host (ljs_glue.c): written beside the
+# host script (host-HASH-NODEVERSION.blob), and `node --version` asked, which says whether the
+# processes can start from it. Called as soon as a configuration is known to have JS plugins, so
+# that node answers while vlint plans (VLINT_JS_SNAPSHOT=0: not used).
+fn prepare(fs: Fs, os: Os, ffi: Ffi):
+  if os.env("VLINT_JS_SNAPSHOT") == "0" or os.env("VLINT_JS_HOST") != "": return
+  let ver = vl_snap_node(ffi, lhost.HOST_HASH)
+  if ver == "": return
+  let p = host_path(fs, os)
+  if p == "" or not p.endswith(".mjs"): return
+  let b = p[0..p.len - 4] + "-" + ver + ".blob"
+  if not fs.exists(b):
+    if vl_snap_write(ffi, b) == 0: return
+  vl_node_snapshot(ffi, b)
+
 # Starts the plugin host (nothing runs until the first request).
 fn start(fs: Fs, os: Os, ffi: Ffi, var js: Js, slots: Int) -> Str:
   if js.on: return ""
+  if js.bat:
+    js.on = true
+    return ""
   let p = host_path(fs, os)
   if p == "": return "Failed to write the JS plugin host"
+  prepare(fs, os, ffi)
   vl_node_setup(ffi, p, "\n".join(args()), slots)
   js.on = true
   return ""
@@ -182,19 +325,34 @@ fn resolve_plugin(fs: Fs, ffi: Ffi, dir: Str, spec: Str, var pkg: [Str]) -> Str:
   if found == "": return ""
   let real = lcache.realpath(ffi, found)
   if real != "": found = real
-  if not (spec.startswith(".") or spec.startswith("/")):
-    # the package's name: the package.json nearest to the file
-    var d = lconf.dir_of(found)
-    while d != "":
-      let txt = fs.read(d + "/package.json") else ""
-      if txt != "":
-        let pj = lconf.parse_json(txt)
-        let nm = lconf.get(pj, 0, "name")
-        if nm >= 0 and pj.v[nm].k == lconf.J_STR: pkg.push(pj.v[nm].s + "")
-        break
-      if d == "/": break
-      d = lconf.dir_of(d)
+  # (the package's name, for a package specifier: it names the plugin)
+  if not (spec.startswith(".") or spec.startswith("/")): pkg = package_of(fs, found)
   return found
+
+# The name and version in the package.json nearest to a file ([] none)
+fn package_of(fs: Fs, file: Str) -> [Str]:
+  var d = lconf.dir_of(file)
+  while d != "":
+    let txt = fs.read(d + "/package.json") else ""
+    if txt != "":
+      let pj = lconf.parse_json(txt)
+      let nm = lconf.get(pj, 0, "name")
+      if nm >= 0 and pj.v[nm].k == lconf.J_STR:
+        let vv = lconf.get(pj, 0, "version")
+        if vv >= 0 and pj.v[vv].k == lconf.J_STR: return [pj.v[nm].s + "", pj.v[vv].s + ""]
+        return [pj.v[nm].s + "", ""]
+      return []
+    if d == "/": break
+    d = lconf.dir_of(d)
+  return []
+
+# The package a plugin file is the entry of, for its kind (np_kind): a path specifier's too
+fn kind_package(fs: Fs, path: Str, pkg: [Str]) -> [Str]:
+  if pkg.len > 0:
+    var c: [Str] = []
+    for x in pkg: c.push(x + "")
+    return c
+  return package_of(fs, path)
 
 fn file_url(p: Str) -> Str:
   var b: [Byte] = []
@@ -211,11 +369,12 @@ fn file_url(p: Str) -> Str:
   return b.take_str()
 
 # Loads a plugin (once per file): "" or the message of oxlint's "Failed to load JS plugin" error
-fn load_plugin(fs: Fs, ffi: Ffi, var js: Js, var m: lmeta.Meta, dir: Str, spec: Str, alias: Str) -> Str:
+fn load_plugin(fs: Fs, ffi: Ffi, var js: Js, var m: lmeta.Meta, dir: Str, spec: Str, alias: Str, mask: Int) -> Str:
   var pkg: [Str] = []
   let path = resolve_plugin(fs, ffi, dir, spec, &pkg)
   if path == "": return "Cannot find module '{spec}'"
   if path in js.paths: return ""
+  let kd = native_kind(kind_package(fs, path, pkg), mask)
   var name = ""
   var has_name = false
   if alias != "":
@@ -232,7 +391,20 @@ fn load_plugin(fs: Fs, ffi: Ffi, var js: Js, var m: lmeta.Meta, dir: Str, spec: 
   req += ",\"alias\":"
   if alias != "": req += "true}}"
   else: req += "false}}"
-  let ans = vl_node_call(ffi, req)
+  var ans = ""
+  var host = js.nhost
+  var own = ""
+  if js.bat:
+    let ra = reg_ask(js, 1, req)
+    let t1 = ra.find("\t")
+    if t1 < 0: return "vlint: the JS plugin host (node) could not be started or stopped"
+    host = int(ra[0..t1]) else -1
+    let rest = ra[t1 + 1..ra.len]
+    let t2 = rest.find("\t")
+    if t2 < 0: return "vlint: the JS plugin host (node) could not be started or stopped"
+    own = rest[0..t2]
+    ans = rest[t2 + 1..rest.len]
+  else: ans = vl_node_call(ffi, req)
   if ans == "!" or ans == "": return "vlint: the JS plugin host (node) could not be started or stopped"
   # the answer is a JSON string holding oxlint's {"Success": ...} or {"Failure": message}
   var outer = lconf.parse_json(ans)
@@ -243,18 +415,286 @@ fn load_plugin(fs: Fs, ffi: Ffi, var js: Js, var m: lmeta.Meta, dir: Str, spec: 
   let ok = lconf.get(res, 0, "Success")
   if ok < 0: return "vlint: bad answer from the JS plugin host"
   let nm = lconf.get(res, ok, "name")
-  let pname = res.v[nm].s + ""
+  var pname = res.v[nm].s + ""
+  if own != "": pname = own
   if lconf.plugin_flag(pname) >= 0: return "!reserved:" + pname
   let rn = lconf.get(res, ok, "ruleNames")
   for r in res.v[rn].kids:
     let full = pname + "/" + res.v[r].s
     m.xrid[full] = m.xname.len
     m.xname.push(full)
+    var cat = -1
+    if kd >= 0: cat = np_cat(kd, res.v[r].s)
+    set_x(&m, m.xname.len - 1, host, cat)
+    if kd == 2: m.xsite[full] = report_site(fs, path, res.v[r].s)
+    host += 1
   m.xplug[pname] = true
   js.paths[path] = true
+  if js.bat: return ""
+  js.nhost = host
   js.prelude.push(req)
   vl_node_prelude(ffi, "\n".join(js.prelude))
   return ""
+
+# A JS rule's host id and native category (lmeta.Meta.xhost, xnat)
+fn set_x(var m: lmeta.Meta, id: Int, host: Int, cat: Int):
+  while m.xhost.len <= id: m.xhost.push(-1)
+  while m.xnat.len <= id: m.xnat.push(-1)
+  m.xhost[id] = host
+  m.xnat[id] = cat
+
+fn xnat_of(m: lmeta.Meta, id: Int) -> Int:
+  if id < 0 or id >= m.xnat.len: return -1
+  return m.xnat[id]
+
+fn xhost_of(m: lmeta.Meta, id: Int) -> Int:
+  if id < 0 or id >= m.xhost.len: return id
+  return m.xhost[id]
+
+# ---- JS plugins whose rules vlint runs natively
+#
+# When a configuration's jsPlugins load one of these packages (under any alias), each of its rules
+# that vlint implements runs natively under the configuration's name for it (react-hooks-js/purity,
+# jsx-a11y-js/control-has-associated-label), with that rule's severity and disable directives; the
+# rest, and rules given options the native side doesn't take, stay in node. For the exact versions
+# whose rule names are known here (np_known), the plugin isn't loaded in node at all unless one of
+# those is on (load_deferred). The kinds:
+#   0 eslint-plugin-react-hooks 7.x: its compiler rules on vlint's React Compiler (rmore10.vu)
+#   1 eslint-plugin-jsx-a11y 6.x: a port of 6.10.2's rules oxlint lacks or words otherwise (rxa11y.vu)
+#   2 @eslint-community/eslint-plugin-eslint-comments 4.x: a port of 4.7.2 (rxcomments.vu)
+# A rule's native category (Meta.xnat) is kind * 1000 + its index in np_native (kind 0: the React
+# Compiler's ErrorCategory). Off: VLINT_NATIVE_JS_PLUGINS=0 (all), VLINT_NATIVE_REACT_HOOKS=0,
+# VLINT_NATIVE_JSX_A11Y=0, VLINT_NATIVE_ESLINT_COMMENTS=0, or in the configuration that lists the
+# plugin `settings.vlint`: nativeJsPlugins, nativeReactHooks, nativeJsxA11y, nativeEslintComments
+# false.
+
+fn np_kinds() -> Int:
+  return 3
+
+# The package's kind (-1: not one of these): its name and major version
+fn np_kind(pkg: [Str]) -> Int:
+  if pkg.len < 2: return -1
+  if pkg[0] == "eslint-plugin-react-hooks" and pkg[1].startswith("7."): return 0
+  if pkg[0] == "eslint-plugin-jsx-a11y" and pkg[1].startswith("6."): return 1
+  if pkg[0] == "@eslint-community/eslint-plugin-eslint-comments" and pkg[1].startswith("4."): return 2
+  return -1
+
+fn np_package(kind: Int) -> Str:
+  return ["eslint-plugin-react-hooks", "eslint-plugin-jsx-a11y", "@eslint-community/eslint-plugin-eslint-comments"][kind] + ""
+
+fn np_env(kind: Int) -> Str:
+  return ["VLINT_NATIVE_REACT_HOOKS", "VLINT_NATIVE_JSX_A11Y", "VLINT_NATIVE_ESLINT_COMMENTS"][kind] + ""
+
+fn np_setting(kind: Int) -> Str:
+  return ["nativeReactHooks", "nativeJsxA11y", "nativeEslintComments"][kind] + ""
+
+# The version whose rules (np_rules) are known, so that it needn't be loaded to know them
+fn np_known(kind: Int) -> Str:
+  return ["7.1.1", "6.10.2", "4.7.2"][kind] + ""
+
+# The known version's rules, in the order of its `rules` object (the host's ruleNames)
+fn np_rules(kind: Int) -> [Str]:
+  if kind == 0: return ["exhaustive-deps", "rules-of-hooks", "hooks", "capitalized-calls", "static-components", "use-memo", "void-use-memo", "preserve-manual-memoization", "memo-dependencies", "incompatible-library", "immutability", "globals", "refs", "memoized-effect-dependencies", "exhaustive-effect-dependencies", "set-state-in-effect", "no-deriving-state-in-effects", "error-boundaries", "purity", "set-state-in-render", "invariant", "todo", "syntax", "unsupported-syntax", "config", "gating", "rule-suppression", "fbt", "component-hook-factories"]
+  if kind == 1: return ["accessible-emoji", "alt-text", "anchor-ambiguous-text", "anchor-has-content", "anchor-is-valid", "aria-activedescendant-has-tabindex", "aria-props", "aria-proptypes", "aria-role", "aria-unsupported-elements", "autocomplete-valid", "click-events-have-key-events", "control-has-associated-label", "heading-has-content", "html-has-lang", "iframe-has-title", "img-redundant-alt", "interactive-supports-focus", "label-has-associated-control", "label-has-for", "lang", "media-has-caption", "mouse-events-have-key-events", "no-access-key", "no-aria-hidden-on-focusable", "no-autofocus", "no-distracting-elements", "no-interactive-element-to-noninteractive-role", "no-noninteractive-element-interactions", "no-noninteractive-element-to-interactive-role", "no-noninteractive-tabindex", "no-onchange", "no-redundant-roles", "no-static-element-interactions", "prefer-tag-over-role", "role-has-required-aria-props", "role-supports-aria-props", "scope", "tabindex-no-positive"]
+  return ["disable-enable-pair", "no-aggregating-enable", "no-duplicate-disable", "no-restricted-disable", "no-unlimited-disable", "no-unused-disable", "no-unused-enable", "no-use", "require-description"]
+
+# The rules that run natively (kind 0: the React Compiler's ErrorCategory order, rmore10.rule_ids;
+# "" where the port has none)
+fn np_native(kind: Int) -> [Str]:
+  if kind == 0: return ["hooks", "capitalized-calls", "static-components", "use-memo", "void-use-memo", "", "memo-dependencies", "incompatible-library", "immutability", "globals", "refs", "exhaustive-effect-dependencies", "set-state-in-effect", "no-deriving-state-in-effects", "error-boundaries", "purity", "set-state-in-render", "invariant", "todo", "syntax", "unsupported-syntax", "", "", "rule-suppression"]
+  if kind == 1: return ["control-has-associated-label", "interactive-supports-focus", "no-interactive-element-to-noninteractive-role", "no-noninteractive-element-interactions", "no-noninteractive-element-to-interactive-role", "no-onchange", "label-has-for"]
+  return np_rules(2)
+
+# The rule's native category, -1 when it has none
+fn np_cat(kind: Int, rule: Str) -> Int:
+  if rule == "" or kind < 0: return -1
+  let xs = np_native(kind)
+  for i in 0..xs.len:
+    if xs[i] == rule:
+      if kind == 0: return i
+      return kind * 1000 + i
+  return -1
+
+fn cat_kind(cat: Int) -> Int:
+  if cat < 1000: return 0
+  return cat / 1000
+
+# Which kinds a configuration lets run natively (its settings as JSON text): a bit per kind
+fn native_mask(os: Os, settings: Str) -> Int:
+  if os.env("VLINT_NATIVE_JS_PLUGINS") == "0": return 0
+  var mask = 0
+  for kd in 0..np_kinds():
+    if os.env(np_env(kd)) != "0": mask = mask | (1 << kd)
+  if settings == "" or settings.find("native") < 0: return mask
+  let js = lconf.parse_json(settings)
+  if js.err != "" or js.v.len == 0 or js.v[0].k != lconf.J_OBJ: return mask
+  let v = lconf.get(js, 0, "vlint")
+  if v < 0 or js.v[v].k != lconf.J_OBJ: return mask
+  let all = lconf.get(js, v, "nativeJsPlugins")
+  if all >= 0 and js.v[all].k == lconf.J_FALSE: return 0
+  for kd in 0..np_kinds():
+    let n = lconf.get(js, v, np_setting(kd))
+    if n >= 0 and js.v[n].k == lconf.J_FALSE: mask = mask - (mask & (1 << kd))
+  return mask
+
+# The package's kind if this configuration lets it run natively, else -1
+fn native_kind(pkg: [Str], mask: Int) -> Int:
+  let kd = np_kind(pkg)
+  if kd < 0 or (mask & (1 << kd)) == 0: return -1
+  return kd
+
+# A jsPlugins entry that needn't be loaded in node now: one of the known versions above, under an
+# alias or, when its own name isn't reserved, without one. Its rules are registered by name, run
+# natively or, when load_deferred loads it after all, in node. True when deferred.
+fn try_defer(fs: Fs, ffi: Ffi, var js: Js, var m: lmeta.Meta, dir: Str, spec: Str, alias: Str, mask: Int) -> Bool:
+  if mask == 0: return false
+  if alias != "" and (lconf.normalize_plugin(alias) != alias or lconf.plugin_flag(alias) >= 0): return false
+  var pkg: [Str] = []
+  let path = resolve_plugin(fs, ffi, dir, spec, &pkg)
+  if path == "": return false
+  if path in js.paths: return true
+  let kp = kind_package(fs, path, pkg)
+  let kd = native_kind(kp, mask)
+  if kd < 0 or kp[1] != np_known(kd): return false
+  # (the name the host would give it: the alias, else the package's; eslint-plugin-jsx-a11y's meta.name
+  # and eslint-plugin-react-hooks' are reserved)
+  var name = alias + ""
+  if name == "":
+    # (a path specifier without an alias: the host names it by the plugin's meta, not modeled)
+    if pkg.len == 0: return false
+    name = lconf.normalize_plugin(pkg[0])
+    if kd != 2 or lconf.plugin_flag(name) >= 0: return false
+  if name in m.xplug: return false
+  var req = "{{\"op\":\"load\",\"url\":\"" + lout.json_esc(file_url(path)) + "\",\"name\":\"" + lout.json_esc(name) + "\",\"alias\":"
+  if alias != "": req += "true}}"
+  else: req += "false}}"
+  let first = m.xname.len
+  for r in np_rules(kd):
+    let full = name + "/" + r
+    m.xrid[full] = m.xname.len
+    m.xname.push(full)
+    set_x(&m, m.xname.len - 1, -1, np_cat(kd, r))
+    if kd == 2: m.xsite[full] = report_site(fs, path, r)
+  m.xplug[name] = true
+  js.paths[path] = true
+  js.deferred.push(path + "\t" + req + "\t{first}\t{kd}")
+  return true
+
+# Whether a JS rule with these options (JSON text, "" none) runs natively: vlint has it, and no
+# options it doesn't take. Kind 0: none but an empty object (7.1.1's only option is the compiler's
+# configuration); kinds 1 and 2: the defaults (none, or an empty object for a rule whose schema is
+# an object).
+fn runs_native(m: lmeta.Meta, id: Int, opts: Str) -> Bool:
+  let cat = xnat_of(m, id)
+  if cat < 0: return false
+  let o = opts.replace(" ", "")
+  if o == "" or o == "[]": return true
+  if o != "[{{}}]": return false
+  if cat_kind(cat) != 2: return true
+  # (eslint-comments: the rules whose schema is an object)
+  let r = np_native(2)[cat - 2000]
+  return r == "disable-enable-pair" or r == "no-use" or r == "require-description"
+
+# Loads the deferred plugins in node that a configuration needs (after the others: their rules'
+# host ids follow), need[k] for js.deferred[k]. "" or the error; plugin: the package failing.
+fn load_deferred(ffi: Ffi, var js: Js, var m: lmeta.Meta, need: [Bool], var plugin: Str) -> Str:
+  var left: [Str] = []
+  for di in 0..js.deferred.len:
+    if not need[di]:
+      left.push(js.deferred[di] + "")
+      continue
+    let f = js.deferred[di].split("\t")
+    let req = f[1] + ""
+    let first = int(f[2]) else 0
+    let kd = int(f[3]) else 0
+    plugin = np_package(kd)
+    var ans = ""
+    var host = js.nhost
+    if js.bat:
+      let ra = reg_ask(js, 1, req)
+      let t1 = ra.find("\t")
+      if t1 < 0: return "vlint: the JS plugin host (node) could not be started or stopped"
+      host = int(ra[0..t1]) else -1
+      let rest = ra[t1 + 1..ra.len]
+      let t2 = rest.find("\t")
+      if t2 < 0: return "vlint: the JS plugin host (node) could not be started or stopped"
+      ans = rest[t2 + 1..rest.len]
+    else: ans = vl_node_call(ffi, req)
+    if ans == "!" or ans == "": return "vlint: the JS plugin host (node) could not be started or stopped"
+    var outer = lconf.parse_json(ans)
+    if outer.err != "" or outer.v.len == 0 or outer.v[0].k != lconf.J_STR: return "vlint: bad answer from the JS plugin host"
+    let res = lconf.parse_json(outer.v[0].s)
+    let failure = lconf.get(res, 0, "Failure")
+    if failure >= 0: return res.v[failure].s + ""
+    let ok = lconf.get(res, 0, "Success")
+    if ok < 0: return "vlint: bad answer from the JS plugin host"
+    let rn = lconf.get(res, ok, "ruleNames")
+    let want = np_rules(kd)
+    let bad = "vlint: {np_package(kd)} {np_known(kd)} has other rules than vlint knows ({np_env(kd)}=0 runs it in node)"
+    if rn < 0 or res.v[rn].kids.len != want.len: return bad
+    for k in 0..want.len:
+      if res.v[res.v[rn].kids[k]].s != want[k]: return bad
+      m.xhost[first + k] = host
+      host += 1
+    if not js.bat:
+      js.nhost = host
+      js.prelude.push(req)
+  js.deferred = left
+  if not js.bat: vl_node_prelude(ffi, "\n".join(js.prelude))
+  return ""
+
+# Where an eslint-comments rule's create calls context.report, as a stack trace names it
+# ("FILE:LINE:COL", the column of `report`): the package's lib/rules/RULE.js next to its index.js
+fn report_site(fs: Fs, index: Str, rule: Str) -> Str:
+  let f = lconf.dir_of(index) + "/lib/rules/" + rule + ".js"
+  let txt = fs.read(f) else ""
+  let cr = txt.find("create(")
+  if cr < 0: return f
+  let at = txt.find("context.report(", cr)
+  if at < 0: return f
+  var line = 1
+  var ls = 0
+  for i in 0..at:
+    if txt[i] == '\n':
+      line += 1
+      ls = i + 1
+  return "{f}:{line}:{at + 8 - ls + 1}"
+
+# The stack frames of the RangeError the host throws when a rule reports a column of -1 on the
+# first line (rxcomments.vu), above and below the rule's own frame, with the host's URL: from the
+# host's text (lhost.HOST_JS), the lines and columns V8 gives them. "" when not found.
+fn throw_frames(fs: Fs, os: Os, ffi: Ffi) -> [Str]:
+  # (node names its main module by its real path)
+  var hp = host_path(fs, os)
+  let real = lcache.realpath(ffi, hp)
+  if real != "": hp = real
+  let url = file_url(hp)
+  let h = lhost.HOST_JS
+  # (anchor, the text in its line whose column is the frame's, the function to start the search from)
+  let anchors = [["throw RangeError(\"Line/column pair translates to an out of range offset\")", "RangeError(", "function getOffsetFromLineColumn(lineCol)", "getOffsetFromLineColumn"], ["if (start = getOffsetFromLineColumn(startLineCol)", "getOffsetFromLineColumn(", "function report(diagnostic", "report"], ["report(diagnostic, extraArgs, ruleDetails);", "report(", "value(diagnostic, ...extraArgs) {{", "Object.value [as report]"], ["ruleDetails.rule.create(ruleDetails.context)", "create(", "function lintFileImpl(", "lintFileImpl"], ["lintFileImpl(filePath, bufferId", "lintFileImpl(", "function lintFile(", "lintFile"], ["return lintFile(req.path", "lintFile(", "function lintFileWrapper(", "lintFileWrapper"]]
+  var out: [Str] = []
+  for a in anchors:
+    let fn0 = h.find(a[2])
+    if fn0 < 0: return []
+    let at = h.find(a[0], fn0)
+    if at < 0: return []
+    var ls = at
+    while ls > 0 and h[ls - 1] != '\n': ls -= 1
+    let col = h.find(a[1], ls) - ls + 1
+    var line = 1
+    for i in 0..ls:
+      if h[i] == '\n': line += 1
+    out.push("    at {a[3]} ({url}:{line}:{col})")
+  return out
+
+# The deferred plugin a JS rule id belongs to (its index in js.deferred), -1 none
+fn deferred_of(js: Js, id: Int) -> Int:
+  for di in 0..js.deferred.len:
+    let f = js.deferred[di].split("\t")
+    let first = int(f[2]) else 0
+    let kd = int(f[3]) else 0
+    if id >= first and id < first + np_rules(kd).len: return di
+  return -1
 
 # The tree of a file as one JSON object: the nodes (9 numbers each: kind, start, end, a, b, c, d,
 # flags, name), the item lists, the names, the decorators, the file root.
@@ -344,10 +784,31 @@ fn options_id(var js: Js, rule: Int, opts: Str) -> Int:
   js.orule.push(rule)
   return id
 
+# options_id for a rule of m (a batch's: the registry's id, by the rule's host id)
+fn options_idm(var js: Js, m: lmeta.Meta, rule: Int, opts: Str) -> Int:
+  if not js.bat: return options_id(&js, rule, opts)
+  if opts == "": return 0
+  let key = "{rule}\t{opts}"
+  let k = js.oid.get(key, -1)
+  if k >= 0: return k
+  let id = int(reg_ask(js, 2, "{xhost_of(m, rule)}\t{opts}")) else 0
+  js.oid[key] = id
+  return id
+
 # Sends the rules' options (every configuration's) to the host: "" or the error to print
-fn setup(ffi: Ffi, var js: Js, cwd: Str) -> Str:
+fn setup(ffi: Ffi, var js: Js, cwd: Str, m: lmeta.Meta) -> Str:
+  if js.bat:
+    let a = reg_ask(js, 3, cwd)
+    if a == "!" or a == "": return "vlint: the JS plugin host (node) could not be started"
+    if a == "null": return ""
+    let v = lconf.parse_json(a)
+    if v.err == "" and v.v.len > 0 and v.v[0].k == lconf.J_STR: return v.v[0].s + ""
+    return a
   var ids: [Str] = []
-  for r in js.orule: ids.push("{r}")
+  # (entry 0, no options, isn't a rule's)
+  for k in 0..js.orule.len:
+    if k == 0: ids.push("{js.orule[k]}")
+    else: ids.push("{xhost_of(m, js.orule[k])}")
   let body = "{{\"cwd\":\"" + lout.json_esc(cwd) + "\",\"workspaceUri\":null,\"ruleIds\":[" + ",".join(ids) + "],\"options\":[" + ",".join(js.opts) + "]}}"
   let req = "{{\"op\":\"setup\",\"json\":\"" + lout.json_esc(body) + "\"}}"
   let ans = vl_node_call(ffi, req)
@@ -394,6 +855,98 @@ fn lint_request(path: Str, src: Str, bom: Bool, jsx: Bool, source_type: Str, bas
   b.push('}')
   return b.take_str()
 
+# One file's request as a frame: lint_request's JSON (op "lintb") without the text and the tree's
+# node and list arrays, a line break, then those as bytes: the text, zeros to a multiple of 4, the
+# nodes (9 little-endian int32 each, as tree_json's numbers), the lists. "bin" in the JSON gives the
+# three lengths. The host reads the arrays as they are (main.js), with no JSON to parse or to make.
+# "" when a number doesn't fit in an int32 (then lint_request is sent).
+fn lint_frame(path: Str, src: Str, bom: Bool, jsx: Bool, source_type: Str, base: Int, t: ast.Ast, root: Int, file: Int, rules: [Int], opts: [Int], settings: Str, globals: Str) -> Str:
+  let pad = (4 - src.len % 4) % 4
+  var b: [Byte] = []
+  b.reserve(512 + src.len + pad + 36 * t.nd.len + 4 * t.L.len)
+  push_str(&b, "{{\"op\":\"lintb\",\"path\":\"")
+  push_str(&b, lout.json_esc(path))
+  push_str(&b, "\",\"bom\":")
+  if bom: push_str(&b, "true")
+  else: push_str(&b, "false")
+  push_str(&b, ",\"jsx\":")
+  if jsx: push_str(&b, "true")
+  else: push_str(&b, "false")
+  push_str(&b, ",\"sourceType\":\"")
+  push_str(&b, source_type)
+  push_str(&b, "\",\"base\":")
+  push_int(&b, base)
+  push_str(&b, ",\"rules\":[")
+  for i in 0..rules.len:
+    if i > 0: b.push(',')
+    push_int(&b, rules[i])
+  push_str(&b, "],\"opts\":[")
+  for i in 0..opts.len:
+    if i > 0: b.push(',')
+    push_int(&b, opts[i])
+  push_str(&b, "],\"settings\":\"")
+  push_str(&b, lout.json_esc(settings))
+  push_str(&b, "\",\"globals\":\"")
+  push_str(&b, lout.json_esc(globals))
+  push_str(&b, "\",\"tree\":{{\"nm\":[")
+  for i in 0..t.names.len:
+    if i > 0: b.push(',')
+    b.push('"')
+    push_str(&b, lout.json_esc(t.names[i]))
+    b.push('"')
+  push_str(&b, "],\"deco\":[")
+  let dk = -1000000 - file
+  if dk in t.dirs:
+    let ds = t.dirs[dk]
+    for i in 0..ds.len:
+      if i > 0: b.push(',')
+      push_int(&b, ds[i])
+  push_str(&b, "],\"np\":[")
+  var first = true
+  for k, v in t.npos:
+    if not first: b.push(',')
+    first = false
+    push_int(&b, k)
+    b.push(',')
+    push_int(&b, v)
+  push_str(&b, "],\"root\":")
+  push_int(&b, root)
+  push_str(&b, "}},\"bin\":[")
+  push_int(&b, src.len)
+  b.push(',')
+  push_int(&b, 9 * t.nd.len)
+  b.push(',')
+  push_int(&b, t.L.len)
+  push_str(&b, "]}}\n")
+  push_str(&b, src)
+  for i in 0..pad: b.push(0)
+  for i in 0..t.nd.len:
+    let x = t.nd[i]
+    if not (fits32(x.k) and fits32(x.pos) and fits32(x.end) and fits32(x.a) and fits32(x.b) and fits32(x.c) and fits32(x.d) and fits32(x.f) and fits32(x.s)): return ""
+    push_i32(&b, x.k)
+    push_i32(&b, x.pos)
+    push_i32(&b, x.end)
+    push_i32(&b, x.a)
+    push_i32(&b, x.b)
+    push_i32(&b, x.c)
+    push_i32(&b, x.d)
+    push_i32(&b, x.f)
+    push_i32(&b, x.s)
+  for i in 0..t.L.len:
+    let x = t.L[i]
+    if not fits32(x): return ""
+    push_i32(&b, x)
+  return b.take_str()
+
+fn fits32(x: Int) -> Bool:
+  return x >= -2147483648 and x <= 2147483647
+
+fn push_i32(var b: [Byte], x: Int):
+  b.push(byte(x & 255))
+  b.push(byte((x >> 8) & 255))
+  b.push(byte((x >> 16) & 255))
+  b.push(byte((x >> 24) & 255))
+
 # a source text as a JSON string's contents (control characters, quotes, backslashes; invalid
 # UTF-8 as U+FFFD, which JSON can't carry otherwise)
 fn json_text(s: Str) -> Str:
@@ -402,8 +955,19 @@ fn json_text(s: Str) -> Str:
 fn call(ffi: Ffi, req: Str) -> Str:
   return vl_node_call(ffi, req)
 
+# how many lint requests the run sends at most (the processes are added as the work shows it pays)
+fn expect(ffi: Ffi, n: Int):
+  vl_node_expect(ffi, n)
+
+fn expect_add(ffi: Ffi, n: Int):
+  vl_node_expect_add(ffi, n)
+
 fn stop(ffi: Ffi):
   vl_node_stop(ffi)
+
+# (no more calls after this: the processes end on their own, waited for at exit)
+fn release(ffi: Ffi):
+  vl_node_release(ffi)
 
 # tsgolint started without waiting for it (ljs_glue.c): its pid (-1: it couldn't start), and its exit
 # status when it's done

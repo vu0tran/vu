@@ -1,7 +1,13 @@
 // vlint's result cache: a file's size, modification and change times (ns) and inode, and the clock.
+#if !defined(__APPLE__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* (dl_iterate_phdr) */
+#endif
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #ifdef __APPLE__
 #define st_mtim st_mtimespec
 #define st_ctim st_ctimespec
@@ -75,14 +81,63 @@ int64_t vl_now_ns(void) {
   return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
 }
 
-// The online CPUs, where /proc/cpuinfo isn't there (macOS).
+// The CPUs this process may use: the online ones, on Linux fewer when its affinity mask or its
+// cgroup's CPU quota (v2 cpu.max, v1 cpu.cfs_quota_us) allows fewer. (A container's limit shows in
+// neither /proc/cpuinfo nor the affinity mask: a CI pod limited to a few CPUs of a large node saw
+// all of the node's.)
+#ifdef __linux__
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static long vl_quota_cpus(void) {
+  FILE *f = fopen("/sys/fs/cgroup/cpu.max", "r");
+  long long q = -1, per = 0;
+  if (f) {
+    char a[64] = {0};
+    if (fscanf(f, "%63s %lld", a, &per) == 2 && strcmp(a, "max") != 0) q = atoll(a);
+    fclose(f);
+  } else {
+    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r");
+    if (f) { if (fscanf(f, "%lld", &q) != 1) q = -1; fclose(f); }
+    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r");
+    if (f) { if (fscanf(f, "%lld", &per) != 1) per = 0; fclose(f); }
+  }
+  if (q <= 0 || per <= 0) return -1;
+  return (long)((q + per - 1) / per);
+}
+#endif
 int64_t vl_ncpu(void) {
   long n = sysconf(_SC_NPROCESSORS_ONLN);
+#ifdef __linux__
+  cpu_set_t cs;
+  if (sched_getaffinity(0, sizeof cs, &cs) == 0) {
+    long a = CPU_COUNT(&cs);
+    if (a > 0 && (n <= 0 || a < n)) n = a;
+  }
+  long q = vl_quota_cpus();
+  if (q > 0 && (n <= 0 || q < n)) n = q;
+#endif
   return n > 0 ? (int64_t)n : 1;
 }
 
+// For values a process hands its workers through the environment (VLINT_BUILD_ID).
+void vl_setenv(const vu_str *name, const vu_str *value) {
+  char k[256], v[256];
+  if (name->len <= 0 || name->len >= (int64_t)sizeof k || value->len >= (int64_t)sizeof v) return;
+  memcpy(k, name->data, (size_t)name->len);
+  k[name->len] = 0;
+  memcpy(v, value->data, (size_t)value->len);
+  v[value->len] = 0;
+  setenv(k, v, 1);
+}
+
+
 // For the command line: whether a descriptor is a terminal, the working directory, a real path.
 #include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <limits.h>
 #include <stdlib.h>
 
@@ -119,6 +174,80 @@ vu_str vl_self_exe(void) {
   if (!realpath("/proc/self/exe", buf)) return vu_str_from("", 0);
 #endif
   return vu_str_from(buf, (int64_t)strlen(buf));
+}
+
+// The linker's identifier of this executable, as hex ("" none): its Mach-O LC_UUID or its ELF GNU
+// build-id note, read from the image in memory. Both are hashes of the linked output, so a build of
+// other code has another; the caches' build key without reading the 16 MB executable (exe_hash).
+#ifdef __APPLE__
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#else
+#include <link.h>
+#include <elf.h>
+static int vl_note_cb(struct dl_phdr_info *info, size_t size, void *data) {
+  (void)size;
+  char *out = (char *)data;
+  // (the first object is the executable itself)
+  for (int i = 0; i < info->dlpi_phnum; i++) {
+    const ElfW(Phdr) *ph = &info->dlpi_phdr[i];
+    if (ph->p_type != PT_NOTE) continue;
+    const unsigned char *p = (const unsigned char *)(info->dlpi_addr + ph->p_vaddr);
+    size_t off = 0;
+    while (off + 12 <= ph->p_memsz) {
+      uint32_t nsz, dsz, typ;
+      memcpy(&nsz, p + off, 4); memcpy(&dsz, p + off + 4, 4); memcpy(&typ, p + off + 8, 4);
+      size_t name_at = off + 12, desc_at = name_at + ((nsz + 3) & ~3u);
+      size_t next = desc_at + ((dsz + 3) & ~3u);
+      if (next > ph->p_memsz) break;
+      if (typ == 3 && nsz == 4 && memcmp(p + name_at, "GNU", 4) == 0 && dsz >= 8 && dsz <= 64) {
+        for (uint32_t k = 0; k < dsz; k++) sprintf(out + 2 * k, "%02x", p[desc_at + k]);
+        return 1;
+      }
+      off = next;
+    }
+  }
+  return 1;
+}
+#endif
+vu_str vl_build_uuid(void) {
+  char hex[160] = "";
+#ifdef __APPLE__
+  const struct mach_header_64 *h = (const struct mach_header_64 *)_dyld_get_image_header(0);
+  if (h && h->magic == MH_MAGIC_64) {
+    const unsigned char *lc = (const unsigned char *)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+      const struct load_command *c = (const struct load_command *)lc;
+      if (c->cmd == LC_UUID) {
+        const struct uuid_command *u = (const struct uuid_command *)lc;
+        int zero = 1;
+        for (int k = 0; k < 16; k++) { sprintf(hex + 2 * k, "%02x", u->uuid[k]); if (u->uuid[k]) zero = 0; }
+        if (zero) hex[0] = 0;
+        break;
+      }
+      lc += c->cmdsize;
+    }
+  }
+#else
+  dl_iterate_phdr(vl_note_cb, hex);
+#endif
+  return vu_str_from(hex, (int64_t)strlen(hex));
+}
+
+// The allocator's free memory given back to the system (macOS: malloc_zone_pressure_relief; glibc:
+// malloc_trim): vlint's process kept 0.3-0.7 GB of the plain lint's freed memory resident while
+// the type-aware part ran.
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
+void vl_release_memory(void) {
+#ifdef __APPLE__
+  malloc_zone_pressure_relief(NULL, 0);
+#elif defined(__GLIBC__)
+  malloc_trim(0);
+#endif
 }
 
 // Whether a path is a symbolic link (lstat).
@@ -173,6 +302,7 @@ vu_str vl_readdir(const vu_str *path) {
 // bound, so each shares that copy-on-write instead of making its own. Only where this process has
 // one thread: another's locks (malloc's among them) would stay held in the child.
 #include <sys/wait.h>
+#include <sys/mman.h>
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
@@ -212,7 +342,65 @@ int64_t vl_fork(void) {
 
 bool vl_is_child(void) { return vl_child_flag != 0; }
 
+// n flags (zero) that processes forked after they're made share (an anonymous shared mapping):
+// forked workers claiming work items. 0 when they can't be made.
+int64_t vl_shared_flags(int64_t n) {
+  if (n < 1) n = 1;
+  void *p = mmap(NULL, (size_t)n * 8, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+  if (p == MAP_FAILED) return 0;
+  return (int64_t)(intptr_t)p;
+}
+// flag i set by this call (a compare-and-swap from 0): whether it was this call that set it
+bool vl_flag_claim(int64_t at, int64_t i) {
+  int64_t old = 0;
+  return __atomic_compare_exchange_n((int64_t *)(intptr_t)at + i, &old, 1, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+}
+int64_t vl_flag_get(int64_t at, int64_t i) { return __atomic_load_n((int64_t *)(intptr_t)at + i, __ATOMIC_RELAXED); }
+void vl_flag_set(int64_t at, int64_t i, int64_t v) { __atomic_store_n((int64_t *)(intptr_t)at + i, v, __ATOMIC_RELAXED); }
+void vl_flags_free(int64_t at, int64_t n) {
+  if (n < 1) n = 1;
+  if (at != 0) munmap((void *)(intptr_t)at, (size_t)n * 8);
+}
+
 // A child's exit status (128 + the signal that stopped it; -1 when it can't be waited for).
+/* A program started with vlint's standard streams and environment, its arguments separated by \x01
+   (os.run without the wait: vl_poll_exit waits). Its pid, or -1. */
+#include <spawn.h>
+extern char **environ;
+int64_t vl_spawn(const vu_str *args) {
+  size_t n = 1;
+  for (int64_t i = 0; i < args->len; i++) if (args->data[i] == 1) n++;
+  char *all = malloc((size_t)args->len + 1);
+  memcpy(all, args->data, (size_t)args->len);
+  all[args->len] = 0;
+  char **argv = calloc(n + 1, sizeof *argv);
+  size_t k = 0;
+  char *p = all;
+  argv[k++] = p;
+  for (; p < all + args->len; p++) if (*p == 1) { *p = 0; argv[k++] = p + 1; }
+  argv[k] = NULL;
+  fflush(stdout);
+  fflush(stderr);
+  pid_t pid;
+  int rc = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
+  free(argv);
+  free(all);
+  return rc == 0 ? (int64_t)pid : -1;
+}
+
+/* pid's exit status as os.run gives it (128 + the signal), -2 while it runs, -1 when it can't be
+   waited for */
+int64_t vl_poll_exit(int64_t pid) {
+  int st = 0;
+  pid_t r;
+  do { r = waitpid((pid_t)pid, &st, WNOHANG); } while (r < 0 && errno == EINTR);
+  if (r == 0) return -2;
+  if (r < 0) return -1;
+  if (WIFEXITED(st)) return (int64_t)WEXITSTATUS(st);
+  if (WIFSIGNALED(st)) return 128 + (int64_t)WTERMSIG(st);
+  return 1;
+}
+
 int64_t vl_wait(int64_t pid) {
   int st = 0;
   pid_t r;
@@ -271,4 +459,196 @@ vu_str vl_read_text(const vu_str *path, int64_t *ok, int64_t n) {
   free(buf);
   if (!err && n > 0) ok[0] = 1;
   return s;
+}
+
+// ---- folders' listings, shared by the module graph's workers (vl_lkind, vl_llink)
+// A stat costs about as much as listing a small folder, and resolving a request looks at up to 17
+// paths of one folder, most of them not there. A folder asked about VL_LIST_AFTER times is listed,
+// once (opendir, d_type; the others are answered by stat): a table of 64 parts by the folder's hash,
+// each with its lock, held while a folder is listed. The entries are found by their name in ASCII
+// lower case, so a name the file system could match under another case is seen. (Listing every
+// folder asked about once listed home folders and a 43,000-file package four times, once for each
+// worker, and made a small package's graph a third slower.)
+#include <dirent.h>
+#include <pthread.h>
+typedef struct { char *name; uint32_t len; uint64_t lh; uint8_t dt; int8_t kind; } vl_dent;
+#define VL_LIST_AFTER 4
+typedef struct vl_dir {
+  char *path; size_t plen; uint64_t h; int ok; int wide; int listed; int asked;
+  uint32_t n; vl_dent *e; uint32_t mask; int32_t *slot;
+  struct vl_dir *next;
+} vl_dir;
+#define VL_PARTS 64
+#define VL_BUCKETS 1024
+static pthread_mutex_t vl_dmu[VL_PARTS] = { [0 ... VL_PARTS - 1] = PTHREAD_MUTEX_INITIALIZER };
+static vl_dir *vl_dtab[VL_PARTS][VL_BUCKETS];
+
+static uint64_t vl_fnv(const char *s, size_t n, int fold) {
+  uint64_t h = 1469598103934665603ULL;
+  for (size_t i = 0; i < n; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (fold && c >= 'A' && c <= 'Z') c = (unsigned char)(c + 32);
+    h = (h ^ c) * 1099511628211ULL;
+  }
+  return h;
+}
+
+static int vl_ieq(const char *a, const char *b, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    unsigned char x = (unsigned char)a[i], y = (unsigned char)b[i];
+    if (x >= 'A' && x <= 'Z') x = (unsigned char)(x + 32);
+    if (y >= 'A' && y <= 'Z') y = (unsigned char)(y + 32);
+    if (x != y) return 0;
+  }
+  return 1;
+}
+
+static void vl_list(vl_dir *d) {
+  d->listed = 1;
+  DIR *dd = opendir(d->path);
+  if (!dd) return;
+  d->ok = 1;
+  uint32_t cap = 16;
+  d->e = malloc(cap * sizeof(vl_dent));
+  struct dirent *x;
+  while ((x = readdir(dd)) != NULL) {
+    const char *nm = x->d_name;
+    if (nm[0] == '.' && (nm[1] == 0 || (nm[1] == '.' && nm[2] == 0))) continue;
+    size_t nl = strlen(nm);
+    if (d->n == cap) { cap *= 2; d->e = realloc(d->e, cap * sizeof(vl_dent)); }
+    vl_dent *e = &d->e[d->n++];
+    e->name = malloc(nl + 1); memcpy(e->name, nm, nl + 1); e->len = (uint32_t)nl;
+    e->lh = vl_fnv(nm, nl, 1);
+    e->dt = x->d_type;
+    e->kind = -1;
+    if (x->d_type == DT_DIR) e->kind = 2;
+    else if (x->d_type != DT_LNK && x->d_type != DT_UNKNOWN) e->kind = 1;
+    for (size_t i = 0; i < nl; i++) if ((unsigned char)nm[i] >= 128) d->wide = 1;
+  }
+  closedir(dd);
+  uint32_t sz = 16;
+  while (sz < 2 * d->n + 2) sz *= 2;
+  d->mask = sz - 1;
+  d->slot = malloc(sz * sizeof(int32_t));
+  for (uint32_t i = 0; i < sz; i++) d->slot[i] = -1;
+  for (uint32_t k = 0; k < d->n; k++) {
+    uint32_t s = (uint32_t)d->e[k].lh & d->mask;
+    while (d->slot[s] >= 0) s = (s + 1) & d->mask;
+    d->slot[s] = (int32_t)k;
+  }
+}
+
+// the listing of path's folder (path[0..plen]), listed now if it's been asked about often
+// enough; NULL while it hasn't
+static vl_dir *vl_dir_of(const char *path, size_t plen) {
+  uint64_t h = vl_fnv(path, plen, 0);
+  int part = (int)(h % VL_PARTS);
+  size_t b = (size_t)((h >> 6) % VL_BUCKETS);
+  pthread_mutex_lock(&vl_dmu[part]);
+  vl_dir *d = vl_dtab[part][b];
+  while (d && !(d->h == h && d->plen == plen && memcmp(d->path, path, plen) == 0)) d = d->next;
+  if (!d) {
+    d = calloc(1, sizeof *d);
+    d->path = malloc(plen + 1); memcpy(d->path, path, plen); d->path[plen] = 0;
+    d->plen = plen; d->h = h;
+    d->next = vl_dtab[part][b];
+    vl_dtab[part][b] = d;
+  }
+  if (!d->listed && ++d->asked >= VL_LIST_AFTER) vl_list(d);
+  vl_dir *out = d->listed ? d : NULL;
+  pthread_mutex_unlock(&vl_dmu[part]);
+  return out;
+}
+
+// (folders of links, where a listing says little: node_modules and its @scope folders)
+static int vl_listable(const char *p, size_t plen) {
+  size_t i = plen;
+  while (i > 0 && p[i - 1] != '/') i--;
+  const char *b = p + i; size_t bl = plen - i;
+  if (bl == 0) return 0;
+  if (bl == 12 && memcmp(b, "node_modules", 12) == 0) return 0;
+  if (b[0] == '@' && i >= 14 && memcmp(p + i - 14, "/node_modules/", 14) == 0) return 0;
+  return 1;
+}
+
+// the entry named exactly base in d: index, -1 none (and *ci set when one matches under case
+// folding), -2 the name could match one the folding of the file system can't be told here
+static int64_t vl_find(vl_dir *d, const char *base, size_t bl, int *ci) {
+  *ci = 0;
+  for (size_t i = 0; i < bl; i++) if ((unsigned char)base[i] >= 128) return -2;
+  if (d->wide) return -2;
+  uint64_t lh = vl_fnv(base, bl, 1);
+  uint32_t s = (uint32_t)lh & d->mask;
+  int64_t found = -1;
+  while (d->slot[s] >= 0) {
+    vl_dent *e = &d->e[d->slot[s]];
+    if (e->lh == lh && e->len == bl && vl_ieq(e->name, base, bl)) {
+      if (memcmp(e->name, base, bl) == 0) found = d->slot[s];
+      else *ci = 1;
+    }
+    s = (s + 1) & d->mask;
+  }
+  return found;
+}
+
+static int vl_split(const vu_str *path, size_t *dl) {
+  const char *p = (const char *)path->data;
+  size_t n = (size_t)path->len;
+  if (n == 0 || p[0] != '/' || memchr(p, 0, n)) return 0;
+  size_t i = n;
+  while (i > 0 && p[i - 1] != '/') i--;
+  if (i == n) return 0;
+  const char *b = p + i; size_t bl = n - i;
+  if ((bl == 1 && b[0] == '.') || (bl == 2 && b[0] == '.' && b[1] == '.')) return 0;
+  *dl = i > 1 ? i - 1 : 1;   // the folder: "/" for "/x"
+  return 1;
+}
+
+// What stat says path is (0 nothing, 1 not a folder, 2 a folder, links followed), from its
+// folder's listing: -1 when the listing can't say (a folder of links, a name it could match
+// under case folding), -2 when the folder couldn't be listed.
+int64_t vl_lkind(const vu_str *path) {
+  size_t dl;
+  if (!vl_split(path, &dl)) return -1;
+  const char *p = (const char *)path->data;
+  size_t n = (size_t)path->len;
+  if (!vl_listable(p, dl)) return -1;
+  vl_dir *d = vl_dir_of(p, dl);
+  if (!d) return -1;
+  if (!d->ok) return -2;
+  size_t bs = dl == 1 ? 1 : dl + 1;
+  int ci;
+  int64_t k = vl_find(d, p + bs, n - bs, &ci);
+  if (k == -2) return -1;
+  if (k < 0) return ci ? -1 : 0;
+  vl_dent *e = &d->e[k];
+  int8_t kd = __atomic_load_n(&e->kind, __ATOMIC_RELAXED);
+  if (kd >= 0) return kd;
+  char *full = vu_cstr(path);
+  if (!full) return -1;
+  struct stat st;
+  int r = stat(full, &st);
+  free(full);
+  kd = r != 0 ? 0 : (S_ISDIR(st.st_mode) ? 2 : 1);
+  __atomic_store_n(&e->kind, kd, __ATOMIC_RELAXED);
+  return kd;
+}
+
+// Whether path is a symbolic link, from its folder's listing: 1 yes, 0 no, -1 it can't say.
+int64_t vl_llink(const vu_str *path) {
+  size_t dl;
+  if (!vl_split(path, &dl)) return -1;
+  const char *p = (const char *)path->data;
+  size_t n = (size_t)path->len;
+  if (!vl_listable(p, dl)) return -1;
+  vl_dir *d = vl_dir_of(p, dl);
+  if (!d || !d->ok) return -1;
+  size_t bs = dl == 1 ? 1 : dl + 1;
+  int ci;
+  int64_t k = vl_find(d, p + bs, n - bs, &ci);
+  if (k < 0) return -1;
+  uint8_t t = d->e[k].dt;
+  if (t == DT_LNK) return 1;
+  if (t == DT_UNKNOWN) return -1;
+  return 0;
 }

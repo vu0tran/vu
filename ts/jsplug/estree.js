@@ -1780,7 +1780,8 @@ function setParents(node, parent) {
   }
 }
 
-// The ESTree Program of a request: { src, tree: {nd, L, nm, deco, np, root}, sourceType }.
+// The ESTree Program of a request: { src, tree: {nd, L, nm, deco, np, root}, sourceType } (nd and L
+// arrays, or int32 arrays from a frame).
 function buildEstree(req) {
   // (a .vue section, or a file without its BOM: vlint's positions start base bytes earlier)
   baseOff = req.base || 0;
@@ -1789,7 +1790,8 @@ function buildEstree(req) {
   nd = t.nd;
   Ls = t.L;
   nm = t.nm;
-  bytes = Buffer.from(src, "utf8");
+  // (a frame's text comes with its bytes when they're valid UTF-8: src's own bytes)
+  bytes = baseOff === 0 && req.srcBuf !== undefined ? req.srcBuf : Buffer.from(src, "utf8");
   if (bytes.length === src.length) u16 = null;
   else {
     // byte offset -> UTF-16 offset

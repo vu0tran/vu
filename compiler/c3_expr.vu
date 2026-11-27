@@ -29,8 +29,10 @@ fn place(var g: G, e: Node) -> Place:
     let bk = tkind(g, b.ty)
     if ((bk == "list" or bk == "map") and e.name == "len") or b.ty == "Str": return no_place()
     let ft = field_type(g, b.ty, e.name, e.line)
+    # (.unique: writable while it's the only handle, checked when used: before it's shared with tasks)
+    if bk == "shared" and e.name == "unique": return Place(true, b.root, "(VU_SHUNIQ(" + b.code + ", {e.line}))->v", ft, false, b.ro)
     if bk == "shared": return Place(true, b.root, "(" + b.code + ")->v", ft, false, true)   # read-only, from any thread
-    return Place(true, b.root, b.code + "." + cf(e.name), ft, false, b.ro)
+    return Place(true, b.root, b.code + "." + cf(e.name), ft, false, b.ro, n32_name(g, bk, b.ty, e.name))
   if e.k == "index":
     if g.par_on and e.kids[0].k == "name" and e.kids[1].k == "name" and e.kids[1].name == g.par_var:
       let v = lookup(g, e.kids[0].name)
@@ -160,7 +162,7 @@ fn static_type_uncached(var g: G, e: Node) -> Str:
     let bk = tkind(g, bt)
     if (bk == "list" or bk == "map" or bt == "Str") and e.name == "len": return "Int"
     if bk == "struct": return struct_field(g, bt, e.name)
-    if bk == "shared" and e.name == "value": return inner_of(bt)
+    if bk == "shared" and (e.name == "value" or e.name == "unique"): return inner_of(bt)
     return ""
   if k == "index":
     let bt = static_type(&g, e.kids[0])
@@ -212,6 +214,8 @@ fn gen(var g: G, e: Node, expect: Str) -> GR:
   if p.ok:
     read_check(g, p, e.line)
     g.tcache[e.id] = p.ty + ""
+    # (an Int32 field is read as an Int value: nothing may point at its 4 bytes as an Int)
+    if p.n32 != "": return GR("((int64_t)" + p.code + ")", "Int", no_place())
     return GR(p.code, p.ty, p)
   let r = gen_kind(&g, e, expect)
   if expect == "": g.tcache[e.id] = r.ty + ""
@@ -340,6 +344,30 @@ fn effects_uncached(var g: G, e: Node) -> Bool:
 
 fn is_lit(e: Node) -> Bool:
   return e.k == "int" or (e.k == "un" and e.op == "-" and e.kids[0].k == "int")
+
+# "T.f" when field f of struct type t is an Int32, else "".
+fn n32_name(g: G, bk: Str, t: Str, f: Str) -> Str:
+  if bk == "struct" and is_n32(g, t, f): return disp(t) + "." + f
+  return ""
+
+# The C storing e (code: its Int value) into Int32 field what ("T.f"): a literal is checked now,
+# anything else when it's stored, in every build (as a Byte's range is).
+fn n32_store(var g: G, e: Node, code: Str, what: Str) -> Str:
+  var lit = false
+  var bad = false
+  var shown = ""
+  if e.k == "int":
+    lit = true
+    bad = e.big or e.ival > 2147483647
+    shown = "{e.ival}"
+  if e.k == "un" and e.op == "-" and e.kids[0].k == "int":
+    lit = true
+    bad = e.kids[0].big or e.kids[0].ival > 2147483648
+    shown = "-{e.kids[0].ival}"
+  if bad: err(g, e.line, shown + " does not fit in " + what + ", an Int32 (-2147483648..2147483647)")
+  if lit: return "((int32_t)" + code + ")"
+  rep_check(&g, e.line, "store into Int32 " + what)
+  return "vu_i32(" + code + ", {e.line}, " + cstr(what) + ")"
 
 fn g_int(var g: G, e: Node, expect: Str) -> CT:
   if e.big: err(g, e.line, "integer literal is too large for Int")
@@ -722,6 +750,7 @@ fn g_field(var g: G, e: Node) -> CT:
       if not b.p.ok and not is_copy(g, t) and not is_copy(g, ft):
         err(g, e.line, "can't take field '" + e.name + "' out of a temporary " + tn(t) + "; store it in a variable first")
       rc = "(" + b.code + ")." + cf(e.name)
+      if k == "struct" and is_n32(g, t, e.name): rc = "((int64_t)" + rc + ")"
     rt = ft
   return bw_end(&g, e.kids[0], b, rc, rt)
 
@@ -1095,6 +1124,7 @@ fn g_orelse(var g: G, e: Node, expect: Str) -> CT:
 fn builtin_type_msg(n: Str) -> Str:
   if n == "Byte": return "convert with byte(x)"
   if n == "Int": return "convert with int(x)"
+  if n == "Int32": return "Int32 is only a struct field's type; its values are Ints"
   if n == "Float": return "convert with float(x)"
   if n == "Str": return "make strings with \"...\" or str(bytes)"
   return "use true or false"
@@ -1136,7 +1166,7 @@ fn method_call(var g: G, e: Node) -> Node?:
   let rt = probe_type(&g, f.kids[0])
   if rt == "": return nil
   let kd = tkind(g, rt)
-  if kd == "cap" or kd == "chan" or kd == "shared" or kd == "memo" or kd == "ext" or kd == "fn" or kd == "lfn" or kd == "opt" or kd == "res" or kd == "void" or kd == "nil": return nil
+  if kd == "cap" or kd == "chan" or kd == "shared" or kd == "memo" or kd == "smap" or kd == "ext" or kd == "fn" or kd == "lfn" or kd == "opt" or kd == "res" or kd == "void" or kd == "nil": return nil
   if builtin_method(kd, f.name): return nil
   if kd == "struct" and struct_field(g, rt, f.name) != "": return nil
   let target = method_fn(g, rt, f)
@@ -1204,9 +1234,10 @@ fn g_call(var g: G, e: Node, expect: Str) -> CT:
     if is_net_method(fname) and probe_type(&g, f.kids[0]) == "Net": return net_call(&g, e, false)
     if is_chan_method(fname) and is_chan_expr(&g, f.kids[0]): return chan_method(&g, e, false)
     if fname == "temp_dir": return fs_call(&g, e, false)
-    if fname == "get" or fname == "share" or fname == "len":
+    if fname == "get" or fname == "share" or fname == "len" or fname == "add":
       let mrt = probe_type(&g, f.kids[0])
       if tkind(g, mrt) == "memo": return memo_method(&g, e)
+      if tkind(g, mrt) == "smap": return smap_method(&g, e)
     if fname == "get" or fname == "remove": return map_method(&g, e)
     if fname == "read" or fname == "write": return fs_call(&g, e, false)
     if (fname == "list" or fname == "mkdir" or fname == "exists" or fname == "remove" or fname == "rename") and probe_type(&g, f.kids[0]) == "Fs": return fs_call(&g, e, false)
@@ -1450,6 +1481,8 @@ fn lambda_code(var g: G, e: Node, expect0: Str, hint_ps: [Str], hint_throws: Boo
   g.is_main = false
   g.src_line = e.line
   g.lam_names.push(e.name + "")
+  let s_ffi = g.ffi_ck
+  g.ffi_ck = 0
   push_scope(&g, false)
   for i in 0..caps.len:
     let cname = g.vars[caps[i]].name + ""
@@ -1505,6 +1538,8 @@ fn lambda_code(var g: G, e: Node, expect0: Str, hint_ps: [Str], hint_throws: Boo
   let rett = g.rett + ""
   var lines: [Str] = []
   swap(&lines, &g.lines)
+  if g.ffi_ck > 0: ffi_entry(&lines)
+  g.ffi_ck = s_ffi
   swap(&s_lines, &g.lines)
   swap(&s_scopes, &g.scopes)
   swap(&s_loops, &g.loops)
@@ -1770,5 +1805,12 @@ fn field_inits(var g: G, e: Node, name: Str, fields: [Fld]) -> Inits:
       let tv = tmp(&g)
       res.pre.push(ct(g, ftypes[fname]) + " " + tv + " = " + code + ";")
       code = tv
+    if name in g.structs and is_n32(g, name, fname):
+      let w = disp(name) + "." + fname
+      if oidx[j] >= 0: code = n32_store(&g, e.kids[oidx[j]].kids[0], code, w)
+      else:
+        let dk = name + "." + fname
+        let dn = copy_node(g.fdefs[dk])
+        code = n32_store(&g, dn, code, w)
     res.inits.push("." + cf(fname) + " = " + code)
   return res

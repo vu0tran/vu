@@ -686,8 +686,44 @@ with severities and options, `categories`, `plugins`, `env`/`globals` (globals r
 `denyWarnings`, `maxWarnings`, `reportUnusedDisableDirectives`, `respectEslintDisableDirectives`),
 JSON errors as serde words them. `oxlint.config.ts` is reported as needing a JavaScript runtime.
 `jsPlugins` (in the config and in overrides): run in Node as oxlint runs them (see "JS plugins"
-below). Ignore files: `.gitignore` (and the folders above, up
+below), except eslint-plugin-react-hooks 7.x's compiler rules, which vlint runs on its own React
+Compiler, and the rules of eslint-plugin-jsx-a11y 6.x and eslint-comments 4.x that it ports (below). Ignore files: `.gitignore` (and the folders above, up
 to the repository root, and `.git/info/exclude`), `.eslintignore`/`--ignore-path`.
+
+**eslint-plugin-react-hooks on the native React Compiler.** When `jsPlugins` loads
+eslint-plugin-react-hooks 7.x under an alias (`{ "name": "react-hooks-js", "specifier":
+"eslint-plugin-react-hooks" }`), each of its compiler rules that vlint's React Compiler port has
+(`purity`, `refs`, `immutability`, `set-state-in-effect`... 21 of its 29) runs natively, reported
+under the configuration's own name (`react-hooks-js(purity)`) with its severity, and disabled by
+directives that name it, unused ones reported as such. The rest (`preserve-manual-memoization`,
+`config`, `gating`, `fbt`, `memoized-effect-dependencies`, `component-hook-factories`,
+`rules-of-hooks`, `exhaustive-deps`) and any rule given options other than `{}` stay in node;
+with 7.1.1 and none of those on, node isn't started for the plugin at all. The messages are the port's, not the plugin's (no code frame), and
+the port is oxc's port of a later compiler, so the findings differ from 7.1.1's (ts/NOTES.md has
+them by kind). `VLINT_NATIVE_REACT_HOOKS=0`, or `"settings": { "vlint": { "nativeReactHooks":
+false } }` in the configuration, runs the plugin in node as before.
+
+**eslint-plugin-jsx-a11y and eslint-comments, natively.** Configurations load these two in
+`jsPlugins` for rules oxlint lacks or words otherwise. When `jsPlugins` loads
+eslint-plugin-jsx-a11y 6.x (under an alias) or @eslint-community/eslint-plugin-eslint-comments 4.x
+(under an alias or its own name), these rules run natively, under the configuration's names, with
+the same output as the plugin in node (`rxa11y.vu`, `rxcomments.vu`: ports of 6.10.2 and 4.7.2):
+jsx-a11y's `control-has-associated-label`, `interactive-supports-focus`,
+`no-interactive-element-to-noninteractive-role`, `no-noninteractive-element-interactions`,
+`no-noninteractive-element-to-interactive-role`, `no-onchange` and `label-has-for`, and all nine of
+eslint-comments' (`require-description`, `disable-enable-pair`, `no-unlimited-disable`, `no-use`,
+`no-duplicate-disable`, `no-aggregating-enable`, `no-unused-enable`, `no-restricted-disable`,
+`no-unused-disable`). The same messages, spans and order among the file's other JS plugin
+diagnostics, the same severities, disable directives and unused ones, the error the host gives
+when eslint-comments reports on a file's first line (its stack trace included) and the messages
+jsx-ast-utils prints for expressions it can't read. Measured: identical on 14,167 files of a large
+monorepo (6,347 diagnostics; 6,896 with five more jsx-a11y rules in node alongside) and on the
+code of jsx-a11y's own 5,453 test cases for these rules (ts/NOTES.md). The plugins' other rules, and these with options other
+than none or `{}`, stay in node; with the exact versions above and none of those on, node isn't
+started for the plugin. `VLINT_NATIVE_JS_PLUGINS=0` (or `VLINT_NATIVE_JSX_A11Y=0`,
+`VLINT_NATIVE_ESLINT_COMMENTS=0`, `VLINT_NATIVE_REACT_HOOKS=0`), or `"settings": { "vlint": {
+"nativeJsPlugins": false } }` (`nativeJsxA11y`, `nativeEslintComments`, `nativeReactHooks`) in the
+configuration that lists the plugin, runs them in node.
 
 **JS plugins** (`ljs.vu`, `ljs_glue.c`, `jsplug/`): vlint runs ESLint-style plugins with
 oxlint 1.90.0's own plugin runtime (its `dist`, MIT, embedded by `jsplug/gen_host.py` into
@@ -1362,6 +1398,45 @@ launcher and one optional dependency per platform with the binary: Linux x64/ARM
 `packaging/npm/vlint/README.md`, which is also the
 package's README. Each `vlint-vX.Y.Z` tag also puts the bare binaries on the GitHub release
 (`vlint-X.Y.Z-<platform>.tar.gz`). Releasing: `RELEASING.md`.
+
+## Many runs at once: `vlint --batch`
+
+A monorepo that lints each package with its own `vlint` command can run them all as one:
+
+```sh
+vlint --batch plan.json
+```
+
+`plan.json` is a JSON array of runs, each `{"args": [...]}`: the arguments that would follow
+`vlint`, with optional `"out"`, `"err"` and `"exit"` files for that run's standard output, standard
+error and exit code. A run without them prints to the batch's own, in the plan's order, each run's
+output whole. The batch exits with the largest of the runs' exit codes. Each run's output and exit
+code are what it gives alone (`ts/batch_test.sh` checks this on a made-up monorepo, and the CI job
+below gave all 176 of its outputs identical). Every run is in the folder vlint runs in.
+
+What the runs share: the JS plugins' node processes (each plugin loaded once and warm, not started
+again for every run), the files read, and the packages' declaration files parsed once for every
+program that has them. The largest runs start first, and the runs going at once are capped by
+their size, which is what holds the memory down: `VLINT_BATCH_JOBS` runs at a time (default 2 for
+each 5 CPUs), holding at most `VLINT_BATCH_CAP` permille of the largest run's files (1200).
+`VLINT_BATCH_ORDER=plan` keeps the plan's order, `VLINT_BATCH_SHARE=0` keeps each run's files and
+programs to itself (its larger programs checked in processes of their own, as alone), and
+`VLINT_BATCH_TRACE=1` says when each run starts and ends.
+
+On a monorepo's CI lint job (88 packages, `--type-aware --threads=4`, cold, on 10 cores; one run
+each, with other work on the machine, so a second or two either way):
+
+| | wall | CPU | peak memory |
+|---|---|---|---|
+| 88 runs, 2 at a time (the job as it was) | 35-42 s | 255-275 s | 4.3-4.9 GB |
+| 88 runs, 4 at a time | 30-37 s | 265-280 s | 6.4-7.0 GB |
+| one `vlint --batch` | 29-35 s | 226-252 s | 5.8-7.6 GB |
+
+Most of what the batch gains is the machine kept busy, which running more at once gives too; on
+top of that it does less work: node 48 -> 39 cpu-s (88 starts of the plugins' host become 4
+processes), system time 41-43 -> 27-30 s, and the packages' declaration files (1,114 MB parsed by
+the job's 123 programs, 132 MB of them distinct) parsed once, 3.7% of the batch process's
+instructions.
 
 ## The cache
 

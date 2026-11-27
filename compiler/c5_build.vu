@@ -28,9 +28,14 @@ fn gen_extern(var g: G, items: [Node], name: Str):
       args.push("*" + v)
   var rett = ret + ""
   if g.fns[name].fails: rett = "!" + ret
-  g.sigs.push("static " + ct(g, rett) + " fn_" + name + "(" + join(cps, ", ") + ")")
+  # (a glue header's functions are in every part of a split build: their calls are inlined)
+  var jx = ii
+  while jx > 0 and items[jx].k != "extern": jx -= 1
+  var inl = ""
+  if items[jx].k == "extern" and items[jx].v.endswith(".h"): inl = "inline __attribute__((always_inline)) "
+  g.sigs.push("static " + inl + ct(g, rett) + " fn_" + name + "(" + join(cps, ", ") + ")")
   let where = cstr(cn) + ", {items[ii].line}"
-  var lines = ["    vu_ffi_here(" + where + ");"]
+  var lines = ["    /* vu-extern */"]
   let is_ext = tkind(g, ret) == "ext"
   if g.fns[name].fails:
     var all = copy_strs(args)
@@ -243,6 +248,8 @@ fn gen_fn_node(var g: G, node: Node, name: Str):
   let params = copy_params(g.fns[name].params)
   let ret = g.fns[name].ret
   g.lines = []
+  let s_ffi = g.ffi_ck
+  g.ffi_ck = 0
   g.ind = 1
   g.src_line = node.line   # the function's own setup and cleanup belong to its 'fn' line
   # its module's prefix (geo__ for geo__area): a local named like one of the module's types is rejected
@@ -299,6 +306,8 @@ fn gen_fn_node(var g: G, node: Node, name: Str):
   g.sigs.push(sig)
   var body: [Str] = []
   swap(&body, &g.lines)
+  if g.ffi_ck > 0: ffi_entry(&body)
+  g.ffi_ck = s_ffi
   if small_leaf(body):
     for bi in 0..body.len:
       let at = body[bi].find("VU_ENTER(")
@@ -306,6 +315,134 @@ fn gen_fn_node(var g: G, node: Node, name: Str):
         body[bi] = body[bi][0..at] + "VU_ENTER_LEAF(" + body[bi][at + 9..body[bi].len]
         break
   g.bodies.push(join(body, "\n"))
+
+# The par-loop check of extern calls only where a par loop can reach (VU_FFI_OFF elsewhere: no check).
+# A function can run on a par loop's thread only if a par loop's function reaches it through the
+# functions its C names (called or used as values), or if it is used as a value anywhere (a function
+# value can be called from anywhere) or named by code outside the functions (thunks, interfaces),
+# while the program has a par loop. Not counted: main's caller, and a spawned task's entry, which
+# runs on a thread of its own, never one of a par loop's (and a par loop's body can't spawn).
+fn ffi_reach(var g: G, outside: [Str], nlam: Int):
+  # (the line ffi_entry adds: a string literal in C never holds a newline)
+  let mark = "\n    VU_FFI_ENTRY;"
+  let nf = g.sigs.len
+  var any = false
+  for b in g.bodies:
+    if mark in b: any = true
+  for k in 1..nlam + 1:
+    if k in g.lam_bodies and mark in g.lam_bodies[k]: any = true
+  if not any: return
+  var ids: {Str: Int} = {}
+  for i in 0..nf:
+    let nm = c_fn_name(g.sigs[i])
+    if nm != "": ids[nm] = i
+  for k in 1..nlam + 1:
+    if k in g.lam_sigs:
+      let nm = c_fn_name(g.lam_sigs[k])
+      if nm != "": ids[nm] = nf + k
+  let n = nf + nlam + 1
+  var edges: [[Int]] = []
+  var reached: [Bool] = []
+  for i in 0..n:
+    edges.push([])
+    reached.push(false)
+  var roots: [Int] = []
+  var vals: [Int] = []
+  var has_par = false
+  for i in 0..n:
+    var refs: [Int] = []
+    if i < nf:
+      c_refs(g.bodies[i], ids, &refs, &vals)
+      if par_roots(g.bodies[i], ids, &roots): has_par = true
+    elif i - nf in g.lam_bodies:
+      c_refs(g.lam_bodies[i - nf], ids, &refs, &vals)
+      if par_roots(g.lam_bodies[i - nf], ids, &roots): has_par = true
+    edges[i] = refs
+  if has_par:
+    for v in vals: roots.push(v)
+    for o in outside:
+      if "{{" in o and not o.startswith("static int vu_main(void)") and not o.startswith("static void vu_se_"):
+        var refs: [Int] = []
+        var vs: [Int] = []
+        c_refs(o, ids, &refs, &vs)
+        for r in refs: roots.push(r)
+  var todo = roots
+  while todo.len > 0:
+    let x = todo.pop()
+    if reached[x]: continue
+    reached[x] = true
+    for y in edges[x]:
+      if not reached[y]: todo.push(y)
+  for i in 0..nf:
+    if not reached[i] and mark in g.bodies[i]: g.bodies[i] = g.bodies[i].replace(mark, "\n    VU_FFI_OFF;")
+  for k in 1..nlam + 1:
+    if k in g.lam_bodies and not reached[nf + k] and mark in g.lam_bodies[k]: g.lam_bodies[k] = g.lam_bodies[k].replace(mark, "\n    VU_FFI_OFF;")
+
+# The functions a function's par loops' bodies name (the block after each "#pragma omp parallel"), and
+# whether it has one.
+fn par_roots(text: Str, ids: {Str: Int}, var roots: [Int]) -> Bool:
+  var at = text.find("#pragma omp parallel", 0)
+  if at < 0: return false
+  while at >= 0:
+    let a = text.find("{{", at)
+    if a < 0: break
+    let e = c_block_end(text, a)
+    var vs: [Int] = []
+    c_refs(text[a..e], ids, &roots, &vs)
+    at = text.find("#pragma omp parallel", e)
+  return true
+
+# Where the C block opened at text[a] ('{') ends: after its '}', string and character literals skipped.
+fn c_block_end(text: Str, a: Int) -> Int:
+  var dep = 0
+  var i = a
+  while i < text.len:
+    let ch = text[i]
+    if ch == '"' or ch == '\'':
+      var j = i + 1
+      while j < text.len and text[j] != ch:
+        if text[j] == '\\': j += 1
+        j += 1
+      i = j + 1
+      continue
+    if ch == '{': dep += 1
+    elif ch == '}':
+      dep -= 1
+      if dep == 0: return i + 1
+    i += 1
+  return text.len
+
+# The C name a definition's signature declares (fn_x, vu_lam3), or "".
+fn c_fn_name(sig: Str) -> Str:
+  let p = sig.find("(", 0)
+  if p <= 0: return ""
+  var a = p
+  while a > 0 and is_name_char(sig[a - 1]): a -= 1
+  return sig[a..p]
+
+# The program's functions a piece of C names (refs), and those of them it names other than to call
+# them (vals: used as values).
+fn c_refs(text: Str, ids: {Str: Int}, var refs: [Int], var vals: [Int]):
+  for pat in ["fn_", "vu_lam"]:
+    var i = text.find(pat, 0)
+    while i >= 0:
+      var j = i + pat.len
+      if i == 0 or not is_name_char(text[i - 1]):
+        while j < text.len and is_name_char(text[j]): j += 1
+        let nm = text[i..j]
+        if nm in ids:
+          refs.push(ids[nm])
+          var k = j
+          while k < text.len and text[k] == ' ': k += 1
+          if k >= text.len or text[k] != '(': vals.push(ids[nm])
+      i = text.find(pat, j)
+
+# A function whose body calls C (VU_FFI_CK) asks at its start whether it runs inside a par loop.
+fn ffi_entry(var lines: [Str]):
+  for i in 0..lines.len:
+    if lines[i].find("VU_ENTER(", 0) >= 0:
+      lines[i] = lines[i] + "\n    VU_FFI_ENTRY;"
+      return
 
 # Whether a function's C has no loop and calls none of the program's functions: in --profile builds it
 # then keeps no frame of its own (VU_ENTER_LEAF), whose cost would be counted as the function's.
@@ -473,7 +610,7 @@ fn gen_consts(var g: G, items: [Node]) -> [Str]:
   for i in 0..dsn.len:
     let key = dsn[i] + "." + dfn[i]
     let d = copy_node(g.fdefs[key])
-    if not default_const(g, d): err(g, d.line, "the default of field '" + dfn[i] + "' of " + disp(dsn[i]) + " must be a constant: a literal, a const, [] or {{}}, or a struct or variant built from those")
+    if not default_const(g, d): err(g, d.line, "the default of field '" + dfn[i] + "' of " + disp(dsn[i]) + " must be a constant: a literal, a const, [] or {{}}, shared_map(), or a struct or variant built from those")
     # (its type, checked even when no construction uses it; the code is thrown away)
     var saved: [Str] = []
     swap(&saved, &g.lines)
@@ -510,6 +647,8 @@ fn default_const(g: G, e: Node) -> Bool:
     for x in e.kids:
       if not default_const(g, x): return false
     return true
+  # (shared_map() makes a new, empty table for each value built, as {} makes a new map)
+  if k == "call" and e.kids[0].k == "name" and e.kids[0].name == "shared_map" and e.kids.len == 1: return true
   if k == "call" and e.kids[0].k == "name" and (e.kids[0].name in g.structs or e.kids[0].name in g.variants):
     for i in 1..e.kids.len:
       if e.kids[i].kids.len == 0 or not default_const(g, e.kids[i].kids[0]): return false
@@ -539,9 +678,11 @@ fn visit_const(var g: G, items: [Node], idx: Int, consts: {Str: Int}, var state:
   state[idx] = 2
   order.push(idx)
 
-fn field_decls(g: G, fs: [Fld]) -> Str:
+fn field_decls(g: G, sn: Str, fs: [Fld]) -> Str:
   var parts: [Str] = []
-  for f in fs: parts.push(ct(g, f.ty) + " " + cf(f.name) + ";")
+  for f in fs:
+    if sn != "" and is_n32(g, sn, f.name): parts.push("int32_t " + cf(f.name) + ";")
+    else: parts.push(ct(g, f.ty) + " " + cf(f.name) + ";")
   return join(parts, " ")
 
 # The boxed variants, sorted by (enum name, variant index) like Python's sorted() of the pairs.
@@ -625,6 +766,7 @@ fn build(var g: G, items: [Node]) -> Str:
   if g.uses_memo:
     out.push("#define VU_MEMO 1")
     out.push(rt_memo())
+  if g.uses_smap: out.push(rt_smap())
   if g.uses_tasks: out.push(rt_tasks())
   if g.jtypes.len > 0 or "~any" in g.jset: out.push(rt_json())
   if g.has_extern:
@@ -636,11 +778,15 @@ fn build(var g: G, items: [Node]) -> Str:
       if fi.item >= 0 and items[fi.item].op == "extern": out.push(extern_proto(g, fi, items[fi.item].v))
     # (a split build includes the glue in part 0 only, with the functions that call it: the extern
     # functions' bodies (split_build moves them there) and the handles' drops, which the other parts
-    # call; the glue's own static state then exists once)
+    # call; the glue's own static state then exists once. A glue header, "x.h", has no state of its
+    # own: it is included in every part, and so are its functions' bodies, to be inlined)
     out.push("#if defined(VU_PART) || defined(VU_PART0)\n#define VU_XDROP\n#else\n#define VU_XDROP static\n#endif")
     for n, d in g.exttypes: out.push("VU_XDROP void drop_X_" + n + "(void **p);")
+    for p in g.ext_paths:
+      if p.endswith(".h"): out.push("#include " + cstr(p))
     out.push("#ifndef VU_PART")
-    for p in g.ext_paths: out.push("#include " + cstr(p))
+    for p in g.ext_paths:
+      if not p.endswith(".h"): out.push("#include " + cstr(p))
     for n, d in g.exttypes: out.push("VU_XDROP void drop_X_" + n + "(void **p) {{ if (*p) {{ " + d + "(*p); *p = NULL; }} }}")
     out.push("#endif")
   for c in consts: out.push(c)
@@ -662,20 +808,20 @@ fn build(var g: G, items: [Node]) -> Str:
       out.push("typedef struct vu_sh_" + sm + " vu_sh_" + sm + ";")
     elif tk == "map":
       let m = mg(g, t)
-      out.push("typedef struct ME_" + m + " ME_" + m + "; typedef struct {{ ME_" + m + " *ents; int64_t nents, cap, live; int64_t *idx; int64_t nidx; }} " + m + ";")
+      out.push("typedef struct ME_" + m + " ME_" + m + "; typedef struct {{ ME_" + m + " *ents; int64_t nents, cap, live; uint32_t *idx; int64_t nidx; }} " + m + ";")
   for n in g.struct_order:
     if n in g.structs:
-      out.push("struct T_" + n + " {{ " + field_decls(g, g.structs[n].fields) + " }};")
+      out.push("struct T_" + n + " {{ " + field_decls(g, n, g.structs[n].fields) + " }};")
     else:
       let nv = g.enums[n].variants.len
       for k in 0..nv:
         if boxed_key(n, k) in g.boxed:
-          out.push("struct T_{k}_" + n + " {{ " + field_decls(g, g.enums[n].variants[k].fields) + " }};")
+          out.push("struct T_{k}_" + n + " {{ " + field_decls(g, "", g.enums[n].variants[k].fields) + " }};")
       var parts: [Str] = []
       for k in 0..nv:
         if g.enums[n].variants[k].fields.len == 0: continue
         if boxed_key(n, k) in g.boxed: parts.push("T_{k}_" + n + " *b{k};")
-        else: parts.push("struct {{ " + field_decls(g, g.enums[n].variants[k].fields) + " }} v{k};")
+        else: parts.push("struct {{ " + field_decls(g, "", g.enums[n].variants[k].fields) + " }} v{k};")
       var u = ""
       if parts.len > 0: u = "union {{ " + join(parts, " ") + " }} u; "
       out.push("struct T_" + n + " {{ int32_t tag; " + u + "}};")
@@ -840,6 +986,9 @@ fn build(var g: G, items: [Node]) -> Str:
       if not is_copy(g, ci): out.push("static void vu_cdrop_" + m + "(void *e) {{ " + drop_code(g, ci, "*(" + ct(g, ci) + " *)e") + " }}")
       out.push("static void drop_" + m + "(vu_chan **p) {{ vu_chan_release(p); }}")
       continue
+    if tk == "smap":
+      out.push("static void drop_" + m + "(vu_smap **p) {{ vu_smap_release(p); }}")
+      continue
     if tk == "memo":
       # (a Memo holds a handle to each value it has: dropped with the last handle to the Memo)
       let mv = map_val(inner_of(t))
@@ -857,12 +1006,14 @@ fn build(var g: G, items: [Node]) -> Str:
       out.push("static void drop_" + m + "(" + tx + " **p) {{ " + tx + " *q = *p; if (!q) return; if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) {{ vu_drop_depth++; " + inner + "vu_release_" + x + "(q); vu_drop_depth--; }} else vu_defer(vu_freenode_" + m + ", q, 0); }}")
     else:
       let et = inner_of(t)
-      if is_copy(g, et):
-        out.push("static void drop_" + m + "(" + ct(g, t) + " *p) {{ free(p->data); }}")
-        continue
       let ec = ct(g, et)
-      out.push("static void vu_freeitems_" + m + "(void *v, int64_t n) {{ " + ec + " *d = (" + ec + " *)v; for (int64_t i = 0; i < n; i++) " + drop_code(g, et, "d[i]") + " free(d); }}")
-      out.push("static void drop_" + m + "(" + ct(g, t) + " *p) {{ if (!p->data) return; if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) {{ vu_drop_depth++; vu_freeitems_" + m + "(p->data, p->len); vu_drop_depth--; }} else vu_defer(vu_freeitems_" + m + ", p->data, p->len); }}")
+      # (the buffer goes back to the runtime's free lists by the size its capacity says, vu_lfree)
+      if is_copy(g, et):
+        out.push("static void drop_" + m + "(" + ct(g, t) + " *p) {{ vu_lfree(p->data, (size_t)p->cap * sizeof(" + ec + ")); }}")
+        continue
+      out.push("static void vu_dropitems_" + m + "(" + ec + " *d, int64_t n) {{ for (int64_t i = 0; i < n; i++) " + drop_code(g, et, "d[i]") + " }}")
+      out.push("static void vu_freeitems_" + m + "(void *v, int64_t n) {{ vu_dropitems_" + m + "((" + ec + " *)v, n); free(v); }}")
+      out.push("static void drop_" + m + "(" + ct(g, t) + " *p) {{ if (!p->data) return; if (__builtin_expect(vu_drop_depth < VU_MAX_DROP_DEPTH, 1)) {{ vu_drop_depth++; vu_dropitems_" + m + "(p->data, p->len); vu_lfree(p->data, (size_t)p->cap * sizeof(" + ec + ")); vu_drop_depth--; }} else vu_defer(vu_freeitems_" + m + ", p->data, p->len); }}")
   for en in g.err_enums: out.push(etext(g, en))
   for jc in json_code(&g): out.push(jc)
   # Everything after the entry points is user code under #line directives, so they come first.
@@ -887,6 +1038,7 @@ fn build(var g: G, items: [Node]) -> Str:
   out.push("#ifndef VU_PART")
   out.push("int main(int argc, char **argv) {{ return vu_start(argc, argv, vu_main, vu_file_names); }}")
   out.push("#endif")
+  ffi_reach(&g, out, nlam)
   # (a split build compiles what follows in parts: each function's definition starts with a marker)
   out.push("/* vu-parts */")
   for i in 0..g.sigs.len:
@@ -1438,7 +1590,9 @@ fn index_text(g: G, items: [Node]) -> Str:
     let name = bare_name(it.name)
     var fields: [Str] = []
     if k == "type" and it.name in g.structs:
-      for f in g.structs[it.name].fields: fields.push(f.name + ": " + tn(f.ty))
+      for f in g.structs[it.name].fields:
+        if is_n32(g, it.name, f.name): fields.push(f.name + ": Int32")
+        else: fields.push(f.name + ": " + tn(f.ty))
     if k == "enum" and it.name in g.enums:
       for vr in g.enums[it.name].variants:
         var ps: [Str] = []
@@ -1789,7 +1943,7 @@ fn glue_text(fs: Fs, csrc: Str) -> Str:
   while i >= 0 and i < lim:
     let e = csrc.find("\n", i + 1)
     let ln = csrc[i + 1..e]
-    if ln.endswith(".c\""):
+    if ln.endswith(".c\"") or ln.endswith(".h\""):
       let p = ln[10..ln.len - 1]
       let txt = fs.read(p) else ""
       out += p + "\n" + txt + "\n"
@@ -1839,7 +1993,7 @@ fn split_build(fs: Fs, os: Os, csrc: Str, path: Str, argl: [Str], cfile: Str, ou
     var rest = ""
     for f in p.split("\n/* vu-part */\n"):
       if f.startswith("VU_FNI "): head += f + "\n"
-      elif f.find("vu_ffi_here(", 0) >= 0: part0 += "\n/* vu-part */\n" + f
+      elif f.find("/* vu-extern */", 0) >= 0: part0 += "\n/* vu-part */\n" + f
       elif f != "": rest += "\n/* vu-part */\n" + f
     if rest != "": parts.push(rest)
   # (part 0's key holds the glue files it includes, which aren't in the C here)
@@ -1859,7 +2013,10 @@ fn split_build(fs: Fs, os: Os, csrc: Str, path: Str, argl: [Str], cfile: Str, ou
   fs.write(pdir + "/head.h", head) else 0
   var objs: [Str] = []
   var jobs = 0
-  let hkey = sha256(fkey + "\n" + head).hex() + "\n"   # (the header and options, hashed once)
+  # (the header and options, hashed once; with a glue header, which every part includes, its text)
+  var hglue = ""
+  if head.find(".h\"\n", 0) >= 0: hglue = glue
+  let hkey = sha256(fkey + "\n" + head + hglue).hex() + "\n"
   let tag = random_bytes(6).hex()
   # clang: the header compiled once (a precompiled header, kept with the parts) for every part but
   # part 0, instead of parsed by each

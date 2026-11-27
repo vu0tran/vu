@@ -1,0 +1,7 @@
+
+                              /**
+                               * @override
+                               */
+                              function * quux (foo) {
+                              }
+                          

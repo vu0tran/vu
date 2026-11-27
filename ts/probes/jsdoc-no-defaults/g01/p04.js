@@ -1,0 +1,6 @@
+
+			          /**
+			           * @function
+			           * @param {number} foo
+			           */
+			      

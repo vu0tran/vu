@@ -84,6 +84,21 @@ VU_SPLIT=always "$VU" build --debug "$PWD/../golint/main.vu" -o "$work/vgl" 2>"$
 gslot=$(ls -d "$XDG_CACHE_HOME"/vu/parts/*/ | head -1)
 gdup=$(for o in "$gslot"/*.o; do nm "$o" 2>/dev/null | awk '$2 ~ /^[bdBD]$/ {print $3}' | sed 's/^_//; s/\.[0-9]*$//' | sort -u; done | grep -v -E '^(altstack|vu_guard_init\.altstack|__compound_literal|ltmp[0-9]+|vu_file_names|vu_m_[a-z0-9]+)$' | sort | uniq -d)
 [ $rc -eq 0 ] && [ -z "$gdup" ] && nm "$gslot"/*.o 2>/dev/null | grep -q 'vu_memo_lock'; check "no part of vgolint has its own copy of the runtime's state (Memo, tasks, channels)" $? "rc=$rc $(head -3 "$work/eg") $(echo "$gdup" | tr '\n' ' ')"
+# and in the source: a static that isn't const in the header every part includes (the runtime, the
+# templates, glue headers, tried copies), where nm can miss one (a part that only stores to its copy
+# drops the store and the copy). ts/ctab.h's ct_slack_n was such a static: 0 for every part reading it.
+# (split_state.py lists them, as clang parses the header for a part; each allowed one has its reason)
+sbad=""; ns=0
+for p in ../compiler/vuc.vu ../golint/main.vu ../ts/vtsc.vu ../ts/ctab_stress.vu ffi/36_glue_header/main.vu ffi/37_header_par/main.vu ffi/44_par_deep_generic/main.vu; do
+  r=$(python3 split_state.py "$p" 2>&1) && ns=$((ns+1)) || sbad="$sbad $p: $(echo "$r" | tail -8 | tr '\n' ' ')"
+done
+[ -z "$sbad" ]; check "no static state in the header the parts include ($ns programs)" $? "$sbad"
+# (and it finds one: a glue header's counter, at file scope and inside a function)
+mkdir -p "$work/st"
+printf '#include <stdint.h>\nstatic int64_t st_count;\nstatic inline int64_t st_bump(void) { static int64_t calls; calls += 1; st_count += 1; return st_count; }\n' > "$work/st/st.h"
+printf 'extern "st.h":\n  fn st_bump(ffi: Ffi) -> Int\n\nfn main(ffi: Ffi):\n  print("{st_bump(ffi)}")\n' > "$work/st/main.vu"
+r=$(python3 split_state.py "$work/st/main.vu" 2>&1); rc=$?
+[ $rc -eq 1 ] && echo "$r" | grep -q "STATIC st_count " && echo "$r" | grep -q "STATIC st_bump.calls "; check "split_state.py finds a glue header's statics" $? "rc=$rc $r"
 "$work/vuc1" build "$src" --emit-c "$work/a.c" -o "$work/vuc2" >/dev/null 2>&1
 "$VU" build "$src" --emit-c "$work/b.c" -o "$work/vuc3" >/dev/null 2>&1
 cmp -s "$work/a.c" "$work/b.c"; check "the split-built compiler writes the same C as the installed one" $? "$(diff "$work/a.c" "$work/b.c" | head -5)"

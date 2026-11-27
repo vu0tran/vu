@@ -3171,3 +3171,287 @@ v0.50.0 (709) and x/net v0.59.0 (354). Files that import "C" are skipped by both
 golangci-lint does. `VGOLINT_REQUIRE_ALL=1` makes a config that enables anything vgolint lacks (a
 linter, a govet analyzer, a revive rule) an error instead of a warning. `tools/shadow.sh` runs vgolint
 beside golangci-lint in CI and reports differences without failing the job.
+
+**vlint: eight type-aware differences from tsgolint 7.0.2008 (2026-11-24).** Found on the React
+monorepo's per-package CI runs, each reduced to a probe in `ts/probes/` (it fails on 0.5.0):
+`no-unnecessary-type-arguments` read a constructor's parameters only when the class was in the file
+being linted (`type-args-ctor-other-file`); `no-unnecessary-type-parameters` reported an overloaded
+function's or method's implementation, whose type tsgolint visits is the overloads'
+(`type-params-overload-impl`); `no-deprecated` didn't follow a property through a mapped type whose
+`as` clause only filters keys (`P extends X ? never : P`, which tsc still links;
+`deprecated-filtering-as`); `no-unsafe-enum-assignment` read the keys of an imported receiver,
+where tsgolint's symbol is the import's and has no annotation (`enum-access-imported-receiver`).
+In vtsc: a rest element of a union of tuples (`...args: [A?, B?] | [B?]`) is spread into a union of
+tuples instead of leaving the file untyped (`tuple-rest-union-of-tuples`); an intersection with one
+iterable member is iterable (`spread-iterable-intersection`); an array literal's elements in an
+`A[] | B[]` context get the union of the element types, not the last member's
+(`array-ctx-union-of-arrays`); and inferring from a generic signature keeps a constraint naming the
+signature's own type parameters, as getBaseSignature does (`base-signature-own-constraints`; one
+package measured 0.9% more instructions). Over the 87 runs other than the largest package, 10
+diagnostics that differed from oxlint 1.94.0 now match and none that matched differs. Not fixed: a
+file narrowing a deferred conditional type with `in` (`'x' in mock`, vitest's `MaybeMocked<T>`)
+stays untyped; narrowing it as tsc does moves the stop to an assertion relating that conditional
+type to an intersection, which vtsc doesn't model. vtsc's 813 cases give the same output as
+before (byte for byte; 3 of them fail with the lib folder used here, before and after), and the
+116 saved probes all match.
+
+**vlint: ten more of oxlint's rules (2026-11-24).** A configuration that turned on
+eslint(no-restricted-properties), promise(no-multiple-resolved) or any of eight jsdoc rules
+(check-property-names, implements-on-classes, no-defaults, require-property and its -description,
+-name and -type, require-yields) got a note on stderr and nothing else; they are ported from oxlint
+1.94.0. The jsdoc plugin follows oxc_jsdoc 1.94 now (a tag needs only a line start, so check-tag-names
+found 4 more tags on one corpus, as oxlint does), counts only leading `/** */` comments, attaches each
+to its node as oxc does, and reports the once-per-file rules in iter_all's hash-map order.
+no-multiple-resolved walks oxc's control flow graph, so `rmore11.vu` builds a model of it (blocks
+and edges in the order oxc adds them) for files with a `new Promise(fn)`. Checked against oxlint
+1.94.0: the rules' own test cases (10 probe folders), 6 more probes (attacks, one generated), 2,400 generated
+files of Promise executors (14,711 diagnostics), a 541-file corpus of package sources for the jsdoc rules
+(2,276 diagnostics, three settings variants), 9,598 files of a monorepo plus that corpus for
+no-restricted-properties (55,654), and 3,000 package files using `new Promise` (173): all identical
+in JSON, order included. What the attack rounds found: comments in a template's `${}` were skipped
+(rjest.all_comments, used by other rules too); a literal number past 2^53 crashed the property
+name's printing; decorators' expressions aren't in vlint's walk; directives aren't attachable; the
+1.90 parser's bracket rule; and a type-kind filter that dropped template expressions. Cost: on that
+3,000-file corpus (480 MB, every file with a `new Promise`), the rule adds about 3 s of CPU to 14.5;
+on the 38,000-file monorepo, under 1 s. The hash-map order is modeled with
+aarch64's 8-byte control groups (the oxlint measured is darwin-arm64); large tables are exercised (one file
+has 634 JSDoc comments, its order matches). Not checked: TypeScript-only corners of the CFG beyond
+the probes, and the order on an x86-64 oxlint (16-byte groups), which can differ in tables of more
+than 16 buckets.
+
+**vlint: linting a package at a time costs half the CPU (2026-11-24).** A monorepo's CI job lints
+its 88 package invocations two at a time (`--threads=4 --type-aware`, each package's config), and
+vlint 0.5.0 was no faster there than oxlint. Reproduced on 10 cores, alternating runs, outputs
+identical every time: 0.5.0 took 99.5 and 99.4 s and 840 and 838 cpu-s; now 73.7 and 76.7 s and
+453 and 449 cpu-s; oxlint 1.79 74.1 and 73.5 s, 470 and 462 cpu-s. So the wall is oxlint's, not
+better: the type-aware check of one mid-sized program is most packages' critical path. A
+package's largest process went from 13.3 GB to 2.7 (the largest package; oxlint's 7.4); summed
+over the process tree (forked shards counted once each) 12.3-12.7 GB against oxlint's 12.3-12.4.
+What changed: a program checked alone no longer runs its workers as threads that each read, parse
+and bind it again (they're forked from a worker process after parsing); workers are one per 400
+files, at most 8 and the CPUs the process may use (on Linux its affinity and cgroup quota, not
+`/proc/cpuinfo`'s count of the whole node); programs take CPU tokens; forked shards start cold
+(the warm-up was a serial half); @types/node's `/// <reference lib>` no longer makes every program
+be read twice; a single-worker program's files are read ahead by four tasks. Not measured: the CI
+machine itself (its core count and quota aren't known here).
+
+**vlint: an unused disable closed by an enable is reported at the disable (2026-11-24).** oxlint 1.94
+moved it there; `probes/disable-enable-unused` (with `.args`, which oxprobe.sh now reads per folder).
+Against oxlint 1.94 on that CI job, 79 of 88 invocations are now identical (76 on 0.5.0); the rest
+are the React Compiler's preserve-manual-memoization (not ported: it needs the reactive-scope
+passes) and the rules whose results depend on it, plus two files vtsc can't type yet.
+
+**vlint: a type-aware worker per 200 files (2026-11-24).** On the CI job's pattern, alternated with
+oxlint 1.79: vlint 71.2 and 71.2 s (478 and 475 cpu-s), oxlint 74.4 and 74.3 s (473 and 470);
+outputs identical. 4% under oxlint's wall, not the 20% aimed at: most packages' critical path is one
+program's check of its own files (the files nothing lints take 4-12 ms of 1-4.8 s), after 0.45-0.7 s
+of reading and parsing declarations. Measured and not kept: a small warm-up before forking (less
+cpu, no faster), 120 files a worker, and read-ahead threads in forking programs (their read+parse
+2.0 -> 0.57 s, but the job 73.9 and 76.3 s with 14 s more sys time).
+
+**vlint: dependencies' module records kept between runs (2026-11-24).** no-barrel-file makes the
+module graph read and parse every file a package's imports reach in node_modules, about 10,000
+files a package, the same ones for every package of a monorepo. A record (before its requests are
+resolved) is now kept per package root under `$XDG_CACHE_HOME/vlint/modrec-BUILD` and used while
+the file's times, size and inode are unchanged. The CI job's pattern from an empty cache, alternated
+with oxlint 1.79: 71.3 and 70.4 s (451 and 455 cpu-s) against 74.8 and 74.8 s (471 and 469); 74.9 s
+and 475 cpu-s before; outputs identical, 63 MB of cache. Measured, not changed: vtsc instantiates no
+more than tsgo on the same program (554,000 against 791,000) and checks it as fast on one thread.
+
+**Extern calls as cheap as a list read (2026-11-24).** vtsc's flat type and symbol tables are
+moving to C, so that several checker threads can share them; each read became an extern call, and
+in a split release build that cost far more than the small benchmark it was measured on: a call
+into part 0 (the only part that includes the glue), `omp_in_parallel()` on every call for the
+par-loop check, and a stack protector for the check's message buffer. Moving one table (`c.tk`,
+2,800 read sites) cost +23-35% instructions retired on three programs. Now:
+- a glue file named `.h` ("glue header", SPEC.md) has no state of its own: every part includes it,
+  and its wrappers are `static inline`, so the calls inline into the Vu code (`tests/ffi/36`, and a
+  generated check that a split build of it runs and that an edit to the header builds the parts
+  again);
+- the par-loop check asks OpenMP only while a par loop runs (`vu_par_live`, counted around each
+  loop), and asks once per function at its start rather than per call, since whether a frame runs
+  inside a par loop doesn't change while it runs; a call in a par loop's own body is still checked
+  each time. The panic is unchanged and still happens only when the call is reached
+  (`tests/ffi/37_header_par`, `38_par_unreached`, `39_closure_par`, and `09_par`).
+With twelve tables moved: +2.1-4.0% instructions on the three programs (+0.4% with no check at all;
+the rest is the check at each function's start). Measured on macOS (arm64, Apple clang); the FFI
+suite passes there with leak detection off (LeakSanitizer isn't supported on macOS), 75 targeted
+tests matching par, extern or ffi pass, run_split.sh 17 of 17, run_targeted.sh 776 of 776. The full
+gate can't pass on this Mac: its other failures are the machine's (no LeakSanitizer, Apple clang
+without -fopenmp for CC=clang builds, clang crashing on a 20,000-term expression, Python's Unicode
+and HTML versions, Linux tools for the network suites); run_tools, run_profile and run_norm fail the
+same way at the previous commit, and the par-loop programs give one output under -O3, --debug and
+--malloc (31 of 31). Not yet run on Linux.
+
+**The par-loop check only where a par loop can reach (2026-11-24).** The check at the start of each
+function that calls C (whether it runs inside a par loop) was the rest of an extern call's cost: 2-4%
+of vtsc's instructions once its tables moved to C, because it makes small leaf functions keep a
+frame. Now the compiler looks at which functions each function's C names (`ffi_reach` in
+c5_build.vu): a function keeps the check (`VU_FFI_ENTRY`) when a par loop's body reaches it through
+calls, or when the program has a par loop and the function is used as a value (closures, named
+functions passed around, interface tables, thunks: a value can be called from anywhere). Every other
+function gets `VU_FFI_OFF`, a constant false, and the check compiles to nothing. Not counted as
+reaching: main's caller and a spawned task's entry (a task runs on a thread of its own, never one of
+a par loop's, and a par loop's body can't spawn). The panic is unchanged where it can happen.
+Attack rounds: the first version counted a whole function with a par loop as reached, so a function
+called outside the loop kept its check (`tests/ffi/43`, imprecise, not unsound); replacing the
+marker text everywhere in a function's C also rewrote the compiler's own string literal naming it
+(the fixed-point build caught it: now only the marker's own line is replaced); and a string that reads
+like the par pragma with no block after it made the compiler index -1 (its own source hit it). New
+tests: a closure made where no par loop reaches and called in one (`40`), a named function passed as
+a value (`41`), an interface function through an interface value (`42`), a function no par loop
+reaches with a par loop, a task and a closure in the program (`43`, output, and the emitted C checked
+for `VU_FFI_OFF` there and `VU_FFI_ENTRY` in 40's closure), a method, a generic function and a closure
+in a par body (`44`), a closure made inside the body (`45`), braces and quotes in the body's strings
+and a string holding the pragma's text (`46`). In vlint all 1,009 functions that call C lose the
+check: with vtsc's signatures also moved to C, instructions on the three programs 18.62, 16.90 and
+55.19 G (18.48, 16.77, 55.20 before any table moved; 18.85, 17.24, 56.40 with the twelve flat tables
+and the check). Measured on macOS (arm64): run_ffi 52 of 52 with leak detection off (LeakSanitizer
+isn't supported there; with it, the same 18 fail on that alone as before), run_targeted.sh 776 of
+776, run_split.sh 17 of 17; the full gate not run (it can't pass on this Mac); not run on Linux.
+
+**vlint: node processes as the work needs them; no-barrel-file's graph scoped (2026-11-24).** On
+the CI job's pattern without type-aware rules, vlint's plain lint cost 240 cpu-s against oxlint's
+147: 341 node processes for JS plugins (one per two cores in every invocation, about 0.2 cpu-s each
+to start, most for packages of a few dozen files) and a module graph that followed every import of
+every dependency for no-barrel-file. Now a process is added only when the requests left are more
+than 1.0 s of work for each process in use (at the time the first 16 answers and those after took),
+and a dependency is followed whole only when it is reachable from what a linted file re-exports
+whole. Measured alternated with oxlint 1.79: the plain-only job 180.9 and 181.7 cpu-s, 33.2 and
+34.1 s (from 240.3 and 241.1, 41.0 and 40.0; node 130 -> 96 cpu-s, 341 -> 134 processes; oxlint
+146-149), the full cold job 74.8 s twice, 451.5 and 449.0 cpu-s (from 78.4 and 79.1 s, 501 and 497;
+oxlint 74.6 and 73.9 s, 473 and 468). All 88 outputs identical, the 133 probes
+the same, vtest's 3 failures unchanged. Tried and not kept: kind_of answered from folder listings
+(in Vu maps: more instructions; in C, shared by the process: 34,000 of 34,400 answers without a
+stat, cpu unchanged) and integer keys for the React Compiler's value cache (-0.4% instructions).
+
+**Lists' and maps' buffers from per-thread free lists (2026-11-25).** On macOS, malloc, free and
+realloc were about a quarter of vlint's busy samples in its React Compiler: every list grew from
+malloc and was freed to it, and so was every map's entry array and index. Now a buffer of up to
+1,024 bytes whose size is a multiple of 8 goes back, when it's freed, on a free list of its thread
+for exactly that size (`vu_lalloc`, `vu_lfree` and `vu_lgrow` in rt/runtime.c; list.c and the
+map templates, and the lists' drop functions in c5_build.vu, use them). A buffer is freed knowing
+only its capacity, which never says more than the buffer holds, so a buffer made anywhere by malloc
+can go on the list its capacity names, and one taken from a list can still be freed by free(): the
+lists need no header and no agreement with code that still calls malloc and free (the deferred
+drops past the drop depth, buffers handed to Str, the runtime's C). A list's first buffer is now at
+least 16 bytes (16 Bytes or Bools, not 4). Each list keeps at most 1 MB (256 KB in programs with
+tasks or par loops, where a buffer freed on another thread stays on that thread's lists); past that
+malloc and free as before. --san and --malloc builds call malloc and free for every buffer;
+--san-pool and TSan builds use the lists, with freed buffers poisoned under ASan as the string pool's
+are. Measured (instructions retired, macOS arm64, a loaded machine): vlint's plain invocations on the
+CI job's pattern 133.6 -> 111.8 G, 20.8 -> 17.7 and 26.3 -> 25.6 G; a serial type-aware invocation
+55.0 -> 46.2 G; the compiler checking its own source 2.58 -> 2.22 G (the build's wall is the C
+compiler's and didn't change); examples/json.vu on a 30 MB document 3.17 -> 3.09 G (summary) and
+7.87 -> 7.78 G (printing it back); binarytrees unchanged (its nodes were already pooled);
+tests/memory/list_par.vu 21.4 -> 9.0 G, its peak resident memory 20 -> 29 MB (28 MB after 20 of
+its 200 rounds: bounded). Tried and not kept: 2,048-byte buffers (-0.5%), 4 MB or 256 KB a list
+(within 0.6%). Attack rounds: the first (a single-thread program with lists of 1-, 8-, 24- and
+48-byte elements grown, truncated, popped, reserved, sliced, repeated and nested, maps grown past
+their index, `take_str`; bags of lists and maps made by tasks and freed by others on other threads
+through two channels; par loops freeing the main thread's lists and the main thread the workers')
+found nothing, under ASan with and without the pool and under TSan. The second (a 200,000-deep chain
+through lists and maps, whose drop is deferred and frees with free() between pooled buffers;
+[Byte] lists of every length to 1,100 through bytes(), push, reserve, take_str and str()) found
+nothing; reading the code for it found that a zero-size element type would have divided by zero in
+the first buffer's size (guarded; Vu has no such type today). New tests: targeted 782-786 and
+tests/memory/list_par.vu (resident memory is read from /proc: on macOS it checks nothing). The full gate
+on this Mac (arm64, loaded) printed GATE FAILED, as it does for the build before (run alongside in a
+second worktree): the same suites fail the same way in both (networking, JSON, modules, FFI and
+others that need Linux; the selfhost chain test's hash), run_targeted.sh 781 of 781 (776 of 776
+before), run_memory 4 of 4, run_split 17 of 17, run_differential one more "different" (the new par
+test, which Apple's clang can't build with OpenMP, as for every par program there); not run on Linux.
+
+**SharedMap: one table several threads add to (2026-11-25).** Tasks share only frozen values,
+channels and Memos, so a type checker's interning tables (a literal's type, an instantiation's id)
+couldn't be one table for several checking threads: a Memo hands out each value as a Shared handle,
+under one lock. `SharedMap[K, V]` (`shared_map()`, SPEC "SharedMap") keeps Int, Float, Bool or Byte
+values under Int, Byte, Bool or Str keys; `m.add(k, v)` adds v unless k has a value and returns the
+value k has (the first add wins, so two tasks interning one key get one id), `m.get(k, default)`
+reads without a lock. rt/smap.c: 64 shards by hash, each an open-addressed array whose slots are
+published by a release store of their hash word, written under the shard's spin lock; a full shard
+is copied into one twice the size and published by pointer, the old array kept until the map goes,
+so a reader is never left in freed memory. A struct field may default to `shared_map()`. Measured
+single-threaded against a Vu map (macOS arm64, 400,000 keys, 10 million reads): Int keys +15%
+instructions (0.49 -> 0.57 G), Str keys +2%. Attack round 1 (targeted 787-800: 8 tasks interning
+20,000 Str and Int keys at once while every shard grows, 4 readers during 200,000 adds, a par loop
+adding, SharedMaps in a Shared value, maps with grown Str keys dropped from tasks, the other key and
+value kinds, and the refusals: Str and list values, Float keys, no type, `m[k] = v`, a moved handle,
+a wrong value, `get` without a default) found nothing but two mistakes in the tests themselves;
+under TSan (`CC=clang vu build --tsan`, three runs of each spawn test) no reports, and a planted bug
+(a slot's hash word published before its key, or read relaxed) is reported (1 of 3 and 3 of 3
+runs). The par test runs under ASan only here: Archer isn't installed on this Mac.
+
+**A Shared value built in place: `.unique` (2026-11-25).** A value tasks read at once had to be
+complete before `share()`, so a program that fills a large structure through one field and then
+hands it to worker tasks (a type checker's syntax tree, read by every checking thread, but added to
+while binding) needed two fields and two ways to read it. `s.unique` is the value of `s`, writable
+(`s.unique.nd.push(n)`, `grow(&s.unique)`), checked where it's used: while `s` has another handle
+(`s.share()`, a task's), the program stops ("a Shared value's .unique used while it has other
+handles"). The count is read with acquire ordering, so a task's last reads happen before the writes
+that follow its handle's drop. `.value` stays read-only. Attack round 1 (targeted 801-806: building
+through a field, an index, push and a `var` argument, then 4 tasks reading; a handle kept in a
+struct; every task's handle dropped first; a parameter that isn't `var`; a view of `.value` held
+across a write; a write reached through an outer `.value`) found only mistakes in the tests (a wrong
+expected sum, and a test that raced its own tasks' drops); round 2 (807: a list swapped out of
+`.unique`, Shared values in a list written through `.unique`, a map entry replaced; ASan, UBSan and
+the C audit clean) found nothing.
+
+**Smaller maps and SharedMaps (2026-11-26).** A type checker of 14,000 files (vlint's, on a large
+monorepo) kept some 15 M entries in maps with Int keys and 3.7 M in SharedMaps, about a third of
+its memory. A map with Int (or Byte, Bool) keys no longer keeps each entry's hash (an Int key's is
+two multiplications, done again when the index is rebuilt): an entry of `{Int: Int}` is 24 bytes,
+was 32. Every map's index holds 32-bit entry numbers, was 64 (past 4 G entries a map stops the
+program, as out of memory). A SharedMap slot is 24 bytes, was 32 (a Str key is one pointer to its
+length and bytes), and a shard grows once three quarters full, was half (each grown shard keeps its
+old arrays for readers still probing them, so a SharedMap took 160 bytes or more an entry).
+Measured on that checker, one program on one thread, the same output: malloc's bytes in use at the
+end 2,157 -> 1,549 MB, peak RSS 3.43 -> 2.81 GB, instructions 88.2 -> 87.8 G; the invocation as CI
+runs it (8 threads, its process tree) peaked at 6.5 GB, now 5.3. Attack round 1 (targeted 808: Int
+keys at both ends of the range, removals, index rebuilds, Bool and Byte keys; 809: Str keys from 4
+tasks at once, empty and 5,000-byte keys and prefixes; ASan, UBSan, the C audit, and ThreadSanitizer
+three runs of 809 and one of 788) found nothing. The full gate can't pass on macOS (its sanitizer
+leak checks, static linking, /proc and Python's Unicode version are Linux's); there, the suites that
+don't need those passed (targeted 802 of 802, the fixed point), and the selfhost case that failed
+(a 20,000-term expression) crashes Apple's clang with the old compiler too. Not run on Linux.
+
+**Int32 struct fields (2026-11-26).** A struct field declared `Int32` keeps an Int from
+-2147483648 to 2147483647 in 4 bytes (`int32_t` in C) instead of 8. It's for structs kept by the
+million: vtsc's syntax tree is one list of a 10-field `Node`, 4.1 M of them on the largest program
+vlint checks in CI, 80 bytes each. To the checker the field is an Int: a read is an `int64_t` value
+(never a place, so nothing can point at its 4 bytes as an Int's 8), and every store into it is
+checked: a construction (and a default), `=`, `+=` and the other compound assignments (computed as an
+Int, then checked), `.unique` writes into a Shared value, and `from_json`, which fails with "expected
+a number from -2147483648 to 2147483647" instead of truncating. A value that doesn't fit stops the
+program ("2147483648 does not fit in Node.pos, an Int32 (-2147483648..2147483647)") in release builds
+too: Vu's release builds keep every check (Int overflow, a Byte's range), and a silent truncation
+would corrupt an index that's only read much later; the check is one comparison per store, and reads
+cost nothing. An out-of-range literal is a compile error. `&n.k` (a `var` parameter, a method whose
+receiver is `var`, `swap`) is refused with a message saying to copy it into a variable and store it
+back; `Int32` anywhere but a struct field (a variable, parameter, list element, optional, enum
+variant, generic type argument) is refused too. `vu check --checks` lists the store's check in a loop,
+and `vu check --index` shows the field as `Int32`.
+Attack round 1 (targeted 810 to 823: both ends of the range by `=`, `+=` and construction, computed
+so only the runtime check sees them; `&` and `swap` refused; out-of-range literals and defaults;
+Int32 where it isn't allowed; lists of such structs with sort, `for var`, `copy_within`, moves and
+copies; a Shared value written through `.unique` and read by tasks; JSON at both ends and past them;
+generic structs; and a module's struct, `tests/modules/49_int32_fields`) found only mistakes in the
+tests (expected values worked out by hand, now computed in Python; messages starting with `-` read as
+grep options). Round 2 (`?` and `else` on the right of a store, `+%=` and `>>>=`, loop accumulators
+into a field, map values, `par` loops, function values and methods with a `var` receiver) found one
+thing: `vu check --checks` didn't list the store's range check among a loop's per-pass checks (now
+it does). Round 3 (the C each test makes under gcc-14 and clang with the gate's warning flags, and
+the struct sizes: `run_cli.sh` checks that ten Int32 fields make a 40-byte struct) found nothing.
+ASan and UBSan runs of every test were clean. Not run: the full gate (it needs Linux: leak checks,
+static linking, /proc), ThreadSanitizer and the arm64 suite. On macOS: targeted 818 of 818, modules
+54 of 54 and json 97 of 97 (both with leak checks off), fmt, tests, debug and cli (but `--static`) passed; selfhost passed
+but the 20,000-term expression that crashes Apple's clang with the old compiler too.
+
+**vtsc's syntax tree in Int32 fields (2026-11-26).** All ten of `ts/ast.vu`'s `Node` fields are
+`Int32` now (its kind, offsets within a file, node and list indexes, interned names, flags up to
+2^21, the file's index): 40 bytes a node, was 80; no field access had to change. On the CI job's
+pattern (176 outputs, 2 at a time) the outputs are identical and the job's peak tree RSS went 5.8 ->
+5.1 GB. Its largest invocation alone, as the job runs it: peak 5.57 -> 4.51 GB; checked serially in
+vlint's process: max RSS 3.78 -> 3.25 GB, instructions 150.75 -> 150.95 G (the stores' checks). The
+next largest: 3.66 -> 3.15 GB, 2.77 -> 2.29 GB, 87.50 -> 88.02 G. vtsc's probes and vtests are
+unchanged (one measurement each, on a loaded machine).

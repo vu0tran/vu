@@ -20,3 +20,4 @@ mocha.before(async function () {
 function f() { return this.x; }
 declare const g: any;
 g((function () { const z: string = this; }));
+declare function require(id: string): any;
