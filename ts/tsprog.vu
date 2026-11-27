@@ -781,6 +781,8 @@ type FSrc:
   text: Str
   specs: [Str] = []   # its import("x") types' specifiers (import_type_specs), found once too
   t: ast.Ast = ast.Ast([], [], [], [], [], [], {}, {}, {}, ast.Sev([], [], 0, false, false), 0)   # (a lib file's entry, lib_key) its tree, parsed once for every program
+  ds: [parse.Diag] = []   # (a package file's entry, pkg_key) its parse's errors and facts, as file 1
+  fx: FFacts = FFacts()
 
 fn read_fsrc(fs: Fs, p: Str) -> FSrc:
   let t = fs.read(p) else return FSrc(false, "")
@@ -821,6 +823,7 @@ type PRes:
   src: Str
   fx: FFacts = FFacts()
   lib: Str = ""          # a lib file's: its tree is fm's, under this lib_key
+  pkg: Str = ""          # a package file's: its tree is fm's, under this pkg_key, parsed as file 1
 
 # What run_libs reads of a file's own tree, found where it's parsed (file_facts), with the tree's own
 # node ids (its first node 1): run_libs adds the nodes before it.
@@ -898,10 +901,13 @@ fn pmerge(own t0: ast.Ast, own inq: Chan[PRes], own outq: Chan[ast.Ast], own fm:
     if r.lib != "":
       let lv = fm.get(r.lib, fn(k) => FSrc(false, ""))
       ast.append_file(&t, lv.value.t)
+    elif r.pkg != "":
+      let pv = fm.get(r.pkg, fn(k) => FSrc(false, ""))
+      ast.append_file_as(&t, pv.value.t, r.fi)
     else: ast.append_file_own(&t, &r.t)
   outq.send(t)
 
-fn pparse(fs: Fs, own fm: Memo[Str, FSrc], own jobs: Chan[PJob], own res: Chan[PRes]):
+fn pparse(fs: Fs, own fm: Memo[Str, FSrc], own jobs: Chan[PJob], own res: Chan[PRes], pkgc: Bool):
   var kw = scan.keywords()
   while true:
     let j = jobs.recv() else return
@@ -911,6 +917,21 @@ fn pparse(fs: Fs, own fm: Memo[Str, FSrc], own jobs: Chan[PJob], own res: Chan[P
       var lr = PRes(j.fi, lv.value.ok, ast.blank(), [], "")
       lr.lib = lk
       res.send(lr)
+      continue
+    # (a package's file: parsed once for every program that has it, as file 1, pkg_tree)
+    if j.in_pkg and j.facts and pkgc:
+      let pk = pkg_key(j.jsx, j.json, j.path)
+      let pv = fm.get(pk, fn(k) => pkg_tree(fs, fm, k))
+      if not pv.value.ok:
+        res.send(PRes(j.fi, false, ast.blank(), [], ""))
+        continue
+      var src1 = read_shared(fs, fm, j.path)
+      if j.json: src1 = "const __json = " + src1 + ";\nexport = __json;\n"
+      var ds1: [parse.Diag] = []
+      for d in pv.value.ds: ds1.push(parse.Diag(d.file + j.fi - 1, d.pos, d.end, d.code, d.msg + ""))
+      var pr = PRes(j.fi, true, ast.blank(), ds1, src1, copy_facts(pv.value.fx))
+      pr.pkg = pk
+      res.send(pr)
       continue
     var src = read_shared(fs, fm, j.path)
     if src == "":
@@ -954,6 +975,47 @@ fn lib_tree(fs: Fs, fm: Memo[Str, FSrc], key: Str) -> FSrc:
   var t = ast.new_ast()
   parse.parse_file(&t, src + "", fi, &kw)
   return FSrc(true, "", [], t)
+
+# A package's file parsed once for every program that has it (a run's, or a batch's: the CI job's
+# 123 programs parsed 1,114 MB of packages' files, 132 MB of them distinct): its tree, errors and
+# facts in fm under pkg_key, parsed as file 1 and added as the program's (ast.append_file_as).
+# VTSC_PKG_TREES=0: each program parses its own.
+fn pkg_key(jsx: Bool, json: Bool, path: Str) -> Str:
+  var m = 0
+  if jsx: m += 1
+  if json: m += 2
+  return "\0P{m}\0" + path
+
+fn pkg_tree(fs: Fs, fm: Memo[Str, FSrc], key: Str) -> FSrc:
+  let at = key.find("\0", 1)
+  let m = int(key[2..at]) else 0
+  let path = key[at + 1..key.len]
+  var src = read_shared(fs, fm, path)
+  if src == "": return FSrc(false, "")
+  if (m & 2) != 0: src = "const __json = " + src + ";\nexport = __json;\n"
+  var kw = scan.keywords()
+  var t = ast.new_ast()
+  let ds = parse.parse_file_x(&t, src + "", 1, &kw, false, (m & 1) != 0)
+  let fx = file_facts(&t, src, 1, path, true, &kw)
+  return FSrc(ok: true, text: "", specs: [], t: t, ds: ds, fx: fx)
+
+fn copy_facts(f: FFacts) -> FFacts:
+  var o = FFacts()
+  o.root = f.root
+  o.jw = f.jw + ""
+  for x in f.req: o.req.push(x + "")
+  o.cjs = f.cjs
+  o.ce = f.ce
+  for r in f.refs:
+    var rr: [Str] = []
+    for x in r: rr.push(x + "")
+    o.refs.push(rr)
+  for x in f.imps: o.imps.push(x + "")
+  for x in f.imp_is: o.imp_is.push(x)
+  o.ismod = f.ismod
+  for x in f.augs: o.augs.push(x + "")
+  o.in_pkg = f.in_pkg
+  return o
 
 fn read_shared(fs: Fs, fm: Memo[Str, FSrc], p: Str) -> Str:
   let v = fm.get(p, fn(k) => read_fsrc(fs, k))
@@ -1392,7 +1454,8 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
   var kw2 = scan.keywords()
   if pp_chk: tsh = ast.new_ast()
   if pp_on:
-    for _k in 0..pp_n: spawn pparse(fs, fm.share(), pjq.share(), prq.share())
+    let pkgc = os.env("VTSC_PKG_TREES") != "0"
+    for _k in 0..pp_n: spawn pparse(fs, fm.share(), pjq.share(), prq.share(), pkgc)
   # (each file parsed on a tree of its own (here or ahead), what run_libs reads of it found there
   # (file_facts), and the trees added to t in order by a task of their own (pmerge), which has t
   # until the files are read; nn and nl: t's nodes and list items by then. A grafting pass adds
@@ -1656,11 +1719,17 @@ fn run_libs(fs: Fs, os: Os, ffi: Ffi, files: [Str], dir: Str, target: Str, pg: P
     if pp_chk: let _d2 = parse.parse_file_x(&tsh, src + "", fi, &kw2, false, jsxv)
     # (the file's nodes follow t's nn: its own ids moved up by dn)
     let dn = nn - 1
-    nn += pr.t.nd.len - 1
-    nl += pr.t.L.len
+    if pr.pkg != "":
+      let pv = fm.get(pr.pkg, fn(k) => FSrc(false, ""))
+      nn += pv.value.t.nd.len - 1
+      nl += pv.value.t.L.len
+      if not mg_on: ast.append_file_as(&t, pv.value.t, fi)
+    else:
+      nn += pr.t.nd.len - 1
+      nl += pr.t.L.len
     let tm0 = os.clock()
     if mg_on: mq.send(pr)
-    else: ast.append_file(&t, pr.t)
+    elif pr.pkg == "": ast.append_file(&t, pr.t)
     tmg += os.clock() - tm0
     tparse += os.clock() - tp0
     # (a package's syntax errors aren't reported: tsc reports them, but they'd hide every other error)
