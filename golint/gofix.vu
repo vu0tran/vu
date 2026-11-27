@@ -1,0 +1,416 @@
+# goimports' fix.go (golang.org/x/tools v0.50.0, internal/imports): which imports a file is missing
+# and which it doesn't use, in fix.go's passes. The first looks at the file alone, with import names
+# assumed from their paths; the second adds the other files of its folder (their package variables,
+# their imports as candidates); the third loads the real package names. Missing references are
+# looked for among the siblings' imports and the standard library, and last outside it (the caller
+# searches; ext_result). The fixes (add, delete, name an import) are applied to the formatting tree
+# by goimports.apply_fixes, as astutil's AddNamedImport and DeleteNamedImport do.
+
+import ast
+import resolve
+import stdsyms
+import doccmt
+
+const ADD = 0
+const DEL = 1
+const SET = 2
+
+type Imp:
+  name: Str
+  path: Str
+
+type Fix:
+  kind: Int
+  name: Str
+  path: Str
+  ident: Str
+
+# What fix.go reads from one file: its package name, references (a selector X.Sel with X an
+# identifier the parser didn't resolve and Sel exported, by X), imports (none for "C", "_" or "."),
+# and package-level variable and constant names (addGlobals: each spec's first).
+type FInfo:
+  pkg: Str
+  refs: {Str: {Str: Bool}}
+  rkeys: [Str]
+  imps: [Imp]
+  globals: [Str]
+  file: Str = ""
+
+fn copy_info(o: FInfo) -> FInfo:
+  var c = new_info()
+  c.pkg = o.pkg + ""
+  for k in o.rkeys:
+    c.rkeys.push(k + "")
+    var m: {Str: Bool} = {}
+    for s in o.refs[k]: m[s + ""] = true
+    c.refs[k + ""] = m
+  for i in o.imps: c.imps.push(Imp(i.name + "", i.path + ""))
+  for g in o.globals: c.globals.push(g + "")
+  c.file = o.file + ""
+  return c
+
+type PI:
+  name: Str
+  ex: {Str: Bool}
+
+type Pass:
+  real: Bool
+  last_try: Bool
+  existing: {Str: [Imp]}
+  ekeys: [Str]
+  missing: [Str]
+  cands: [Imp]
+  known: {Str: PI}
+
+type R:
+  done: Bool
+  fixes: [Fix]
+
+fn new_pass(real: Bool) -> Pass:
+  return Pass(real, false, {}, [], [], [], {})
+
+fn new_info() -> FInfo:
+  return FInfo("", {}, [], [], [])
+
+# ast.IsExported
+fn exported(name: Str) -> Bool:
+  if name.len == 0: return false
+  if name[0] < 128: return name[0] >= 'A' and name[0] <= 'Z'
+  var size = 0
+  return doccmt.is_upper(doccmt.rune_at(name, 0, &size))
+
+# strings.Trim(s, `"`)
+fn trim_quotes(s: Str) -> Str:
+  var a = 0
+  var b = s.len
+  while a < b and s[a] == '"': a += 1
+  while b > a and s[b - 1] == '"': b -= 1
+  return s[a..b]
+
+# The file's references, imports and globals. resolved: with go/parser's object resolution (the file
+# being fixed: r has resolve_file's answer for it); without it (parseOtherFiles'
+# SkipObjectResolution) every identifier X counts.
+fn analyze(t: ast.Ast, root: Int, resolved: Bool, r: resolve.Res) -> FInfo:
+  var fi = new_info()
+  if t.a[root] > 0: fi.pkg = t.names[t.s[t.a[root]]] + ""
+  if t.b[root] > 0:
+    for im in ast.items(t, t.b[root]):
+      let pn = t.b[im]
+      if pn <= 0: continue
+      let lit = t.names[t.s[pn]] + ""
+      var name = ""
+      if t.a[im] > 0: name = t.names[t.s[t.a[im]]] + ""
+      if lit == "\"C\"" or name == "_" or name == ".": continue
+      fi.imps.push(Imp(name, trim_quotes(lit)))
+  if t.c[root] <= 0: return fi
+  for d in ast.items(t, t.c[root]):
+    if t.k[d] == ast.N_GENDECL and t.a[d] > 0:
+      for sp in ast.items(t, t.a[d]):
+        if t.k[sp] != ast.N_VALUESPEC or t.a[sp] <= 0: continue
+        let ns = ast.items(t, t.a[sp])
+        if ns.len > 0: fi.globals.push(t.names[t.s[ns[0]]] + "")
+  var stack: [Int] = []
+  let ds = ast.items(t, t.c[root])
+  var di = ds.len - 1
+  while di >= 0:
+    stack.push(ds[di])
+    di -= 1
+  while stack.len > 0:
+    let n = stack.pop()
+    if n <= 0: continue
+    if t.k[n] == ast.N_SELECTOR:
+      let x = t.a[n]
+      let sel = t.b[n]
+      if x > 0 and sel > 0 and t.k[x] == ast.N_IDENT and (not resolved or r.obj[x] < 0):
+        let sn = t.names[t.s[sel]]
+        if exported(sn):
+          let left = t.names[t.s[x]] + ""
+          if not (left in fi.refs):
+            fi.refs[left] = {}
+            fi.rkeys.push(left + "")
+          fi.refs[left][sn + ""] = true
+    let nk = resolve.nkids(t, n)
+    var i = nk - 1
+    while i >= 0:
+      stack.push(resolve.kid(t, n, i))
+      i -= 1
+  return fi
+
+# ---- the standard library (stdlib.PackageSymbols)
+
+type Std:
+  paths: [Str]
+  syms: {Str: [Str]}
+
+fn load_std() -> Std:
+  var s = Std([], {})
+  for line in stdsyms.text().split("\n"):
+    let tab = line.find("\t")
+    if tab < 0: continue
+    let p = line[0..tab] + ""
+    s.paths.push(p + "")
+    var names: [Str] = []
+    for x in line[tab + 1..line.len].split(" "):
+      if x.len > 0: names.push(x + "")
+    s.syms[p] = names
+  return s
+
+fn name_set(names: [Str]) -> {Str: Bool}:
+  var m: {Str: Bool} = {}
+  for n in names: m[n + ""] = true
+  return m
+
+# ---- names
+
+fn path_base(p0: Str) -> Str:
+  if p0.len == 0: return "."
+  var p = p0 + ""
+  while p.len > 0 and p[p.len - 1] == '/': p = p[0..p.len - 1]
+  var j = p.len - 1
+  while j >= 0 and p[j] != '/': j -= 1
+  p = p[j + 1..p.len]
+  if p.len == 0: return "/"
+  return p
+
+fn path_dir(p: Str) -> Str:
+  var j = p.len - 1
+  while j >= 0 and p[j] != '/': j -= 1
+  var d = p[0..j + 1]
+  while d.len > 1 and d[d.len - 1] == '/': d = d[0..d.len - 1]
+  if d.len == 0: return "."
+  return d
+
+fn atoi_ok(s: Str) -> Bool:
+  var i = 0
+  if s.len > 0 and (s[0] == '+' or s[0] == '-'): i = 1
+  if i >= s.len or s.len - i > 19: return false
+  for k in i..s.len:
+    if s[k] < '0' or s[k] > '9': return false
+  return true
+
+fn not_identifier(r: Int) -> Bool:
+  if (r >= 97 and r <= 122) or (r >= 65 and r <= 90) or (r >= 48 and r <= 57) or r == 95: return false
+  if r < 128: return true
+  return not (doccmt.is_letter(r) or doccmt.is_digit(r))
+
+# ImportPathToAssumedName
+fn assumed_name(path: Str) -> Str:
+  var base = path_base(path)
+  if base.startswith("v") and atoi_ok(base[1..base.len]):
+    let dir = path_dir(path)
+    if dir != ".": base = path_base(dir)
+  if base.startswith("go-"): base = base[3..base.len]
+  var i = 0
+  while i < base.len:
+    var size = 0
+    let r = doccmt.rune_at(base, i, &size)
+    if not_identifier(r): return base[0..i]
+    i += size
+  return base
+
+# WithoutVersion
+fn without_version(nm: Str) -> Str:
+  let v = path_base(nm)
+  if v.len > 0 and v[0] == 'v' and atoi_ok(v[1..v.len]) and v.len < nm.len:
+    return path_base(nm[0..nm.len - v.len - 1])
+  return nm
+
+# importIdentifier: the name the import introduces
+fn ident(p: Pass, imp: Imp) -> Str:
+  if imp.name.len > 0: return imp.name + ""
+  if imp.path in p.known:
+    let n = p.known[imp.path].name
+    if n.len > 0: return without_version(n)
+  return assumed_name(imp.path)
+
+# importSpecName: the name to write in the import spec
+fn spec_name(p: Pass, imp: Imp) -> Str:
+  if not p.real or imp.name.len > 0: return imp.name + ""
+  let id = ident(p, imp)
+  if id == assumed_name(imp.path): return ""
+  return id
+
+# ---- the passes
+
+fn add_candidate(var p: Pass, imp: Imp, pi: PI):
+  p.cands.push(Imp(imp.name + "", imp.path + ""))
+  if imp.path in p.known:
+    if p.known[imp.path].name.len == 0: p.known[imp.path].name = pi.name + ""
+    for k in pi.ex: p.known[imp.path].ex[k + ""] = true
+  else:
+    var ex: {Str: Bool} = {}
+    for k in pi.ex: ex[k + ""] = true
+    p.known[imp.path + ""] = PI(pi.name + "", ex)
+
+# load: the file's existing imports by identifier and its missing references; done when nothing is
+# missing (then fix's answer). names: the real package names (loadPackageNames; the third pass).
+fn load(var p: Pass, fi: FInfo, others: [FInfo], names: {Str: Str}) -> R:
+  p.known = {}
+  p.missing = []
+  p.existing = {}
+  p.ekeys = []
+  var globals: {Str: Bool} = {}
+  for o in others:
+    if o.pkg == fi.pkg:
+      for gname in o.globals: globals[gname + ""] = true
+    for imp in o.imps: p.cands.push(Imp(imp.name + "", imp.path + ""))
+  if p.real:
+    var all: [Imp] = []
+    for imp in fi.imps: all.push(Imp(imp.name + "", imp.path + ""))
+    for imp in p.cands: all.push(Imp(imp.name + "", imp.path + ""))
+    for imp in all:
+      if imp.path in p.known: continue
+      if imp.path in names: p.known[imp.path + ""] = PI(names[imp.path] + "", {})
+  for imp in fi.imps:
+    let id = ident(p, imp)
+    if not (id in p.existing):
+      p.existing[id + ""] = []
+      p.ekeys.push(id + "")
+    p.existing[id].push(Imp(imp.name + "", imp.path + ""))
+  for left in fi.rkeys:
+    if left in globals: continue
+    if not (left in p.existing): p.missing.push(left + "")
+  if p.missing.len > 0: return R(false, [])
+  return fix(&p, fi)
+
+fn find_missing(p: Pass, pkg: Str, syms: {Str: Bool}, var out: Imp) -> Bool:
+  for c in p.cands:
+    if not (c.path in p.known): continue
+    if ident(p, c) != pkg: continue
+    var all = true
+    for s in syms:
+      if not (s in p.known[c.path].ex):
+        all = false
+        break
+    if all:
+      out = Imp(c.name + "", c.path + "")
+      return true
+  return false
+
+fn fix_less(a: Fix, b: Fix) -> Bool:
+  if a.path != b.path: return a.path < b.path
+  if a.name != b.name: return a.name < b.name
+  if a.ident != b.ident: return a.ident < b.ident
+  return a.kind < b.kind
+
+fn sort_fixes(var fs: [Fix]):
+  fs.sort(by: fn(a, b) => fix_less(a, b))
+
+# fix: the missing references satisfied from the candidates (all of them, unless it's the last try),
+# then the unused imports deleted and the names set
+fn fix(var p: Pass, fi: FInfo) -> R:
+  var selected: [Imp] = []
+  for left in p.missing:
+    var imp = Imp("", "")
+    if find_missing(p, left, fi.refs[left], &imp): selected.push(imp)
+  if not p.last_try and selected.len != p.missing.len: return R(false, [])
+  var fixes: [Fix] = []
+  for k in p.ekeys:
+    for imp in p.existing[k]:
+      let id = ident(p, imp)
+      if not (id in fi.refs):
+        fixes.push(Fix(DEL, imp.name + "", imp.path + "", id))
+        continue
+      let nm = spec_name(p, imp)
+      if nm != imp.name: fixes.push(Fix(SET, nm, imp.path + "", id))
+  sort_fixes(&fixes)
+  var sel: [Fix] = []
+  for imp in selected: sel.push(Fix(ADD, spec_name(p, imp), imp.path + "", ident(p, imp)))
+  sort_fixes(&sel)
+  for f in sel: fixes.push(Fix(f.kind, f.name + "", f.path + "", f.ident + ""))
+  return R(true, fixes)
+
+fn has_delete(fs: [Fix]) -> Bool:
+  for f in fs:
+    if f.kind == DEL: return true
+  return false
+
+# assumeSiblingImportsValid: each sibling's imports, with the exports its references use (all of a
+# standard library package's)
+fn assume_siblings(var p: Pass, others: [FInfo], std: Std):
+  for o in others:
+    var byn: {Str: Imp} = {}
+    for imp in o.imps: byn[ident(p, imp)] = Imp(imp.name + "", imp.path + "")
+    for left in o.rkeys:
+      if not (left in byn): continue
+      let imp = byn[left]
+      var rights: {Str: Bool} = {}
+      if imp.path in std.syms: rights = name_set(std.syms[imp.path])
+      else:
+        for k in o.refs[left]: rights[k + ""] = true
+      add_candidate(&p, imp, PI("", rights))
+
+# addStdlibCandidates (in path order where Go ranges over a map, so where two packages of one name
+# both have every symbol, as go/scanner and text/scanner can, Go's choice is random; rand's three in
+# its order)
+fn add_std(var p: Pass, fi: FInfo, std: Std, goroot: Str, srcdir: Str):
+  var lefts: [Str] = []
+  for x in p.missing: lefts.push(x + "")
+  for left in lefts:
+    if left == "rand":
+      std_one(&p, fi, std, goroot, srcdir, "crypto/rand")
+      std_one(&p, fi, std, goroot, srcdir, "math/rand/v2")
+      std_one(&p, fi, std, goroot, srcdir, "math/rand")
+      continue
+    for ip in std.paths:
+      if path_base(ip) == left: std_one(&p, fi, std, goroot, srcdir, ip)
+
+fn std_one(var p: Pass, fi: FInfo, std: Std, goroot: Str, srcdir: Str, pkg: Str):
+  if path_base(pkg) == fi.pkg and goroot + "/src/" + pkg == srcdir: return
+  var ex: {Str: Bool} = {}
+  if pkg in std.syms: ex = name_set(std.syms[pkg])
+  # (localbase: math/rand/v2 is named rand/v2, and importIdentifier drops the version)
+  var nm = path_base(pkg)
+  if nm.len > 1 and nm[0] == 'v' and atoi_ok(nm[1..nm.len]):
+    nm = path_base(path_dir(pkg)) + "/" + nm
+  add_candidate(&p, Imp("", pkg + ""), PI(nm, ex))
+
+# The first pass: the file alone
+fn pass1(fi: FInfo) -> R:
+  var p = new_pass(false)
+  return load(&p, fi, [], {})
+
+# The second: with the siblings, then the standard library
+fn pass2(fi: FInfo, others: [FInfo], std: Std, goroot: Str, srcdir: Str) -> R:
+  var p = new_pass(false)
+  let r2 = load(&p, fi, others, {})
+  if r2.done: return r2
+  assume_siblings(&p, others, std)
+  add_std(&p, fi, std, goroot, srcdir)
+  let r3 = fix(&p, fi)
+  if r3.done and not has_delete(r3.fixes): return r3
+  return R(false, [])
+
+# The third: real package names. Not done: p.missing is what the search outside must find, and
+# pass_last finishes.
+fn pass3(var p: Pass, fi: FInfo, others: [FInfo], names: {Str: Str}, std: Std, goroot: Str, srcdir: Str) -> R:
+  let r = load(&p, fi, others, names)
+  if r.done: return r
+  add_std(&p, fi, std, goroot, srcdir)
+  assume_siblings(&p, others, std)
+  return fix(&p, fi)
+
+# A package found outside the standard library for a missing reference (ResolveReferences' result,
+# or the module index's): its import path, package name and the symbols it was found with.
+type Ext:
+  path: Str
+  name: Str
+  ex: {Str: Bool}
+
+fn predeclared(n: Str) -> Bool:
+  for u in ["bool", "byte", "complex64", "complex128", "error", "float32", "float64", "int", "int8", "int16", "int32", "int64", "rune", "string", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr", "any", "comparable", "true", "false", "iota", "nil", "append", "cap", "clear", "close", "complex", "copy", "delete", "imag", "len", "make", "max", "min", "new", "panic", "print", "println", "real", "recover"]:
+    if n == u: return true
+  return false
+
+fn pass_last(var p: Pass, fi: FInfo, ext: [Ext]) -> [Fix]:
+  for e in ext:
+    # (types.Universe: a package named like a predeclared identifier isn't offered)
+    if predeclared(e.name): continue
+    var ex: {Str: Bool} = {}
+    for k in e.ex: ex[k + ""] = true
+    add_candidate(&p, Imp("", e.path + ""), PI(e.name + "", ex))
+  p.last_try = true
+  var r = fix(&p, fi)
+  var out: [Fix] = []
+  swap(&out, &r.fixes)
+  return out

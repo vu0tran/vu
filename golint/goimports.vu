@@ -6,25 +6,24 @@
 # between groups (addImportSpaces) and formats the result again as format.Source does (gofmt
 # without -s). A file that differs becomes issues as gofmt's do.
 #
-# fix.go for code that compiles (the packages golangci-lint lints): every import is used, so none
-# is removed and none added; an unnamed import whose package name isn't the name goimports assumes
-# from its path (ImportPathToAssumedName) leaves a reference missing in the first two passes, so the
-# third one loads the real names and gives each such import its name (SetImportName).
+# fix.go's passes (which imports to add, delete or name) are in gofix.vu, run by main.vu's
+# goimports_issues; apply_fixes here makes those changes to the tree as astutil does.
 
 import fparse
 import printer
 import gofmt
 import doccmt
 import pkg
+import gofix
 from fparse import FT, GENDECL, IMPORTSPEC, IDENT, npos, nend, llen, at
-from scan import K_IMPORT
+from scan import K_IMPORT, T_STRING
 
 # The file as goimports formats it; err set when it doesn't parse. names: the package name of each
 # import path (from the type checker), for fix.go's third pass.
-fn process(src: Str, local: Str, names: {Str: Str}, var err: Str) -> Str:
+fn process(src: Str, local: Str, fixes: [gofix.Fix], var err: Str) -> Str:
   var t = fparse.parse(src, &err)
   if err.len > 0: return ""
-  set_import_names(&t, names)
+  apply_fixes(&t, fixes)
   merge_imports(&t)
   sort_imports(&t, local)
   let breaks = spaces_before(t, local)
@@ -124,33 +123,204 @@ fn file_imports(t: FT) -> [Int]:
     for i in 0..llen(t, t.b[d]): out.push(at(t, t.b[d], i))
   return out
 
-# The third pass's SetImportName fixes, in sortFixes' order, applied.
-fn set_import_names(var t: FT, names: {Str: Str}):
-  if names.len == 0: return
-  let imps = file_imports(t)
-  var fix_path: [Str] = []
-  var fix_name: [Str] = []
-  for s in imps:
-    if t.b[s] >= 0: continue
-    let lit = t.s[t.c[s]]
-    if lit == "\"C\"": continue
-    let path = trim_quotes(lit)
-    if not (path in names) or names[path].len == 0: continue
-    let ident = without_version(names[path])
-    if ident == assumed_name(path): continue
-    var dup = false
-    for i in 0..fix_path.len:
-      if fix_path[i] == path and fix_name[i] == ident: dup = true
-    if dup: continue
-    fix_path.push(path)
-    fix_name.push(ident)
-  var ord: [Int] = []
-  for i in 0..fix_path.len: ord.push(i)
-  ord.sort(by: fn(a, b) => fix_path[a] < fix_path[b] or (fix_path[a] == fix_path[b] and fix_name[a] < fix_name[b]))
-  for i in ord:
-    for s in imps:
-      if trim_quotes(t.s[t.c[s]]) == fix_path[i]:
-        t.b[s] = fparse.ident_at(&t, npos(t, s), fix_name[i] + "")
+# ---- astutil (go/ast/astutil/imports.go): fix.go's apply
+
+fn apply_fixes(var t: FT, fixes: [gofix.Fix]):
+  for f in fixes:
+    if f.kind == gofix.DEL: delete_named_import(&t, f.name, f.path)
+    elif f.kind == gofix.ADD: add_named_import(&t, f.name, f.path)
+    else:
+      for s in file_imports(t):
+        if trim_quotes(t.s[t.c[s]]) == f.path: t.b[s] = fparse.ident_at(&t, npos(t, s), f.name + "")
+
+fn imp_name(t: FT, s: Int) -> Str:
+  if t.b[s] < 0: return ""
+  return t.s[t.b[s]] + ""
+
+fn is_import_decl(t: FT, d: Int) -> Bool:
+  return t.k[d] == GENDECL and t.tok[d] == K_IMPORT
+
+fn decl_imports(t: FT, d: Int, path: Str) -> Bool:
+  if not is_import_decl(t, d): return false
+  for i in 0..llen(t, t.b[d]):
+    if spec_path(t, at(t, t.b[d], i)) == path: return true
+  return false
+
+fn match_len(x: Str, y: Str) -> Int:
+  var n = 0
+  var i = 0
+  while i < x.len and i < y.len and x[i] == y[i]:
+    if x[i] == '/': n += 1
+    i += 1
+  return n
+
+fn quote_path(p: Str) -> Str:
+  var out = "\""
+  for i in 0..p.len:
+    if p[i] == '"' or p[i] == '\\': out = out + "\\"
+    out = out + p[i..i + 1]
+  return out + "\""
+
+fn del_at(var xs: [Int], i: Int):
+  var j = i
+  while j + 1 < xs.len:
+    xs[j] = xs[j + 1]
+    j += 1
+  xs.pop()
+
+fn ins_at(var xs: [Int], i: Int, x: Int):
+  xs.push(x)
+  var j = xs.len - 1
+  while j > i:
+    xs[j] = xs[j - 1]
+    j -= 1
+  xs[i] = x
+
+# token.File.MergeLine
+fn merge_line(var t: FT, line: Int):
+  if line < 1 or line >= t.lines.len: return
+  var nl: [Int] = []
+  for i in 0..t.lines.len:
+    if i != line: nl.push(t.lines[i])
+  t.lines = nl
+  t.lmap = []
+
+fn add_named_import(var t: FT, name: Str, path: Str):
+  for s in file_imports(t):
+    if imp_name(t, s) == name and spec_path(t, s) == path: return
+  let lit = fparse.node(&t, fparse.BASIC)
+  t.tok[lit] = T_STRING
+  t.s[lit] = quote_path(path)
+  let spec = fparse.node(&t, IMPORTSPEC)
+  t.c[spec] = lit
+  if name.len > 0: t.b[spec] = fparse.ident_at(&t, 0, name + "")
+  var best = -1
+  var last_import = -1
+  var imp_decl = -1
+  var imp_index = -1
+  let third = path.find(".") >= 0
+  let dl = t.c[t.root]
+  for i in 0..llen(t, dl):
+    let d = at(t, dl, i)
+    if not is_import_decl(t, d): continue
+    last_import = i
+    if decl_imports(t, d, "C"): continue
+    if llen(t, t.b[d]) == 0 and best == -1: imp_decl = d
+    var seen_third = false
+    for j in 0..llen(t, t.b[d]):
+      let p = spec_path(t, at(t, t.b[d], j))
+      let n = match_len(p, path)
+      if n > best or (best == 0 and not seen_third and third):
+        best = n
+        imp_decl = d
+        imp_index = j
+      seen_third = seen_third or p.find(".") >= 0
+  if imp_decl < 0:
+    imp_decl = fparse.node(&t, GENDECL)
+    t.tok[imp_decl] = K_IMPORT
+    t.b[imp_decl] = fparse.newlist(&t, [])
+    if last_import >= 0: t.p0[imp_decl] = nend(t, at(t, dl, last_import))
+    else:
+      t.p0[imp_decl] = t.p0[t.root]
+      let pkg_line = line_at(t, t.p0[t.root])
+      var tp = t.p0[t.root]
+      for c in t.comments:
+        if line_at(t, npos(t, c)) > pkg_line: break
+        tp = nend(t, c) + 2
+      t.p0[imp_decl] = tp
+    var nd: [Int] = []
+    for i in 0..llen(t, dl):
+      nd.push(at(t, dl, i))
+      if i == last_import: nd.push(imp_decl)
+    if last_import < 0: ins_at(&nd, 0, imp_decl)
+    t.ls[dl] = nd
+  if t.b[imp_decl] < 0: t.b[imp_decl] = fparse.newlist(&t, [])
+  let sl = t.b[imp_decl]
+  var insert_at = 0
+  if imp_index >= 0: insert_at = imp_index + 1
+  ins_at(&t.ls[sl], insert_at, spec)
+  var pos = npos(t, imp_decl)
+  if insert_at > 0:
+    let prev = at(t, sl, insert_at - 1)
+    if t.d[prev] >= 0: pos = nend(t, t.d[prev])
+    else: pos = npos(t, prev)
+  if t.b[spec] >= 0: t.p0[t.b[spec]] = pos
+  shift_lit(&t, lit, pos)
+  t.p0[spec] = pos
+  if llen(t, sl) == 1: t.p1[imp_decl] = 0
+  elif t.p1[imp_decl] <= 0: t.p1[imp_decl] = npos(t, at(t, sl, 0))
+  if llen(t, dl) <= 1: return
+  var first = -1
+  var i = 0
+  while i < t.ls[dl].len:
+    let d = t.ls[dl][i]
+    if not is_import_decl(t, d) or decl_imports(t, d, "C"):
+      i += 1
+      continue
+    if first < 0:
+      first = d
+      i += 1
+      continue
+    t.p1[first] = npos(t, first)
+    var moved: [Int] = []
+    for q in 0..llen(t, t.b[d]): moved.push(at(t, t.b[d], q))
+    if t.b[first] < 0: t.b[first] = fparse.newlist(&t, [])
+    let fl = t.b[first]
+    for s in moved:
+      shift_lit(&t, t.c[s], npos(t, first))
+      t.ls[fl].push(s)
+    del_at(&t.ls[dl], i)
+
+fn delete_named_import(var t: FT, name: Str, path: Str):
+  var delc: {Int: Bool} = {}
+  let dl = t.c[t.root]
+  var i = 0
+  while i < t.ls[dl].len:
+    let d = t.ls[dl][i]
+    if not is_import_decl(t, d) or t.b[d] < 0:
+      i += 1
+      continue
+    let sl = t.b[d]
+    var gone = false
+    var j = 0
+    while j < t.ls[sl].len:
+      let s = t.ls[sl][j]
+      if imp_name(t, s) != name or spec_path(t, s) != path:
+        j += 1
+        continue
+      del_at(&t.ls[sl], j)
+      if t.ls[sl].len == 0:
+        del_at(&t.ls[dl], i)
+        gone = true
+        break
+      elif t.ls[sl].len == 1:
+        if t.a[s] >= 0: delc[t.a[s]] = true
+        if t.d[s] >= 0: delc[t.d[s]] = true
+        for cg in t.comments:
+          if nend(t, cg) < npos(t, s) and line_at(t, nend(t, cg)) == line_at(t, npos(t, s)):
+            delc[cg] = true
+            break
+        let sp = t.ls[sl][0]
+        if t.a[sp] >= 0:
+          while line_at(t, t.p0[d]) + 1 < line_at(t, npos(t, t.a[sp])): merge_line(&t, line_at(t, t.p0[d]))
+        var same = false
+        for cg in t.comments:
+          if nend(t, cg) < npos(t, sp) and line_at(t, nend(t, cg)) == line_at(t, npos(t, sp)):
+            same = true
+            break
+        if same:
+          while line_at(t, t.p0[d]) + 1 < line_at(t, npos(t, sp)): merge_line(&t, line_at(t, t.p0[d]))
+      if j > 0:
+        let lastsp = t.ls[sl][j - 1]
+        let last_line = line_at(t, t.p0[t.c[lastsp]])
+        let line = line_at(t, t.p0[t.c[s]])
+        if not (line - last_line > 1 or t.p2[d] <= 0) and line != t.lines.len: merge_line(&t, line)
+    if not gone: i += 1
+  if delc.len == 0: return
+  var keep: [Int] = []
+  for c in t.comments:
+    if not (c in delc): keep.push(c)
+  t.comments = keep
 
 # ---- sortimports.go
 
@@ -617,9 +787,9 @@ fn reverse_range(var xs: [Int], a: Int, b: Int):
 
 # ---- golangci-lint's issues (as gofmt's: one per change of the diff)
 
-fn file_issues(src: Str, fi: Int, local: Str, names: {Str: Str}, var out: [pkg.Issue]) -> Str:
+fn file_issues(src: Str, fi: Int, local: Str, fixes: [gofix.Fix], var out: [pkg.Issue]) -> Str:
   var err = ""
-  let res = process(src, local, names, &err)
+  let res = process(src, local, fixes, &err)
   if err.len > 0: return err
   if res == src: return ""
   let chs = gofmt.changes_of(gofmt.diff(src, res))

@@ -13,6 +13,7 @@ this file says where things are. Keep it current when you move things.
 | file | what |
 |---|---|
 | `main.vu` | the CLI, `run`/`linters`/`config`/`cache` commands, workers, the per-package result cache (`spec_keys`: a package's key covers its sources and the lib hashes of its in-module imports; entries `p<key>` in the `vgolint3` format with a counts line) |
+| `gofmt.vu`, `goimports.vu`, `gofix.vu`, `gores.vu`, `stdsyms.vu` | the formatters: gofmt; goimports' sorting and printing, fix.go's passes, its search outside the folder, x/tools' standard library table |
 | `cfg.vu`, `doc.vu`, `rx.vu` | golangci-lint's config file (YAML/TOML/JSON into one tree), Go regexps |
 | `load.vu`, `pkg.vu` | finding packages as `go list ./...` does; a package's files and issues |
 | `scan.vu`, `parse.vu`, `ast.vu`, `resolve.vu` | the Go scanner, parser, flat tree, go/parser's object resolution |
@@ -67,13 +68,25 @@ settings.
 
 ## goimports
 
-- `vgolint imp-debug [-l PREFIXES] [-d] FILE` prints a file as goimports formats it (without the
-  package names of fix.go's third pass, which come from the type checker in `run`).
-- fix.go on code that compiles: every import is used and no reference is missing once the real
-  package names are loaded, so nothing is added or removed; only the third pass's SetImportName
-  can apply (an unnamed import whose package name differs from ImportPathToAssumedName's guess).
-  Not ported: removing unused imports, adding missing ones (stdlib and module candidates), cgo's
-  "C" decls are kept apart as mergeImports does but not tested (vgolint skips cgo packages).
+- `vgolint imp-debug [-l PREFIXES] [-d] FILE` prints a file as goimports formats it, without
+  fix.go (no imports added, removed or named; `run` does those).
+- fix.go (`gofix.vu`): `analyze` reads a file's references (selectors on identifiers go/parser
+  doesn't resolve), imports and package variables; `pass1`, `pass2` (siblings, then the standard
+  library table in `stdsyms.vu`, from `tools/gen_stdsyms.py`), `pass3` (real names from the type
+  checker), `pass_last` (with what `gores.resolve` found). main.vu's `goimports_issues` runs them and
+  `siblings` parses the folder's other files (once a folder); goimports.vu's `apply_fixes` makes the
+  changes as astutil's AddNamedImport/DeleteNamedImport do (`merge_line` is token.File.MergeLine).
+- `gores.vu`: the module resolver's search. Roots: GOROOT/src, the main module, replaced
+  dependencies outside the module cache, the module cache (or the vendor folder); the folder list
+  is walked once a run (`tc.Prog.gwalk`, a memo every worker shares). A module cache folder of a
+  module in go.mod's requirements is that module's folder (findPackage); candidates sort by
+  distance, then import path length. The dependencies' own roots give nothing in mod.go (their
+  scans fail and are stored under no folder), so they're found through the cache's walk.
+- Comparing: `tools/fix_mangle.py SEED FRACTION FILES` deletes and adds imports (`FIXPOOL=std`:
+  only standard library ones, so no package becomes unloadable, which golangci-lint reports alone;
+  `GOFMT` names a gofmt that drops changes that don't parse). Give golangci-lint an empty
+  `GOLANGCI_LINT_CACHE` each run: its cache doesn't cover the sibling files goimports reads.
+- "C" decls are kept apart as mergeImports does; files importing "C" are skipped (vgolint skips cgo).
 - The comparison: `tools/imp_mangle.py SEED FRACTION FILES` rewrites import blocks in place
   (shuffled, regrouped, split into several declarations, comments, duplicate blank imports,
   aliases, empty blocks); `tools/imp_unalias.py NAMES FILES` drops aliases that equal a package

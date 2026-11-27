@@ -1,0 +1,472 @@
+# goimports' search outside the file's folder, for the references the standard library and the
+# siblings' imports didn't satisfy (fix.go's addExternalCandidates: ProcessEnvSource.ResolveReferences
+# with mod.go's ModuleResolver, golang.org/x/tools v0.50.0). Every package folder of GOROOT/src, the
+# main module and the whole module cache (or the vendor folder in vendor mode) is a candidate when
+# its import path could name the reference (matchesPath) and its package has the reference's name;
+# a module cache folder of a module in the build list counts as that module's folder (findPackage).
+# The candidates are tried nearest first (folders between them), then by shorter import path, and
+# the first whose exports have every symbol the file uses wins.
+#
+# As in mod.go: the dependencies' own roots give nothing (their folders' scans fail and are stored
+# under no folder), so they're found in the module cache's walk; the build list is go.mod's
+# requirements (go list -m's, without the modules only their go.mod files add).
+
+import ast
+import scan
+import pkg
+import load
+import gofix
+
+const R_GOROOT = 1
+const R_MAIN = 3
+const R_CACHE = 4
+const R_OTHER = 5
+
+type Mod:
+  path: Str
+  dir: Str
+
+type Cand:
+  ipath: Str
+  dir: Str
+  dist: Int
+
+# The walk's answer, once for the run (tc.Prog.gwalk): each package folder found, its root's type,
+# folder and import path as found
+type Walk:
+  rtype: [Int]
+  rdir: [Str]
+  rpath: [Str]
+
+type Env:
+  goroot: Str
+  modcache: Str
+  mods: [Mod]          # the main module first, then the build list
+  vendor: Bool
+  tags: [Str]
+  walked: Bool
+  rtype: [Int]
+  rdir: [Str]
+  rpath: [Str]
+  names: {Str: Str}    # packageDirToName, by folder ("\n": none)
+  modinfo: {Str: Str}  # modInfo, by folder: "DIR\nNAME"
+
+fn new_env(goroot: Str, modcache: Str, mod_path: Str, mod_dir: Str, req_mods: [Str], req_dirs: [Str], vendor: Bool, tags: [Str]) -> Env:
+  var e = Env(goroot + "", modcache + "", [], vendor, [], false, [], [], [], {}, {})
+  for t in tags: e.tags.push(t + "")
+  if mod_path.len > 0: e.mods.push(Mod(mod_path + "", mod_dir + ""))
+  if not vendor:
+    for i in 0..req_mods.len: e.mods.push(Mod(req_mods[i] + "", req_dirs[i] + ""))
+  return e
+
+# ---- paths
+
+fn has_prefix(s: Str, p: Str) -> Bool:
+  return s.len >= p.len and s[0..p.len] == p
+
+fn parts(p: Str) -> [Str]:
+  var out: [Str] = []
+  for x in p.split("/"):
+    if x.len > 0: out.push(x + "")
+  return out
+
+# distance: how many folders filepath.Rel(base, target) has (0 for the same folder)
+fn distance(base: Str, target: Str) -> Int:
+  let a = parts(base)
+  let b = parts(target)
+  var i = 0
+  while i < a.len and i < b.len and a[i] == b[i]: i += 1
+  return (a.len - i) + (b.len - i)
+
+# filepath.Rel(base, target) for absolute clean paths
+fn rel(base: Str, target: Str) -> Str:
+  let a = parts(base)
+  let b = parts(target)
+  var i = 0
+  while i < a.len and i < b.len and a[i] == b[i]: i += 1
+  var out: [Str] = []
+  for _ in i..a.len: out.push("..")
+  for k in i..b.len: out.push(b[k] + "")
+  if out.len == 0: return "."
+  return "/".join(out)
+
+# CanUse: the internal and vendor rules, from the file's own path
+fn can_use(file: Str, dir: Str) -> Bool:
+  if dir.find("vendor") < 0 and dir.find("internal") < 0: return true
+  if dir.find("/vendor/") < 0 and dir.find("/internal/") < 0 and not dir.endswith("/internal"): return true
+  var r = rel(file, dir)
+  var i = r.len - 3
+  var at = -1
+  while i >= 0:
+    if r[i..i + 3] == "../":
+      at = i
+      break
+    i -= 1
+  if at >= 0: r = r[at + 3..r.len]
+  return r.find("/vendor/") < 0 and r.find("/internal/") < 0 and not r.endswith("/internal")
+
+fn lower(b: Byte) -> Byte:
+  if b >= 'A' and b <= 'Z': return b + 32
+  return b
+
+fn match_seg(ident: Str, path: Str, start: Int, end: Int) -> Bool:
+  var ii = ident.len - 1
+  var pi = end - 1
+  while pi >= start and ii >= 0:
+    let pb = path[pi]
+    if pb == '-' or pb == '.':
+      pi -= 1
+      continue
+    if lower(pb) != lower(ident[ii]): return false
+    ii -= 1
+    pi -= 1
+  return ii < 0 and pi < start
+
+# matchesPath: ident is the last segment of path or a dot- or dash-separated part of it, ignoring
+# case, dots and dashes, in the last two segments
+fn matches_path(ident: Str, path: Str) -> Bool:
+  var seg_end = path.len
+  var sub_end = path.len
+  var nslash = 0
+  var i = path.len - 1
+  while i >= 0:
+    let b = path[i]
+    if b == '/' or b == '\\':
+      if match_seg(ident, path, i + 1, seg_end) or match_seg(ident, path, i + 1, sub_end): return true
+      nslash += 1
+      if nslash == 2: return false
+      seg_end = i
+      sub_end = i
+    elif b == '-' or b == '.':
+      if match_seg(ident, path, i + 1, sub_end): return true
+      sub_end = i
+    i -= 1
+  return match_seg(ident, path, 0, seg_end) or match_seg(ident, path, 0, sub_end)
+
+# module.UnescapePath: "!x" is "X"; "" when invalid
+fn unescape(p: Str) -> Str:
+  var out = ""
+  var bang = false
+  for i in 0..p.len:
+    let c = p[i]
+    if bang:
+      if c < 'a' or c > 'z': return ""
+      out = out + p[i..i + 1].upper()
+      bang = false
+    elif c == '!': bang = true
+    elif c >= 'A' and c <= 'Z': return ""
+    else: out = out + p[i..i + 1]
+  if bang: return ""
+  return out
+
+fn join(a: Str, b: Str) -> Str:
+  var bb = b + ""
+  while bb.startswith("/"): bb = bb[1..bb.len]
+  if bb.len == 0: return a + ""
+  if a.len == 0: return bb
+  return a + "/" + bb
+
+# ---- the walk (gopathwalk with the module resolver's roots)
+
+fn walk_root(fs: Fs, var e: Env, root: Str, rtype: Int, ignored: Str):
+  if not fs.exists(root): return
+  var found: [Str] = []
+  walk_dir(fs, root, rtype, root, ignored, &found)
+  for d in found:
+    var sub = ""
+    if has_prefix(d, root + "/"): sub = d[root.len + 1..d.len]
+    if sub.startswith("vendor/"): continue
+    var ip = sub + ""
+    if rtype == R_MAIN: ip = join(e.mods[0].path, sub)
+    elif rtype == R_CACHE:
+      # (.*)@([^/\\]*)(.*): the last @ and the version up to the next slash
+      var atpos = -1
+      var k = sub.len - 1
+      while k >= 0:
+        if sub[k] == '@':
+          atpos = k
+          break
+        k -= 1
+      if atpos < 0: continue
+      var vend = atpos + 1
+      while vend < sub.len and sub[vend] != '/' and sub[vend] != '\\': vend += 1
+      let mp = unescape(sub[0..atpos])
+      if mp.len == 0: continue
+      ip = join(mp, sub[vend..sub.len])
+    e.rtype.push(rtype)
+    e.rdir.push(d + "")
+    e.rpath.push(ip)
+
+fn walk_dir(fs: Fs, root: Str, rtype: Int, path: Str, ignored: Str, var out: [Str]):
+  let base = gofix.path_base(path)
+  if base.len == 0 or base[0] == '.' or base[0] == '_' or base == "testdata": return
+  if rtype == R_GOROOT and base == "vendor": return
+  if ignored.len > 0 and path == ignored: return
+  let names = fs.list(path) else []
+  var has_go = false
+  for nm in names:
+    if nm.endswith("/"): walk_dir(fs, root, rtype, path + "/" + nm[0..nm.len - 1], ignored, &out)
+    elif nm.endswith(".go"): has_go = true
+  if has_go and not (path == root and rtype == R_GOROOT): out.push(path + "")
+
+# The walk through the run's memo (every package's goimports shares one)
+fn walk_shared(fs: Fs, var e: Env, m: Memo[Str, Walk]):
+  if e.walked: return
+  let key = e.goroot + "\n" + e.modcache + "\n{e.vendor}\n" + "\n".join(mod_dirs(e))
+  let gr = e.goroot + ""
+  let mc = e.modcache + ""
+  var mods: [Mod] = []
+  for x in e.mods: mods.push(Mod(x.path + "", x.dir + ""))
+  let vendor = e.vendor
+  let w = m.get(key, fn(k) => walk_new(fs, gr, mc, mods, vendor))
+  e.walked = true
+  for x in w.value.rtype: e.rtype.push(x)
+  for x in w.value.rdir: e.rdir.push(x + "")
+  for x in w.value.rpath: e.rpath.push(x + "")
+
+fn mod_dirs(e: Env) -> [Str]:
+  var out: [Str] = []
+  for x in e.mods: out.push(x.path + " " + x.dir)
+  return out
+
+fn walk_new(fs: Fs, goroot: Str, modcache: Str, mods: [Mod], vendor: Bool) -> Walk:
+  var e = Env(goroot + "", modcache + "", [], vendor, [], false, [], [], [], {}, {})
+  for x in mods: e.mods.push(Mod(x.path + "", x.dir + ""))
+  walk(fs, &e)
+  var w = Walk([], [], [])
+  swap(&w.rtype, &e.rtype)
+  swap(&w.rdir, &e.rdir)
+  swap(&w.rpath, &e.rpath)
+  return w
+
+fn walk(fs: Fs, var e: Env):
+  if e.walked: return
+  e.walked = true
+  let gr = e.goroot + ""
+  let mc = e.modcache + ""
+  var mdir = ""
+  if e.mods.len > 0: mdir = e.mods[0].dir + ""
+  if gr.len > 0: walk_root(fs, &e, gr + "/src", R_GOROOT, "")
+  if mdir.len > 0: walk_root(fs, &e, mdir, R_MAIN, "")
+  if e.vendor:
+    if mdir.len > 0: walk_root(fs, &e, mdir + "/vendor", R_OTHER, "")
+    return
+  # (replaced dependencies outside the module cache are roots of their own)
+  var others: [Str] = []
+  for i in 1..e.mods.len:
+    let d = e.mods[i].dir
+    if d.len > 0 and not (mc.len > 0 and has_prefix(d, mc)): others.push(d + "")
+  for d in others: walk_root(fs, &e, d, R_OTHER, "")
+  if mc.len > 0: walk_root(fs, &e, mc, R_CACHE, mc + "/cache")
+
+# ---- modules
+
+# modInfo: the folder of the nearest go.mod at or above dir, and its module path
+fn mod_info(fs: Fs, var e: Env, dir: Str, var name: Str) -> Str:
+  var d = dir + ""
+  while true:
+    if d in e.modinfo:
+      let v = e.modinfo[d]
+      let nl = v.find("\n")
+      name = v[nl + 1..v.len]
+      return v[0..nl]
+    let gm = fs.read(d + "/go.mod") else ""
+    if gm.len > 0 or fs.exists(d + "/go.mod"):
+      name = module_line(gm)
+      e.modinfo[d + ""] = d + "\n" + name
+      return d
+    let up = gofix.path_dir(d)
+    if up.len >= d.len or up == d:
+      name = ""
+      return ""
+    d = up
+  return ""
+
+fn module_line(gm: Str) -> Str:
+  for line0 in gm.split("\n"):
+    var line = line0 + ""
+    let c = line.find("//")
+    if c >= 0: line = line[0..c]
+    line = line.strip()
+    if not line.startswith("module"): continue
+    var rest = line[6..line.len].strip()
+    if rest.len >= 2 and (rest[0] == '"' or rest[0] == '`'): rest = rest[1..rest.len - 1]
+    return rest
+  return ""
+
+fn nested(fs: Fs, var e: Env, dir: Str, m: Mod) -> Bool:
+  if not has_prefix(dir, m.dir): return false
+  if e.modcache.len > 0 and has_prefix(dir, e.modcache): return false
+  var nm = ""
+  let md = mod_info(fs, &e, dir, &nm)
+  if md.len == 0: return false
+  return md != m.dir
+
+fn slashes(s: Str) -> Int:
+  var n = 0
+  for i in 0..s.len:
+    if s[i] == '/': n += 1
+  return n
+
+# findModuleByDir (modsByDir: deepest folder first)
+fn module_by_dir(fs: Fs, var e: Env, dir: Str) -> Int:
+  var order: [Int] = []
+  for i in 0..e.mods.len:
+    if e.mods[i].dir.len > 0: order.push(i)
+  order.sort(by: fn(a, b) => slashes(e.mods[a].dir) > slashes(e.mods[b].dir))
+  for i in order:
+    let m = Mod(e.mods[i].path + "", e.mods[i].dir + "")
+    if not has_prefix(dir, m.dir): continue
+    if nested(fs, &e, dir, m): continue
+    return i
+  return -1
+
+fn buildable(fs: Fs, e: Env, dir: Str) -> Bool:
+  let names = fs.list(dir) else []
+  for nm in names:
+    if nm.endswith("/") or not nm.endswith(".go"): continue
+    if not load.good_name(nm, e.tags): continue
+    let src = fs.read(dir + "/" + nm) else continue
+    if load.good_constraints(src, e.tags): return true
+  return false
+
+# findPackage's folder for an import path ("" none): the build list's module with the longest path
+fn package_dir(fs: Fs, var e: Env, ip: Str) -> Str:
+  var order: [Int] = []
+  for i in 0..e.mods.len: order.push(i)
+  order.sort(by: fn(a, b) => slashes(e.mods[a].path) > slashes(e.mods[b].path))
+  for i in order:
+    let m = Mod(e.mods[i].path + "", e.mods[i].dir + "")
+    if m.dir.len == 0 or not has_prefix(ip, m.path): continue
+    let pd = m.dir + ip[m.path.len..ip.len]
+    if nested(fs, &e, pd, m): continue
+    if buildable(fs, e, pd): return pd
+  return ""
+
+# packageDirToName: the first non-test file's package clause, but documentation and main
+fn dir_name(fs: Fs, var e: Env, dir: Str) -> Str:
+  if dir in e.names: return e.names[dir] + ""
+  var out = ""
+  let names = fs.list(dir) else []
+  var kw = scan.keywords()
+  for nm in names:
+    if nm.endswith("/") or not nm.endswith(".go") or nm.endswith("_test.go"): continue
+    let src = fs.read(dir + "/" + nm) else continue
+    let pn = package_clause(src, &kw)
+    if pn.len == 0 or pn == "documentation" or pn == "main": continue
+    out = pn
+    break
+  e.names[dir + ""] = out + ""
+  return out
+
+fn package_clause(src: Str, var kw: {Str: Int}) -> Str:
+  var k2: {Str: Int} = {}
+  swap(&k2, &kw)
+  var scn = scan.scanner(src + "", k2)
+  scan.next(&scn)
+  var name = ""
+  if scn.tok == scan.K_PACKAGE:
+    scan.next(&scn)
+    if scn.tok == scan.T_IDENT: name = scn.src[scn.ts..scn.te]
+  swap(&scn.kw, &kw)
+  return name
+
+# loadExportsFromFiles: the package-level exported names of the folder's buildable files
+fn exports(fs: Fs, e: Env, dir: Str, tests: Bool) -> {Str: Bool}:
+  var out: {Str: Bool} = {}
+  let names = fs.list(dir) else []
+  var kw = scan.keywords()
+  for nm in names:
+    if nm.endswith("/") or not nm.endswith(".go"): continue
+    if not tests and nm.endswith("_test.go"): continue
+    if not load.good_name(nm, e.tags): continue
+    let src = fs.read(dir + "/" + nm) else continue
+    if not load.good_constraints(src, e.tags): continue
+    var sp = pkg.new_pkg(dir)
+    if not pkg.add_file(&sp, dir + "/" + nm, src, &kw): continue
+    let t = sp.t
+    let root = sp.roots[0]
+    let pn = t.names[t.s[t.a[root]]]
+    if pn == "documentation": continue
+    if tests and pn.endswith("_test"): continue
+    if t.c[root] <= 0: continue
+    for d in ast.items(t, t.c[root]):
+      if t.k[d] == ast.N_FUNCDECL:
+        if t.a[d] > 0 or t.b[d] <= 0: continue
+        let n = t.names[t.s[t.b[d]]]
+        if gofix.exported(n): out[n + ""] = true
+      elif t.k[d] == ast.N_GENDECL and t.a[d] > 0:
+        for sp2 in ast.items(t, t.a[d]):
+          if t.k[sp2] == ast.N_VALUESPEC and t.a[sp2] > 0:
+            for id in ast.items(t, t.a[sp2]):
+              let n = t.names[t.s[id]]
+              if gofix.exported(n): out[n + ""] = true
+          elif t.k[sp2] == ast.N_TYPESPEC and t.a[sp2] > 0:
+            let n = t.names[t.s[t.a[sp2]]]
+            if gofix.exported(n): out[n + ""] = true
+  return out
+
+# ---- ResolveReferences
+
+fn any_match(lefts: [Str], ip: Str) -> Bool:
+  for l in lefts:
+    if matches_path(l, ip): return true
+  return false
+
+fn cand_less(a: Cand, b: Cand) -> Bool:
+  if a.dist != b.dist: return a.dist < b.dist
+  if a.ipath.len != b.ipath.len: return a.ipath.len < b.ipath.len
+  return a.ipath < b.ipath
+
+fn resolve(fs: Fs, var e: Env, m: Memo[Str, Walk], file: Str, srcdir: Str, file_pkg: Str, lefts: [Str], refs: {Str: {Str: Bool}}) -> [gofix.Ext]:
+  var out: [gofix.Ext] = []
+  if lefts.len == 0: return out
+  walk_shared(fs, &e, m)
+  var found: {Str: [Cand]} = {}
+  for i in 0..e.rdir.len:
+    let dir = e.rdir[i] + ""
+    var ip = e.rpath[i] + ""
+    var cdir = dir + ""
+    # (the import path as found is the canonical one but outside the module cache and the main
+    # module: matched first, as the folders are many)
+    if e.rtype[i] != R_OTHER and not any_match(lefts, ip): continue
+    if e.rtype[i] != R_GOROOT:
+      let mi = module_by_dir(fs, &e, dir)
+      if mi >= 0:
+        let md = e.mods[mi].dir + ""
+        if md == dir: ip = e.mods[mi].path + ""
+        else: ip = join(e.mods[mi].path, dir[md.len + 1..dir.len])
+      else:
+        var mname = ""
+        let _ = mod_info(fs, &e, dir, &mname)
+        if not has_prefix(ip, mname): continue
+    if not any_match(lefts, ip): continue
+    if e.rtype[i] != R_GOROOT:
+      let pd = package_dir(fs, &e, ip)
+      if pd.len > 0: cdir = pd
+      if not can_use(file, cdir): continue
+    let name = dir_name(fs, &e, dir)
+    if name.len == 0 or not (name in refs): continue
+    if cdir == srcdir and file_pkg == name: continue
+    if not can_use(file, cdir): continue
+    if not (name in found): found[name + ""] = []
+    found[name].push(Cand(ip, cdir, distance(srcdir, cdir)))
+  let xtest = file_pkg.endswith("_test")
+  for l in lefts:
+    if not (l in found): continue
+    var cs: [Cand] = []
+    for c in found[l]: cs.push(Cand(c.ipath + "", c.dir + "", c.dist))
+    cs.sort(by: fn(a, b) => cand_less(a, b))
+    for c in cs:
+      let ex = exports(fs, e, c.dir, xtest and c.dir == srcdir)
+      var all = true
+      for s in refs[l]:
+        if not (s in ex):
+          all = false
+          break
+      if all:
+        var syms: {Str: Bool} = {}
+        for s in refs[l]: syms[s + ""] = true
+        out.push(gofix.Ext(c.ipath + "", l + "", syms))
+        break
+  return out

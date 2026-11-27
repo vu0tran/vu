@@ -40,6 +40,8 @@ import lints
 import rx
 import gofmt
 import goimports
+import gofix
+import gores
 
 extern "sys_glue.c":
   fn gl_getcwd(ffi: Ffi) -> Str
@@ -281,29 +283,84 @@ fn imports_c(t: ast.Ast, root: Int) -> Bool:
     if pn > 0 and t.names[t.s[pn]] == "\"C\"": return true
   return false
 
-# goimports' issues for the package's files, with the package names of their unnamed imports as
-# the type checker found them (fix.go's third pass)
+# goimports' issues for the package's files: fix.go's passes (gofix.vu) on each, the second with
+# the folder's other files, the third with the real package names (the type checker's), then the
+# search outside the standard library; and the file formatted with the fixes made
 fn goimports_issues(c: cfg.Cfg, var g: tc.Prog, fs: Fs, pi: Int, p: pkg.Pkg, var issues: [pkg.Issue]):
   let gs = cfg.lsettings(c, "goimports")
   let local = ",".join(doc.strs_of(c.d, doc.get(c.d, gs, "local-prefixes")))
   let std = g.pk[pi].std
+  var stab = gofix.Std([], {})
+  var sibs: {Str: [gofix.FInfo]} = {}
+  var genv = gores.new_env("", "", "", "", [], [], false, [])
+  var res = resolve.new_res(0)
+  var have_res = false
+  var have_env = false
   for fi in 0..p.paths.len:
     if c.gen_mode == "strict" and p.strict_gen[fi]: continue
     if c.gen_mode == "lax" and (p.strict_gen[fi] or p.lax_gen[fi]): continue
     if imports_c(g.pk[pi].t, g.pk[pi].roots[fi]): continue
-    var names: {Str: Str} = {}
-    if fi < g.pk[pi].imps.len:
-      var imps: [Int] = []
-      for x in g.pk[pi].imps[fi]: imps.push(x)
-      for im in imps:
-        let pnode = g.pk[pi].t.b[im]
-        if pnode <= 0 or g.pk[pi].t.a[im] > 0: continue
-        let lit = g.pk[pi].t.names[g.pk[pi].t.s[pnode]] + ""
-        if lit.len < 2: continue
-        let path = lit[1..lit.len - 1]
-        let q = tc.load_pkg(&g, fs, path, std)
-        if q >= 0: names[path] = g.pk[q].name + ""
-    goimports.file_issues(p.srcs[fi], fi, local, names, &issues)
+    if not have_res:
+      res = resolve.new_res(g.pk[pi].t.k.len)
+      have_res = true
+    resolve.resolve_file(g.pk[pi].t, &res, g.pk[pi].roots[fi])
+    let info = gofix.analyze(g.pk[pi].t, g.pk[pi].roots[fi], true, res)
+    var r = gofix.pass1(info)
+    if not r.done:
+      if stab.paths.len == 0: stab = gofix.load_std()
+      let file = cfg.abs_path(c.cwd, p.paths[fi])
+      let srcdir = gofix.path_dir(file)
+      let test = file.endswith("_test.go")
+      let key = srcdir + "\n{test}"
+      if not (key in sibs): sibs[key] = siblings(fs, srcdir, test)
+      let self = gofix.path_base(file)
+      var others: [gofix.FInfo] = []
+      for o in sibs[key]:
+        if o.file != self: others.push(gofix.copy_info(o))
+      r = gofix.pass2(info, others, stab, g.goroot, srcdir)
+      if not r.done:
+        var names: {Str: Str} = {}
+        var paths: [Str] = []
+        for imp in info.imps: paths.push(imp.path + "")
+        for o in others:
+          for imp in o.imps: paths.push(imp.path + "")
+        for path in paths:
+          if path in names: continue
+          let q = tc.load_pkg(&g, fs, path, std)
+          if q >= 0 and g.pk[q].name.len > 0: names[path] = g.pk[q].name + ""
+        var ps = gofix.new_pass(true)
+        r = gofix.pass3(&ps, info, others, names, stab, g.goroot, srcdir)
+        if not r.done:
+          if not have_env:
+            # (absolute folders: the walk's paths are compared with the file's)
+            var mdir = ""
+            if g.mod_dir.len > 0: mdir = cfg.abs_path(c.cwd, g.mod_dir)
+            let vendor = mdir.len > 0 and fs.exists(mdir + "/vendor/modules.txt")
+            var rdirs: [Str] = []
+            for d in g.req_dirs: rdirs.push(cfg.abs_path(c.cwd, d))
+            genv = gores.new_env(cfg.abs_path(c.cwd, g.goroot), cfg.abs_path(c.cwd, g.modcache), g.mod_path, mdir, g.req_mods, rdirs, vendor, g.tags)
+            have_env = true
+          let ext = gores.resolve(fs, &genv, g.gwalk, file, srcdir, info.pkg, ps.missing, info.refs)
+          r = gofix.R(true, gofix.pass_last(&ps, info, ext))
+    goimports.file_issues(p.srcs[fi], fi, local, r.fixes, &issues)
+
+# parseOtherFiles: the folder's .go files (tests only beside a test), each that parses (the file
+# being fixed is left out by the caller)
+fn siblings(fs: Fs, dir: Str, tests: Bool) -> [gofix.FInfo]:
+  var out: [gofix.FInfo] = []
+  var names = fs.list(dir) else []
+  names.sort()
+  var kw = scan.keywords()
+  for nm in names:
+    if not nm.endswith(".go"): continue
+    if not tests and nm.endswith("_test.go"): continue
+    let src = fs.read(dir + "/" + nm) else continue
+    var sp = pkg.new_pkg(dir)
+    if not pkg.add_file(&sp, dir + "/" + nm, src, &kw): continue
+    var fi = gofix.analyze(sp.t, sp.roots[0], false, resolve.new_res(0))
+    fi.file = nm + ""
+    out.push(fi)
+  return out
 
 fn imp_debug(argv: [Str], fs: Fs):
   var local = ""
@@ -319,7 +376,7 @@ fn imp_debug(argv: [Str], fs: Fs):
   let file = argv[argv.len - 1]
   let src = fs.read(file) else ""
   var err = ""
-  let out = goimports.process(src, local, {}, &err)
+  let out = goimports.process(src, local, [], &err)
   if err.len > 0:
     eprint(file + ": " + err)
     exit(2)
@@ -360,13 +417,14 @@ fn rank_of(is: pkg.Issue) -> Int:
     if names[i] == is.linter: return 10000000 + i * 100000 + local
   return 90000000 + local
 
-fn worker(fs: Fs, os: Os, tm: Bool, own msrc: Shared[{Str: Str}], own dsrc: Memo[Str, tc.DepPkg], own dast: Memo[Str, tc.DepFile], own rxc: Memo[Str, rx.Rx], own specs: Shared[[Spec]], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: [Chan[Int]], own res: Chan[Res], own modroot: Str, own goroot: Str, own modcache: Str, gover: Int):
+fn worker(fs: Fs, os: Os, tm: Bool, own msrc: Shared[{Str: Str}], own dsrc: Memo[Str, tc.DepPkg], own dast: Memo[Str, tc.DepFile], own rxc: Memo[Str, rx.Rx], own gw: Memo[Str, gores.Walk], own specs: Shared[[Spec]], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: [Chan[Int]], own res: Chan[Res], own modroot: Str, own goroot: Str, own modcache: Str, gover: Int):
   var kw = scan.keywords()
   var g = tc.new_prog(goroot, modcache)
   for ev in ["TMPDIR", "HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]: g.env[ev] = os.env(ev)
   g.msrc = msrc
   g.dsrc = dsrc
   g.dast = dast
+  g.gwalk = gw
   g.trace = tm
   for t in conf.value.build_tags: g.tags.push(t + "")
   dep_cache(fs, os, &g)
@@ -456,13 +514,14 @@ fn dir_specs(fs: Fs, d: load.Dir, c: cfg.Cfg, modpath: Str, var kw: {Str: Int}, 
   if x_files.len > 0: out.push(Spec(d.path + "", x_files, ip + "_test"))
   return out
 
-fn dworker(fs: Fs, os: Os, tm: Bool, own dirs: Shared[[load.Dir]], own modpath: Str, own mf: Memo[Str, tc.Src], own dsrc: Memo[Str, tc.DepPkg], own dast: Memo[Str, tc.DepFile], own rxc: Memo[Str, rx.Rx], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: [Chan[Int]], own res: Chan[DRes], own keep: Chan[tc.Prog], own goroot: Str, own modcache: Str, gover: Int):
+fn dworker(fs: Fs, os: Os, tm: Bool, own dirs: Shared[[load.Dir]], own modpath: Str, own mf: Memo[Str, tc.Src], own dsrc: Memo[Str, tc.DepPkg], own dast: Memo[Str, tc.DepFile], own rxc: Memo[Str, rx.Rx], own gw: Memo[Str, gores.Walk], own conf: Shared[cfg.Cfg], own chg: Shared[proc.Changed], diff: Bool, own jobs: [Chan[Int]], own res: Chan[DRes], own keep: Chan[tc.Prog], own goroot: Str, own modcache: Str, gover: Int):
   var kw = scan.keywords()
   var g = tc.new_prog(goroot, modcache)
   for ev in ["TMPDIR", "HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]: g.env[ev] = os.env(ev)
   g.mfile = mf.share()
   g.dsrc = dsrc
   g.dast = dast
+  g.gwalk = gw
   g.trace = tm
   g.stream = true
   for t in conf.value.build_tags: g.tags.push(t + "")
@@ -506,7 +565,7 @@ fn dworker(fs: Fs, os: Os, tm: Bool, own dirs: Shared[[load.Dir]], own modpath: 
 # loader shares, and linting them; the results are then put in golist_order's order, from the
 # imports the workers report. (Run_lint reads every file and orders the packages first otherwise:
 # the cache keys need the sources.)
-fn stream_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, shc: Shared[cfg.Cfg], own dirs0: [load.Dir], modpath: Str, goroot: Str, modcache: Str, own ch: proc.Changed, diff: Bool, tm: Bool, t0: Float, mf: Memo[Str, tc.Src], dsrc: Memo[Str, tc.DepPkg], dast: Memo[Str, tc.DepFile], rxc: Memo[Str, rx.Rx], keep: Chan[tc.Prog], var results: [[proc.Iss]], var perrs: [Str], var tot: proc.Counts) throws:
+fn stream_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, shc: Shared[cfg.Cfg], own dirs0: [load.Dir], modpath: Str, goroot: Str, modcache: Str, own ch: proc.Changed, diff: Bool, tm: Bool, t0: Float, mf: Memo[Str, tc.Src], dsrc: Memo[Str, tc.DepPkg], dast: Memo[Str, tc.DepFile], rxc: Memo[Str, rx.Rx], gw: Memo[Str, gores.Walk], keep: Chan[tc.Prog], var results: [[proc.Iss]], var perrs: [Str], var tot: proc.Counts) throws:
   let c = shc.value
   # (folders in path order, handed out in regions of about the same number of files, the two
   # biggest of each first: see run_lint)
@@ -568,7 +627,7 @@ fn stream_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, shc: Shared[cfg.Cfg], own dirs
   for k in 0..jobs:
     var mine: [Chan[Int]] = []
     for q in 0..jobs: mine.push(chs[(k + q) % jobs].share())
-    spawn dworker(fs, os, tm, dirs, modpath + "", mf, dsrc, dast, rxc, shc, sch, diff, mine, rc, keep, goroot + "", modcache + "", gover)
+    spawn dworker(fs, os, tm, dirs, modpath + "", mf, dsrc, dast, rxc, gw.share(), shc, sch, diff, mine, rc, keep, goroot + "", modcache + "", gover)
   var got: [DRes] = []
   for _ in 0..nd: got.push(DRes(-1, [], [], []))
   for _ in 0..nd:
@@ -1496,8 +1555,9 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
   let dsrc: Memo[Str, tc.DepPkg] = memo()
   let dast: Memo[Str, tc.DepFile] = memo()
   let rxc: Memo[Str, rx.Rx] = memo()
+  let gw: Memo[Str, gores.Walk] = memo()
   let keep: Chan[tc.Prog] = chan(1024)
-  if stream: stream_lint(fs, os, ffi, o, shc, dirs, modpath, goroot, modcache, ch, diff, tm, t0, mf, dsrc, dast, rxc, keep, &results, &perrs, &tot)?
+  if stream: stream_lint(fs, os, ffi, o, shc, dirs, modpath, goroot, modcache, ch, diff, tm, t0, mf, dsrc, dast, rxc, gw, keep, &results, &perrs, &tot)?
   else:
     var specs: [Spec] = []
     var srcs: {Str: Str} = {}
@@ -1693,7 +1753,7 @@ fn run_lint(fs: Fs, os: Os, ffi: Ffi, o: Opts, own shc: Shared[cfg.Cfg]) throws:
       for k in 0..jobs:
         var mine: [Chan[Int]] = []
         for q in 0..jobs: mine.push(chs[(k + q) % jobs].share())
-        spawn worker(fs, os, tm, msrc, dsrc, dast, rxc, shared, shc, sch, diff, mine, rc, ".", goroot + "", modcache + "", gover)
+        spawn worker(fs, os, tm, msrc, dsrc, dast, rxc, gw.share(), shared, shc, sch, diff, mine, rc, ".", goroot + "", modcache + "", gover)
       for k in 0..np:
         var r = rc.recv()?
         let si = pending[r.idx]

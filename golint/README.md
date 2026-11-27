@@ -280,6 +280,38 @@ thread) takes 10.8 s; vgolint formats only the files whose issues it can report 
 are skipped under `generated: lax`). The printer stops a nodeSize print once it can't fit, looks
 lines up in a table, and the tabwriter keeps cells as stretches of its input.
 
+## goimports' fix.go: imports added and removed (2026-11-27)
+
+vgolint 0.6.0's goimports only formatted and sorted: on a file that doesn't compile (an import it no
+longer uses, or a reference with no import), golangci-lint reports `File is not properly formatted
+(goimports)` and vgolint reported nothing, without a warning. fix.go is ported now (`gofix.vu`): the
+three passes (the file alone with names assumed from import paths, then with the folder's other
+files' package variables and imports, then with the real package names), x/tools v0.50.0's table of
+the standard library's exports (`stdsyms.vu`, generated), and astutil's AddNamedImport and
+DeleteNamedImport on the formatting tree. What neither the siblings nor that table satisfy is looked
+for as the module resolver does (`gores.vu`): every package folder of GOROOT, the main module and the
+whole module cache whose import path could name the reference, nearest first, the first that exports
+every symbol used. The table isn't complete (it has no `reflect.Type`), so this search happens on
+real code too. The walk is done once a run.
+
+Against golangci-lint 2.14.0 (built from the module cache) with an empty cache each run, JSON with
+SuggestedFixes compared: 16 copies of 30 standard library packages (226 files) with imports deleted,
+added, made one line, commented and split (86 to 107 issues each), three copies of x/tools v0.50.0
+(1,286 files) scrambled the same way, so that missing imports come from x/tools itself, its internal
+packages and the module cache (99, 106 and 103 issues), and a module whose files need dependencies,
+the main module's internal packages and an external test's package: all identical, but one file
+where goimports itself is random. Where two standard library packages of the same name export every
+symbol used (go/scanner and text/scanner both have `Scanner` and `ScanComments`), fix.go takes the
+first in Go's map order, which changes from run to run (5 of 12 runs gave go/scanner); vgolint takes
+them in path order. On code that
+compiles nothing changes (x/tools: the same output, 10.4 G instructions against 9.8-10.8 G before).
+On the scrambled x/tools, vgolint 2.7 s, golangci-lint 33 s.
+
+Two things golangci-lint does that vgolint doesn't copy: its result cache is keyed by a package's
+files, but goimports reads the folder's other files too, so after one of those changes it can replay
+a stale answer (seen while testing); and on a machine where cgo works it formats files that import
+"C", which vgolint still skips.
+
 ## The rest of staticcheck and govet, as golangci-lint 2.14.0 (2026-11-24)
 
 The 87 staticcheck checks vgolint didn't have are ported from v0.8.1 (`sc_g1.vu` to `sc_g5.vu`),
@@ -440,7 +472,7 @@ how often the 248 configs of the 500 most-starred Go repositories on GitHub (sta
 | unused | 196 | yes |
 | errcheck | 168 | yes; `exclude-functions`, `disable-default-exclusions` |
 | misspell | 145 | yes (locale US/UK, ignore-rules, extra-words, mode) |
-| goimports | 132 | yes (`local-prefixes`), as x/tools v0.50.0 on code that compiles |
+| goimports | 132 | yes (`local-prefixes`), as x/tools v0.50.0: unused imports removed, missing ones added (siblings' imports, the standard library, then GOROOT, the main module and the module cache) |
 | unconvert | 132 | yes (fast-math) |
 | revive | 115 | its 23 default rules with their arguments (golangci-lint 2.14.0's revive v1.17.0); not the other 82 |
 | gofmt | 114 | yes (simplify, rewrite-rules), byte for byte as Go 1.27.3's gofmt |

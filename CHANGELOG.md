@@ -3455,3 +3455,22 @@ pattern (176 outputs, 2 at a time) the outputs are identical and the job's peak 
 vlint's process: max RSS 3.78 -> 3.25 GB, instructions 150.75 -> 150.95 G (the stores' checks). The
 next largest: 3.66 -> 3.15 GB, 2.77 -> 2.29 GB, 87.50 -> 88.02 G. vtsc's probes and vtests are
 unchanged (one measurement each, on a loaded machine).
+
+**vgolint: goimports adds and removes imports (2026-11-27).** vgolint 0.6.0 reported nothing on a
+file golangci-lint flags as `File is not properly formatted (goimports)` because an import is unused
+or missing (it ported only the formatting part, for code that compiles, and said nothing about it).
+fix.go is ported (`golint/gofix.vu`: its three passes, x/tools v0.50.0's standard library table,
+astutil's AddNamedImport and DeleteNamedImport), with the module resolver's search of GOROOT, the
+main module and the module cache (`golint/gores.vu`, walked once a run). Attack rounds, each against
+golangci-lint 2.14.0 built from the module cache, JSON with the fixed text compared: round 1 (five
+hand-made files) found the whole gap; round 2 (30 standard library packages scrambled by the new
+`tools/fix_mangle.py`, 16 seeds) found missing references that only GOROOT's walk satisfies (x/tools'
+table has no `reflect.Type`), and showed golangci-lint replaying stale cached answers (its cache
+doesn't cover sibling files; the comparisons now give it an empty cache); round 3 (a module needing
+dependencies, internal packages and an external test's package) found the main module walked from a
+relative folder; round 4 (x/tools v0.50.0 scrambled with three seeds, 99 to 106 issues) found nothing, and
+the 16 seeds of round 2 again on the final build were identical but one file, where goimports picks
+between go/scanner and text/scanner in Go's random map order (vgolint: path order).
+Speed: on code that compiles no change (x/tools: 10.4 G instructions, 9.8-10.8 G before, the same
+output); per-file object resolution over the package's whole tree and the walk once per package were
+both fixed before measuring. On the scrambled x/tools vgolint takes 2.7 s, golangci-lint 33 s.
